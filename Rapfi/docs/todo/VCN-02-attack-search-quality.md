@@ -122,7 +122,19 @@ complex positions.
 | ~~"No miss"~~ | withdrawn 2026-10-06 (user) | Earlier rule: no win within the depth may be missed. Withdrawn as too strict (it made pruning a hard rule instead of a measured trade-off). Pruning and width choices are decided by measurement against the purpose above. |
 | Pruning inside VCN | 2026-10-06 (user) | Keep the ordinary pruning. Turning it all off found 12 more wins on 270 self-play positions but cost ~10× time (see §Item 4). |
 | Meaning of a low value | 2026-10-06 (user) | "Losing" in VCN is not a label: it is a low value, `-M` when proven or a negative eval when no attack exists. `-M` / negative means "no win found within the depth/time", not a proof the defender wins. `+M` is a proof. |
-| Threat bonus at the horizon (item 5) | deferred 2026-10-06 (user) | Scoring "attack still alive" above the positional eval needs a tuned bonus; tuning it properly means SPSA over ~1M self-play games. Not now. Consequence: the `h8j9f6i10` criterion eval > 600 stays unmet; VCN picks the right move (G5) but scores it near 0. |
+| Threat bonus at the horizon (item 5) | deferred 2026-10-06 (user) | Scoring "attack still alive" above the positional eval needs a tuned bonus; tuning it properly means SPSA over ~1M self-play games. Not now; SPSA cannot be run on the user's machine (2026-10-07), so item 5 stays closed unless that changes. Consequence: the `h8j9f6i10` criterion eval > 600 stays unmet; VCN picks the right move (G5) but scores it near 0. |
+
+### Known limitations (2026-10-07)
+
+- **Item 5 (horizon value) and item 7 (defender's longer counter-wins) are not done and not planned.**
+  Item 5 needs an SPSA-tuned attack bonus (~1M self-play games), which the user cannot run locally;
+  item 7 depends on item 5.
+- **Effect on use:** VCN picks the right move on the acceptance position `h8j9f6i10` (G5) but scores it
+  near 0, not above 600. Read the VCN value as `+M` (proven win) or "no win found", not as a
+  calibrated attack-chance score. A positive non-mate value at VC2/VC3 is still the ordinary eval.
+- **To reopen:** write the item 5 decision note, add a tunable constant, and measure it on the
+  position set in `tests/vcn_measure.sh` plus `tests/vcn_selfplay.sh` / `tests/vcn_sweep.sh`
+  (a smaller sweep than full SPSA may be enough for a first value).
 
 Out of scope for now: MCTS (ignored by user decision), output format (user is satisfied: no
 "win / winning line" output needed), TT per-entry level check (decided not needed).
