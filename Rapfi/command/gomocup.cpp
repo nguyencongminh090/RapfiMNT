@@ -106,6 +106,10 @@ void think(Board                             &board,
     options.swapable            = swapable;
     options.disableOpeningQuery = disableOpeningQuery;
 
+    // In VCN mode the side to move is always the attacker
+    if (options.vcnMode.enabled())
+        options.vcnMode.attacker = board.sideToMove();
+
     // If threads are pondering, stop them now and wait for them to finish.
     // This must precede the config reload below: loadConfig quiesces the
     // search threads without signaling them to stop.
@@ -245,6 +249,27 @@ void getOption()
     else if (token == "MAX_DEPTH") {
         std::cin >> options.maxDepth;
     }
+    else if (token == "VCTHREAD") {
+        // Yixin-Board "checkmate in global search": 0 off, 1 VCT (= VC3), 2 VC2.
+        // 3 (VC4) is an extension the GUI never sends. VC5 is internal and not selectable.
+        std::cin >> val;
+        switch (val) {
+        case 0: options.vcnMode.n = Search::VCNLevel::None; break;
+        case 1:
+            options.vcnMode.n = Search::VCNLevel::VC3;
+            MESSAGEL("VCN Mode enabled: VCT (Defender passes 2 times)");
+            break;
+        case 2:
+            options.vcnMode.n = Search::VCNLevel::VC2;
+            MESSAGEL("VCN Mode enabled: VC2 (Defender passes 3 times)");
+            break;
+        case 3:
+            options.vcnMode.n = Search::VCNLevel::VC4;
+            MESSAGEL("VCN Mode enabled: VC4 (Defender passes 1 time)");
+            break;
+        default: ERRORL("Unknown vcthread value: " << val << ", must be 0..3."); break;
+        }
+    }
     else if (token == "START_DEPTH") {
         std::cin >> options.startDepth;
     }
@@ -307,7 +332,7 @@ void getOption()
     // Protocol-required no-ops: these Gomocup/Yixin-Board options are accepted
     // (their value must be consumed from the stream) but deliberately ignored.
     else if (token == "GAME_TYPE" || token == "TIME_INCREMENT" || token == "THREAD_SPLIT_DEPTH"
-             || token == "CHECKMATE" || token == "NBESTSYM" || token == "VCTHREAD") {
+             || token == "CHECKMATE" || token == "NBESTSYM") {
         std::cin >> val;
     }
     else if (token == "FOLDER") {
@@ -694,6 +719,27 @@ void analyzeMoves()
     think(*board, options.multiPV);
 }
 
+/// YXVCN handler: run one search in VCN mode at level 2..4 (the side to move is the attacker),
+/// then restore the level set by INFO VCTHREAD. The level is copied into the search context when
+/// thinking starts, so restoring it right after think() returns is safe.
+void searchVCN()
+{
+    int64_t level = 0;
+    std::cin >> level;
+    if (level < 2 || level > 4) {
+        ERRORL("YXVCN level must be 2..4.");
+        return;
+    }
+
+    options.rootMovesWhitelist.clear();
+    options.multiPV = 1;
+
+    const Search::VCNLevel prevLevel = options.vcnMode.n;
+    options.vcnMode.n                = static_cast<Search::VCNLevel>(level - 1);
+    think(*board);
+    options.vcnMode.n = prevLevel;
+}
+
 void showForbid()
 {
     std::cout << "FORBID ";
@@ -924,6 +970,7 @@ bool runProtocol()
     else if (cmd == "YXBLOCKRESET")        CheckBoardOK([] { options.blockMoves.clear(); });
     else if (cmd == "YXNBEST")             CheckBoardOK(nbest);
     else if (cmd == "YXANALZ")             CheckBoardOK(analyzeMoves);
+    else if (cmd == "YXVCN")               CheckBoardOK(searchVCN);
     else if (cmd == "YXSHOWFORBID")        CheckBoardOK(showForbid);
     else if (cmd == "YXBALANCEONE")        CheckBoardOK([] { balance(Search::SearchOptions::BALANCE_ONE); });
     else if (cmd == "YXBALANCETWO")        CheckBoardOK([] { balance(Search::SearchOptions::BALANCE_TWO); });

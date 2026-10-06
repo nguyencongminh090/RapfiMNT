@@ -64,7 +64,8 @@ MoveHistoryScoring makeMoveHistoryScoring(Rule                      rule,
 
 void HistoryTracker::addSearchedMove(Pos move, Pos currentBestMove)
 {
-    if (move == currentBestMove)
+    // A pass (VCN defender) has no cell to index the history tables with
+    if (move == currentBestMove || move == Pos::PASS)
         return;
 
     Color self = board.sideToMove(), oppo = ~self;
@@ -78,6 +79,10 @@ void HistoryTracker::addSearchedMove(Pos move, Pos currentBestMove)
 
 void HistoryTracker::updateBestmoveStats(Depth depth, Pos bestMove, Value bestValue)
 {
+    // A pass (VCN defender) has no cell to index the history tables with
+    if (bestMove == Pos::PASS)
+        return;
+
     Color    self = board.sideToMove(), oppo = ~self;
     bool     oppo5  = board.p4Count(oppo, A_FIVE);
     bool     oppo4  = oppo5 || board.p4Count(oppo, B_FLEX4);
@@ -109,8 +114,8 @@ void HistoryTracker::updateBestmoveStats(Depth depth, Pos bestMove, Value bestVa
 
 void HistoryTracker::updateTTMoveStats(Depth depth, Pos ttMove, Value ttValue, Value beta)
 {
-    // Validate ttMove first
-    if (!board.isLegal(ttMove))
+    // Validate ttMove first. A pass (VCN defender) has no cell to index the history tables with.
+    if (ttMove == Pos::PASS || !board.isLegal(ttMove))
         return;
 
     Color    self = board.sideToMove(), oppo = ~self;
