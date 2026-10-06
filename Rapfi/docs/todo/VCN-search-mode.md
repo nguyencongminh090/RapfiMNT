@@ -62,6 +62,7 @@ context when thinking starts, so restoring right after `think()` returns is safe
   return a non-mate score.
 - **Measured:** `rapfi bench` node count + hash bit-identical to the recorded baseline
   (`16733809` / `4621a98a`) — see §Verification. Targeted positions via unit tests.
+- **Purpose and later decisions:** see VCN-02 §Settled decisions (VCN value = attack chance; ordinary pruning kept).
 - **Deliberately not done:** VCN is not wired into MCTS, the PV output of passes is not formatted
   specially, and VCN is not exposed through `INFO`. Heuristic pruning (futility, razoring, LMR) is
   left active inside VCN search below the attacker's VC4/VC5 cut points; results are search

@@ -26,6 +26,7 @@
 #include "../core/pos.h"
 #include "../core/types.h"
 #include "../game/board.h"
+#include "../game/wincheck.h"
 #include "../search/movepick.h"
 #include "../search/searchcommon.h"
 #include "../search/searchengine.h"
@@ -71,6 +72,75 @@ std::vector<Pos> quietPosition()
     return {Pos(7, 7), Pos(3, 3)};
 }
 
+// Interleave black and white stones into a move sequence starting with black.
+std::vector<Pos> alternate(const std::vector<Pos> &black, const std::vector<Pos> &white)
+{
+    std::vector<Pos> moves;
+    for (size_t i = 0; i < std::max(black.size(), white.size()); i++) {
+        if (i < black.size())
+            moves.push_back(black[i]);
+        if (i < white.size())
+            moves.push_back(white[i]);
+    }
+    return moves;
+}
+
+// Black to move; white threatens five at (12,9). Black's forced block at (12,9) is itself a block
+// four (row 9, closed by white at (8,9)), which white must block at (13,9). Black's only VCF is
+// then far from (12,9): (3,6) four on row 6 (white (2,6)), then (3,7) double four on column 3
+// and the anti-diagonal. White (2,10) and (2,9) block the anti-diagonals through (3,9) and (3,8),
+// which would otherwise give black double threes at (5,7) and (6,5) that quickWinCheck() reports
+// on its own. Same as P1 in tests/vcn_measure.sh.
+std::vector<Pos> farVcfAfterForcedBlockPosition()
+{
+    const std::vector<Pos> black = {Pos(3, 8),
+                                    Pos(3, 9),
+                                    Pos(4, 6),
+                                    Pos(5, 6),
+                                    Pos(6, 6),
+                                    Pos(5, 5),
+                                    Pos(6, 4),
+                                    Pos(9, 9),
+                                    Pos(10, 9),
+                                    Pos(11, 9),
+                                    Pos(12, 14)};
+    const std::vector<Pos> white = {Pos(3, 10),
+                                    Pos(7, 6),
+                                    Pos(7, 3),
+                                    Pos(8, 9),
+                                    Pos(12, 10),
+                                    Pos(12, 11),
+                                    Pos(12, 12),
+                                    Pos(12, 13),
+                                    Pos(0, 0),
+                                    Pos(2, 9),
+                                    Pos(2, 10)};
+    return alternate(black, white);
+}
+
+// Black to move; the same forced pair as above: black must block at (12,9) (a block four), white
+// blocks at (13,9). Black then has no four anywhere, only a double open three at (5,5) (row 5 and
+// column 5). Same as P7 in tests/vcn_measure.sh.
+std::vector<Pos> doubleThreeAfterForcedBlockPosition()
+{
+    return alternate({Pos(3, 5),
+                      Pos(4, 5),
+                      Pos(5, 3),
+                      Pos(5, 4),
+                      Pos(9, 9),
+                      Pos(10, 9),
+                      Pos(11, 9),
+                      Pos(12, 14)},
+                     {Pos(8, 9),
+                      Pos(12, 10),
+                      Pos(12, 11),
+                      Pos(12, 12),
+                      Pos(12, 13),
+                      Pos(0, 0),
+                      Pos(14, 0),
+                      Pos(0, 14)});
+}
+
 std::vector<Pos> drain(MovePicker &mp)
 {
     std::vector<Pos> moves;
@@ -84,9 +154,9 @@ bool contains(const std::vector<Pos> &v, Pos p)
     return std::find(v.begin(), v.end(), p) != v.end();
 }
 
-MovePicker::ExtraArgs<MovePicker::MAIN> mainArgs(Pos ttMove, bool pass)
+MovePicker::ExtraArgs<MovePicker::MAIN> mainArgs(Pos ttMove, bool pass, bool attackOrder = false)
 {
-    return {ttMove, Search::MoveHistoryScoring {}, false, 1.0f, pass};
+    return {ttMove, Search::MoveHistoryScoring {}, false, 1.0f, pass, attackOrder};
 }
 
 void resetProtocolState(Rule rule, const std::vector<Pos> &moves)
@@ -222,6 +292,87 @@ void movePickerMain_opponentHasFive_neverYieldsPass()
     assert(moves.size() > 1 || !contains(moves, Pos::PASS));
 }
 
+// Black to move. Black has a four-making move ((10,7), a block four on row 7: white (6,7)), a
+// three-making move ((9,10) makes an open three on row 10) and nothing else. White has no four
+// threat (so the picker stays in its main stage: no stones of white line up with each other or
+// with (6,7)) but (12,13) would give white a double three, so the ordinary order ranks that pure
+// defence square highly.
+std::vector<Pos> attackOrderPosition()
+{
+    return alternate({Pos(7, 7), Pos(8, 7), Pos(9, 7), Pos(7, 10), Pos(8, 10)},
+                     {Pos(6, 7), Pos(12, 11), Pos(12, 12), Pos(10, 13), Pos(11, 13)});
+}
+
+// Threat tier of a move for black: 3 four, 2 three, 1 two, 0 nothing (FORBID is not a threat).
+int blackThreatTier(const Board &board, Pos p)
+{
+    const Pattern4 p4 = board.pattern4(p, BLACK);
+    return p4 >= E_BLOCK4 ? 3 : p4 >= H_FLEX3 ? 2 : (p4 >= L_FLEX2) ? 1 : 0;
+}
+
+int indexOf(const std::vector<Pos> &v, Pos p)
+{
+    return int(std::find(v.begin(), v.end(), p) - v.begin());
+}
+
+void movePickerMain_vcnAttackOrderOn_orderedByThreatTier()
+{
+    // Arrange
+    auto board = makeBoard(FREESTYLE, attackOrderPosition());
+    assert(board->sideToMove() == BLACK);
+    assert(board->p4Count(WHITE, B_FLEX4) + board->p4Count(WHITE, C_BLOCK4_FLEX3) == 0
+           && "fixture: white has no four threat, so the picker stays in its main stage");
+    assert(board->pattern4(Pos(10, 7), BLACK) >= E_BLOCK4 && "fixture: (10,7) is a four");
+    assert(board->pattern4(Pos(9, 10), BLACK) >= H_FLEX3
+           && board->pattern4(Pos(9, 10), BLACK) < E_BLOCK4 && "fixture: (9,10) is a three");
+    assert(board->pattern4(Pos(12, 13), BLACK) < L_FLEX2 && "fixture: (12,13) is a pure defence move");
+    assert(board->pattern4(Pos(12, 13), WHITE) == F_FLEX3_2X && "fixture: white double three");
+
+    // Act
+    MovePicker       mp(FREESTYLE, *board, mainArgs(Pos::NONE, false, true));
+    std::vector<Pos> moves = drain(mp);
+
+    // Assert: the whole list is ordered by threat tier (four, three, two, none), including a
+    // pure defence square that the ordinary order ranks above some twos
+    assert(moves.size() > 40);
+    assert(blackThreatTier(*board, moves.front()) == 3);
+    for (size_t i = 0; i + 1 < moves.size(); i++)
+        assert(blackThreatTier(*board, moves[i]) >= blackThreatTier(*board, moves[i + 1]));
+    assert(indexOf(moves, Pos(6, 6)) < indexOf(moves, Pos(12, 13)));
+}
+
+void movePickerMain_vcnAttackOrderOff_orderUnchanged()
+{
+    // Arrange
+    auto board = makeBoard(FREESTYLE, attackOrderPosition());
+
+    // Act
+    MovePicker       plain(FREESTYLE, *board, mainArgs(Pos::NONE, false));
+    MovePicker       off(FREESTYLE, *board, mainArgs(Pos::NONE, false, false));
+    std::vector<Pos> a = drain(plain), b = drain(off);
+
+    // Assert: the flag off is the ordinary order, which ranks the defence square (12,13) above the
+    // two at (6,6)
+    assert(a == b);
+    assert(indexOf(a, Pos(12, 13)) < indexOf(a, Pos(6, 6)) && "fixture: ordinary order differs");
+}
+
+void movePickerMain_vcnAttackOrderOn_sameMoveSet()
+{
+    // Arrange
+    auto board = makeBoard(FREESTYLE, attackOrderPosition());
+
+    // Act
+    MovePicker       off(FREESTYLE, *board, mainArgs(Pos::NONE, false, false));
+    MovePicker       on(FREESTYLE, *board, mainArgs(Pos::NONE, false, true));
+    std::vector<Pos> a = drain(off), b = drain(on);
+    std::sort(a.begin(), a.end());
+    std::sort(b.begin(), b.end());
+
+    // Assert
+    assert(a == b);
+}
+
 void movePickerQvcf_forceAllowB4_enumeratesPlainB4()
 {
     // Arrange: black has a blocked three (white at 6,7) so (10,7) makes a plain B4
@@ -250,6 +401,141 @@ void movePickerQvcf_forceAllowB4_enumeratesPlainB4()
     assert(contains(drain(with), Pos(10, 7)));
 }
 
+// Board of farVcfAfterForcedBlockPosition() after the forced pair (12,9) / (13,9): black to move,
+// black's last stone is (12,9), black's fours are all far from it.
+std::unique_ptr<Board> farVcfAfterForcedPairBoard()
+{
+    auto board = makeBoard(FREESTYLE, farVcfAfterForcedBlockPosition());
+    board->move(FREESTYLE, Pos(12, 9));
+    board->move(FREESTYLE, Pos(13, 9));
+    assert(board->sideToMove() == BLACK);
+    assert(board->getLastActualMoveOfSide(BLACK) == Pos(12, 9));
+    assert(board->pattern4(Pos(3, 6), BLACK) >= E_BLOCK4 && "fixture: (3,6) must be a four");
+    // Nothing quickWinCheck() could report on its own: the win needs the (3,6) four
+    assert(board->p4Count(BLACK, B_FLEX4) == 0 && "fixture: no flex four / double four");
+    assert(board->p4Count(BLACK, C_BLOCK4_FLEX3) == 0 && "fixture: no four-three");
+    assert(board->p4Count(BLACK, F_FLEX3_2X) == 0 && "fixture: no double three");
+    return board;
+}
+
+void movePickerQvcf_fullBoardOff_onlyFoursNearLastMove()
+{
+    // Arrange
+    auto board = farVcfAfterForcedPairBoard();
+
+    // Act: ordinary quiescence (plain B4 allowed so only locality differs from the VCN case)
+    MovePicker mp(FREESTYLE,
+                  *board,
+                  MovePicker::ExtraArgs<MovePicker::QVCF> {Pos::NONE,
+                                                           DEPTH_QVCF,
+                                                           {NONE, NONE},
+                                                           true});
+
+    // Assert: the far four is outside the locality window and stays excluded
+    assert(!contains(drain(mp), Pos(3, 6)));
+}
+
+void movePickerQvcf_fullBoardOn_includesFoursFarFromLastMove()
+{
+    // Arrange
+    auto board = farVcfAfterForcedPairBoard();
+
+    // Act
+    MovePicker mp(FREESTYLE,
+                  *board,
+                  MovePicker::ExtraArgs<MovePicker::QVCF> {Pos::NONE,
+                                                           DEPTH_QVCF,
+                                                           {NONE, NONE},
+                                                           true,
+                                                           true});
+    std::vector<Pos> moves = drain(mp);
+
+    // Assert: every black four on the board, wherever it is
+    assert(contains(moves, Pos(3, 6)));
+    assert(contains(moves, Pos(3, 7)));
+    assert(contains(moves, Pos(2, 8)));
+    for (Pos m : moves)
+        assert(board->pattern4(m, BLACK) >= E_BLOCK4);
+}
+
+// --------------------------------------------------------------------------
+// quickWinCheck: VCF-only mode (VC4 attacker)
+
+// Black to move with a double open three at (5,5) (row 5 and column 5) and no four.
+std::unique_ptr<Board> doubleThreeBoard()
+{
+    auto board = makeBoard(FREESTYLE,
+                           alternate({Pos(3, 5), Pos(4, 5), Pos(5, 3), Pos(5, 4)},
+                                     {Pos(0, 0), Pos(14, 0), Pos(0, 14), Pos(14, 14)}));
+    assert(board->pattern4(Pos(5, 5), BLACK) == F_FLEX3_2X && "fixture: (5,5) double three");
+    return board;
+}
+
+void quickWinCheck_doubleThree_default_reportsWin()
+{
+    // Arrange
+    auto board = doubleThreeBoard();
+
+    // Act
+    Value v = quickWinCheck<FREESTYLE>(*board, 0);
+
+    // Assert: the existing rule for every non-VCN caller
+    assert(v == mate_in(5));
+}
+
+void quickWinCheck_doubleThree_vcfOnly_noWin()
+{
+    // Arrange
+    auto board = doubleThreeBoard();
+
+    // Act
+    Value v = quickWinCheck<FREESTYLE>(*board, 0, VALUE_INFINITE, true);
+
+    // Assert: a double three is not a VCF (the VCN defender answers it with a pass)
+    assert(v == VALUE_ZERO);
+}
+
+void quickWinCheck_fourThree_vcfOnly_stillWin()
+{
+    // Arrange: (6,5) is a block four on row 5 (closed by white (2,5)) and a flex three on column 6
+    auto board = makeBoard(FREESTYLE,
+                           alternate({Pos(3, 5), Pos(4, 5), Pos(5, 5), Pos(6, 3), Pos(6, 4)},
+                                     {Pos(2, 5), Pos(0, 14), Pos(14, 0), Pos(14, 14), Pos(0, 7)}));
+    assert(board->pattern4(Pos(6, 5), BLACK) == C_BLOCK4_FLEX3 && "fixture: (6,5) four-three");
+
+    // Act
+    Value v = quickWinCheck<FREESTYLE>(*board, 0, VALUE_INFINITE, true);
+
+    // Assert
+    assert(v == mate_in(5));
+}
+
+void quickWinCheck_flexFour_vcfOnly_stillWin()
+{
+    // Arrange: the open three on row 7 gives black a flex four
+    auto board = makeBoard(FREESTYLE, openThreePosition());
+    assert(board->p4Count(BLACK, B_FLEX4) > 0 && "fixture: flex four available");
+
+    // Act
+    Value v = quickWinCheck<FREESTYLE>(*board, 0, VALUE_INFINITE, true);
+
+    // Assert
+    assert(v == mate_in(3));
+}
+
+// Board of doubleThreeAfterForcedBlockPosition() after the forced pair: only a double three left.
+void assertDoubleThreeAfterForcedPairFixture()
+{
+    auto board = makeBoard(FREESTYLE, doubleThreeAfterForcedBlockPosition());
+    board->move(FREESTYLE, Pos(12, 9));
+    board->move(FREESTYLE, Pos(13, 9));
+    assert(board->p4Count(BLACK, F_FLEX3_2X) > 0 && "fixture: double three after the pair");
+    assert(board->p4Count(BLACK, B_FLEX4) + board->p4Count(BLACK, C_BLOCK4_FLEX3)
+                   + board->p4Count(BLACK, D_BLOCK4_PLUS) + board->p4Count(BLACK, E_BLOCK4)
+               == 0
+           && "fixture: no black four after the pair");
+}
+
 // --------------------------------------------------------------------------
 // VCN search
 
@@ -275,6 +561,78 @@ void vcnSearch_vc4_openThreeAttacker_findsVcfMate()
 {
     resetProtocolState(FREESTYLE, openThreePosition());
     assert(runVcn(4) > VALUE_MATE_IN_MAX_PLY);
+}
+
+void vcnSearch_vc4_vcfFarFromLastMove_found()
+{
+    // Arrange: the root's only move is the forced block (12,9); after white's (13,9) the VC4
+    // attacker (a non-root node, so its moves come from the QVCF picker) must find a VCF far
+    // from its last stone (12,9)
+    resetProtocolState(FREESTYLE, farVcfAfterForcedBlockPosition());
+
+    // Act
+    Value v = runVcn(4);
+
+    // Assert
+    assert(v > VALUE_MATE_IN_MAX_PLY);
+}
+
+void vcnSearch_vc4_doubleThreeAfterForcedBlock_attackerLoses()
+{
+    // Arrange: after the forced pair the VC4 attacker (non-root) has only a double three
+    assertDoubleThreeAfterForcedPairFixture();
+    resetProtocolState(FREESTYLE, doubleThreeAfterForcedBlockPosition());
+
+    // Act
+    Value v = runVcn(4);
+
+    // Assert: the defender passes after the double three, the attacker has no five at VC5
+    assert(v < VALUE_MATED_IN_MAX_PLY);
+}
+
+void vcnSearch_vc3_doubleThreeAfterForcedBlock_attackerWins()
+{
+    // Arrange
+    assertDoubleThreeAfterForcedPairFixture();
+    resetProtocolState(FREESTYLE, doubleThreeAfterForcedBlockPosition());
+
+    // Act
+    Value v = runVcn(3);
+
+    // Assert: at VC3 the double three is a real threat (pass, then open four)
+    assert(v > VALUE_MATE_IN_MAX_PLY);
+}
+
+void vcnSearch_vc3_forcedRootMoveWithTimeLimit_winFound()
+{
+    // Arrange: a freestyle self-play position (VCN-02 item 4 sweep, #253), black to move. Black's
+    // only move is the block at (4,8), which made the ordinary "singular root" rule stop iterating
+    // early under a time limit (eval 270 at depth 6); the attack wins (+M9) within depth 8. An
+    // ordinary search after the pair (4,8)/(5,7) also proves the win.
+    resetProtocolState(FREESTYLE,
+                       {Pos(5, 6),
+                        Pos(6, 9),
+                        Pos(7, 5),
+                        Pos(5, 8),
+                        Pos(6, 6),
+                        Pos(7, 6),
+                        Pos(6, 7),
+                        Pos(7, 8),
+                        Pos(6, 5),
+                        Pos(6, 8),
+                        Pos(8, 8),
+                        Pos(7, 9),
+                        Pos(7, 7),
+                        Pos(5, 5),
+                        Pos(8, 7),
+                        Pos(3, 8)});
+    GP::options.setTimeControl(60000, 0);  // a time limit enables the early-stop rules
+
+    // Act
+    Value v = runVcn(3);
+
+    // Assert
+    assert(v > VALUE_MATE_IN_MAX_PLY);
 }
 
 void vcnSearch_vc4_attackerWithoutVcf_loses()
@@ -412,7 +770,20 @@ void runVcnTests()
     RUN_TEST(movePickerMain_ttMoveIsPass_yieldedOnceOnly);
     RUN_TEST(movePickerMain_ttMoveIsPassButPassDisabled_ttMoveDropped);
     RUN_TEST(movePickerMain_opponentHasFive_neverYieldsPass);
+    RUN_TEST(movePickerMain_vcnAttackOrderOn_orderedByThreatTier);
+    RUN_TEST(movePickerMain_vcnAttackOrderOff_orderUnchanged);
+    RUN_TEST(movePickerMain_vcnAttackOrderOn_sameMoveSet);
     RUN_TEST(movePickerQvcf_forceAllowB4_enumeratesPlainB4);
+    RUN_TEST(movePickerQvcf_fullBoardOff_onlyFoursNearLastMove);
+    RUN_TEST(movePickerQvcf_fullBoardOn_includesFoursFarFromLastMove);
+    RUN_TEST(vcnSearch_vc4_vcfFarFromLastMove_found);
+    RUN_TEST(quickWinCheck_doubleThree_default_reportsWin);
+    RUN_TEST(quickWinCheck_doubleThree_vcfOnly_noWin);
+    RUN_TEST(quickWinCheck_fourThree_vcfOnly_stillWin);
+    RUN_TEST(quickWinCheck_flexFour_vcfOnly_stillWin);
+    RUN_TEST(vcnSearch_vc4_doubleThreeAfterForcedBlock_attackerLoses);
+    RUN_TEST(vcnSearch_vc3_doubleThreeAfterForcedBlock_attackerWins);
+    RUN_TEST(vcnSearch_vc3_forcedRootMoveWithTimeLimit_winFound);
     RUN_TEST(vcnSearch_vc2_openThreeAttacker_findsMate);
     RUN_TEST(vcnSearch_vc3_openThreeAttacker_findsMate);
     RUN_TEST(vcnSearch_vc4_openThreeAttacker_findsVcfMate);

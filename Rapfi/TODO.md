@@ -6,7 +6,7 @@ a matching `instruction.md` line when execution guidance exists. See
 
 ## Active
 
-- [VCN-02 — VCN tree search: attack-oriented search quality and real-world correctness](docs/todo/VCN-02-attack-search-quality.md) — VC4 only finds fours near the attacker's last move (correctness); attacker/defender width is `ALL` at VC2/VC3; heuristic pruning and eval horizon still active in VCN. Class B. Open, recorded 2026-10-06.
+- [VCN-02 — VCN tree search: attack-oriented search quality and real-world correctness](docs/todo/VCN-02-attack-search-quality.md) — VC4 only finds fours near the attacker's last move (correctness); attacker/defender width is `ALL` at VC2/VC3; heuristic pruning and eval horizon still active in VCN. Class B. In progress: items 1 (VC4 full-board fours) and 1b (VC4 no double-three win) done; item 4 closed with ordinary pruning kept (only the singular-root early stop is off in VCN); next item 5 (horizon value = attack chance), item 6 (threat ordering). Acceptance position h8j9f6i10 (eval > 600) recorded, conditions open. 2026-10-06.
 
 ## Done
 

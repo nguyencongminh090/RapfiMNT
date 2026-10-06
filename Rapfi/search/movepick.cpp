@@ -123,6 +123,8 @@ MovePicker::MovePicker(Rule rule, const Board &board, ExtraArgs<MovePicker::ROOT
     , ttMove(Pos::NONE)
     , allowPlainB4InVCF(false)
     , generatePassMove(false)
+    , fullBoardVCF(false)
+    , vcnAttackOrder(false)
     , hasPolicy(false)
     , useNormalizedPolicy(args.useNormalizedPolicy)
     , normalizedPolicyTemp(args.normalizedPolicyTemp)
@@ -184,6 +186,8 @@ MovePicker::MovePicker(Rule rule, const Board &board, ExtraArgs<MovePicker::MAIN
     , rule(rule)
     , allowPlainB4InVCF(false)
     , generatePassMove(args.generatePassMove)
+    , fullBoardVCF(false)
+    , vcnAttackOrder(args.vcnAttackOrder)
     , hasPolicy(false)
     , useNormalizedPolicy(args.useNormalizedPolicy)
     , normalizedPolicyTemp(args.normalizedPolicyTemp)
@@ -238,6 +242,8 @@ MovePicker::MovePicker(Rule rule, const Board &board, ExtraArgs<MovePicker::QVCF
           args.forceAllowB4InVCF || args.depth >= DEPTH_QVCF_FULL
           || (args.previousSelfP4[0] >= D_BLOCK4_PLUS && args.previousSelfP4[1] >= D_BLOCK4_PLUS))
     , generatePassMove(false)
+    , fullBoardVCF(args.fullBoardVCF)
+    , vcnAttackOrder(false)
     , hasPolicy(false)
     , useNormalizedPolicy(false)
     , normalizedPolicyTemp(1.0f)
@@ -315,6 +321,21 @@ Pos MovePicker::pickNextMove(Pred filter)
     }
 
     return Pos::NONE;
+}
+
+/// Ordering bonus for the VCN attacker by the strength of a move's own threat. The tiers sit well
+/// above the policy score range (int16, observed about -111..387 with the network), so a four
+/// is tried before a three, a three before a two, and those before every non-threat move; within
+/// a tier the policy/history order decides. The sizes are not tuned, the tier order is the design.
+constexpr int vcnThreatBonus(Pattern4 p4)
+{
+    if (p4 >= E_BLOCK4)
+        return 12000;
+    if (p4 >= H_FLEX3)
+        return 8000;
+    if (p4 >= I_BLOCK3_PLUS || p4 == J_FLEX2_2X || p4 == K_BLOCK3 || p4 == L_FLEX2)
+        return 4000;
+    return 0;
 }
 
 /// Score all remaining moves according to score type.
@@ -413,7 +434,11 @@ void MovePicker::scoreAllMoves()
             }
         }
 
-        m.score = Evaluation::clampMoveScore(score + historyBonus + counterMoveBonus);
+        int threatBonus = 0;
+        if (bool(Type & VCN_ATTACK))
+            threatBonus = vcnThreatBonus(board.pattern4(m.pos, self));
+
+        m.score = Evaluation::clampMoveScore(score + historyBonus + counterMoveBonus + threatBonus);
 #ifdef POLICY_TRAINING
         if (traceEvent && !policyTraceCandidate(m.pos)) {
             Tuning::PolicyTraceCandidate candidate {};
@@ -511,7 +536,10 @@ top:
 
         curMove = moves;
         endMove = generate<ALL>(board, curMove);
-        scoreAndSortMoves<ScoreType(MAIN_HISTORY | COUNTER_MOVE)>();
+        if (vcnAttackOrder)
+            scoreAndSortMoves<ScoreType(MAIN_HISTORY | COUNTER_MOVE | VCN_ATTACK)>();
+        else
+            scoreAndSortMoves<ScoreType(MAIN_HISTORY | COUNTER_MOVE)>();
 
         stage = ALLMOVES;
         goto top;
@@ -559,7 +587,9 @@ top:
 
     case QVCF_MOVES:
         curMove = moves;
-        {
+        if (fullBoardVCF)  // every four, wherever it is (the VCN VC4 attacker proves a VCF)
+            endMove = generateVCFMoves(rule, board, curMove);
+        else {
             Pos selfLast = board.getLastActualMoveOfSide(board.sideToMove());
             endMove =
                 (allowPlainB4InVCF ? generateNeighbors<VCF>

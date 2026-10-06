@@ -488,7 +488,9 @@ void ABSearcher::search(SearchThread &th)
         if (!options.isAnalysisMode() && !ctx.inPonder && !rmp.enabled()) {
             if (isMate && sd.rootDepth - firstMateDepth >= SearchCfg.numIterationAfterMate)
                 th.engine.stopThinking();
-            else if (sd.singularRoot
+            // (Not in VCN: a forced root move, e.g. a block, says nothing about whether the
+            // attack still wins, and stopping early can hide it.)
+            else if (sd.singularRoot && !options.vcnMode.enabled()
                      && sd.rootDepth - firstSingularDepth
                             >= SearchCfg.numIterationAfterSingularRoot) {
                 ctx.markPonderingAvailable();
@@ -1461,6 +1463,7 @@ moves_loop:
                       false,
                       1.0f,
                       vcnDefenderPass,
+                      vcnIsAttacker,  // threat-strength ordering for the VCN attacker
                   });
 
     // Step 11. Loop through all legal moves until no moves remain
@@ -2101,8 +2104,8 @@ Value vcfsearch(Board &board, SearchStack *ss, Value alpha, Value beta, Depth de
     if (ss->ply >= MAX_PLY)
         return Evaluation::evaluate<Rule>(board, alpha, beta);
 
-    // Check for immediate winning
-    if ((value = quickWinCheck<Rule>(board, ss->ply, beta)) != VALUE_ZERO) {
+    // Check for immediate winning (the VC4 attacker counts only wins made of fours)
+    if ((value = quickWinCheck<Rule>(board, ss->ply, beta, vcfOnly)) != VALUE_ZERO) {
         // Do not return mate that longer than maxMoves option
         if (board.nonPassMoveCount() + mate_step(value, ss->ply) > thisThread->options().maxMoves)
             value = getDrawValue(board, thisThread->options(), ss->ply);
@@ -2211,6 +2214,7 @@ Value vcfsearch(Board &board, SearchStack *ss, Value alpha, Value beta, Depth de
         MovePicker::ExtraArgs<MovePicker::QVCF> {ttMove,
                                                  depth,
                                                  {(ss - 2)->moveP4[self], (ss - 4)->moveP4[self]},
+                                                 vcfOnly,
                                                  vcfOnly});
 
     while (Pos move = mp()) {
