@@ -876,6 +876,7 @@ namespace detail {
         static FORCE_INLINE R min(R a, R b) { return simde_mm_min_epi8(a, b); }
         static FORCE_INLINE R max(R a, R b) { return simde_mm_max_epi8(a, b); }
         static FORCE_INLINE R avg(R a, R b) { return simde_mm_avg_epu8(a, b); }
+        static FORCE_INLINE R xor_(R a, R b) { return simde_mm_xor_si128(a, b); }
         static FORCE_INLINE R dot2_u7i8(R a, R b) { return simde_mm_maddubs_epi16(a, b); }
 
         /// Compute 4-element dot product of [u7x16] and [i8x16] then accumulate into [i32x4].
@@ -937,6 +938,7 @@ namespace detail {
         static FORCE_INLINE R min(R a, R b) { return simde_mm256_min_epi8(a, b); }
         static FORCE_INLINE R max(R a, R b) { return simde_mm256_max_epi8(a, b); }
         static FORCE_INLINE R avg(R a, R b) { return simde_mm256_avg_epu8(a, b); }
+        static FORCE_INLINE R xor_(R a, R b) { return simde_mm256_xor_si256(a, b); }
         static FORCE_INLINE R dot2_u7i8(R a, R b) { return simde_mm256_maddubs_epi16(a, b); }
 
         /// Compute 4-element dot product of [u7x32] and [i8x32] then accumulate into [i32x8].
@@ -999,6 +1001,7 @@ namespace detail {
         static FORCE_INLINE R min(R a, R b) { return _mm512_min_epi8(a, b); }
         static FORCE_INLINE R max(R a, R b) { return _mm512_max_epi8(a, b); }
         static FORCE_INLINE R avg(R a, R b) { return _mm512_avg_epu8(a, b); }
+        static FORCE_INLINE R xor_(R a, R b) { return _mm512_xor_si512(a, b); }
         static FORCE_INLINE R dot2_u7i8(R a, R b) { return _mm512_maddubs_epi16(a, b); }
 
         /// Compute 4-element dot product of [u7x64] and [i8x64] then accumulate into [i32x16].

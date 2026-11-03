@@ -59,10 +59,25 @@ namespace detail {
         static constexpr int NumChunks = InSize / ChunkSize;
         static_assert(InSize % ChunkSize == 0, "InSize must be a multiple of ChunkSize=4");
 
-        template <bool SignedInput, bool Bias, bool PreReLU, bool PostReLU>
+        template <bool SignedInput,
+                  bool Bias,
+                  bool PreReLU,
+                  bool PostReLU,
+                  bool InputBiased128 = false>
         static void
         forward(int32_t *output, const int8_t *input, const int8_t *weight, const int32_t *bias)
         {
+            // InputBiased128: the caller feeds signed input bytes but the -128*Srow(w)
+            // correction has already been folded into `bias` at load time, so we may add
+            // 128 to every input byte (s ^ 0x80 == s + 128 as an unsigned 0..255 byte) and
+            // run a single unsigned-input vpdpbusd instead of the two-vpdpbusd signed path.
+            // Only valid together with SignedInput, and only on a VNNI build (the bias fold
+            // in the weight loader is gated on the SAME USE_VNNI macro).
+            static_assert(!InputBiased128 || SignedInput,
+                          "InputBiased128 is only defined together with SignedInput");
+            static_assert(!InputBiased128 || (255LL * 128 * InSize < INT32_MAX),
+                          "InputBiased128: biased int32 accumulator could overflow for this InSize");
+
             typedef detail::VecLoadStore<int8_t, Alignment, I>  I8LS;
             typedef detail::VecLoadStore<int32_t, Alignment, I> I32LS;
             typedef detail::VecOp<int8_t, I>                    I8Op;
@@ -79,15 +94,26 @@ namespace detail {
                     acc[j] = I32Op::setzero();
             }
 
+#if defined(USE_VNNI)
+            constexpr bool UseInputBias128 = InputBiased128;
+#else
+            constexpr bool UseInputBias128 = false;
+#endif
+
             for (int i = 0; i < NumChunks; i++) {
                 auto in0 = typename I8Op::R(I32Op::set1(input32[i]));  // Broadcast input value
                 auto w0 =
                     reinterpret_cast<const typename I8Op::R *>(weight + i * OutSize * ChunkSize);
                 if constexpr (PreReLU)
                     in0 = I8Op::max(in0, I8Op::setzero());
+                if constexpr (UseInputBias128)
+                    // s -> (s ^ 0x80) == s + 128, once per broadcast chunk (before the j loop)
+                    in0 = I8Op::xor_(in0, I8Op::set1(static_cast<int8_t>(0x80)));
 
                 for (int j = 0; j < OutB::NumBatch; j++) {
-                    if constexpr (SignedInput)
+                    if constexpr (UseInputBias128)
+                        I8Op::dot4_u7i8_accum(acc[j], in0, I8LS::load(&w0[j]));
+                    else if constexpr (SignedInput)
                         I8Op::dot4_i8i8_accum(acc[j], in0, I8LS::load(&w0[j]));
                     else
                         I8Op::dot4_u7i8_accum(acc[j], in0, I8LS::load(&w0[j]));
@@ -113,10 +139,16 @@ namespace detail {
                          && (OutSize >= 4 && OutSize % 4 == 0)
                          && (detail::VecBatch<InSize, int8_t, I, true>::NumExtra == 0)>>
     {
-        template <bool SignedInput, bool Bias, bool PreReLU, bool PostReLU>
+        template <bool SignedInput,
+                  bool Bias,
+                  bool PreReLU,
+                  bool PostReLU,
+                  bool InputBiased128 = false>
         static void
         forward(int32_t *output, const int8_t *input, const int8_t *weight, const int32_t *bias)
         {
+            static_assert(!InputBiased128,
+                          "InputBiased128 is only implemented in the ChunkSize=4 int8 affine path");
             constexpr InstructionType I128 = getInstTypeOfWidth(I, 128);
 
             typedef detail::VecBatch<InSize, int8_t, I>            B;
@@ -191,7 +223,11 @@ namespace detail {
                          && (detail::VecBatch<InSize, int8_t, I, true>::NumExtra > 0)
                          && (detail::VecBatch<InSize, int8_t, I, true>::NumBatch == 0)>>
     {
-        template <bool SignedInput, bool Bias, bool PreReLU, bool PostReLU>
+        template <bool SignedInput,
+                  bool Bias,
+                  bool PreReLU,
+                  bool PostReLU,
+                  bool InputBiased128 = false>
         static void
         forward(int32_t *output, const int8_t *input, const int8_t *weight, const int32_t *bias)
         {
@@ -204,10 +240,10 @@ namespace detail {
                        int8_t,
                        std::min(Alignment, 32),
                        getInstTypeOfWidth(simd::NativeInstType, 256)>::
-                    template forward<SignedInput, Bias, PreReLU, PostReLU>(output,
-                                                                           input,
-                                                                           weight,
-                                                                           bias);
+                    template forward<SignedInput, Bias, PreReLU, PostReLU, InputBiased128>(output,
+                                                                                          input,
+                                                                                          weight,
+                                                                                          bias);
             }
             else if constexpr (!detail::VecBatch<InSize,
                                                  int8_t,
@@ -218,10 +254,10 @@ namespace detail {
                        int8_t,
                        std::min(Alignment, 16),
                        getInstTypeOfWidth(simd::NativeInstType, 128)>::
-                    template forward<SignedInput, Bias, PreReLU, PostReLU>(output,
-                                                                           input,
-                                                                           weight,
-                                                                           bias);
+                    template forward<SignedInput, Bias, PreReLU, PostReLU, InputBiased128>(output,
+                                                                                          input,
+                                                                                          weight,
+                                                                                          bias);
             }
             else {
                 static_assert(always_false_v<std::integral_constant<int, OutSize>,
@@ -246,10 +282,15 @@ namespace detail {
         static constexpr int NumChunks = InSize / ChunkSize;
         static_assert(InSize % ChunkSize == 0, "InSize must be a multiple of ChunkSize=2");
 
-        template <bool SignedInput, bool Bias, bool PreReLU, bool PostReLU>
+        template <bool SignedInput,
+                  bool Bias,
+                  bool PreReLU,
+                  bool PostReLU,
+                  bool InputBiased128 = false>
         static void
         forward(int32_t *output, const int16_t *input, const int16_t *weight, const int32_t *bias)
         {
+            static_assert(!InputBiased128, "InputBiased128 is not supported for int16 input");
             typedef detail::VecLoadStore<int16_t, Alignment, I> I16LS;
             typedef detail::VecLoadStore<int32_t, Alignment, I> I32LS;
             typedef detail::VecOp<int16_t, I>                   I16Op;
@@ -381,14 +422,15 @@ void preprocessDynamicWeightLinear(WeightType *weight, BiasType *bias)
 /// Apply int8/int16 linear layer with int32 accumulation.
 template <int             OutSize,
           int             InSize,
-          bool            SignedInput = false,
-          bool            Bias        = true,
-          bool            PreReLU     = false,
-          bool            PostReLU    = false,
-          int             Alignment   = NativeAlignment,
-          InstructionType Inst        = NativeInstType,
-          typename AccType            = int32_t,
-          typename InputType          = int8_t>
+          bool            SignedInput    = false,
+          bool            Bias           = true,
+          bool            PreReLU        = false,
+          bool            PostReLU       = false,
+          bool            InputBiased128 = false,
+          int             Alignment      = NativeAlignment,
+          InstructionType Inst           = NativeInstType,
+          typename AccType               = int32_t,
+          typename InputType             = int8_t>
 FORCE_INLINE AccType *linear(AccType         *output,
                              const InputType *input,
                              const InputType  weight[OutSize * InSize],
@@ -397,6 +439,12 @@ FORCE_INLINE AccType *linear(AccType         *output,
     static_assert(std::is_same_v<AccType, int32_t>, "Only int32_t accumulator is supported");
     static_assert(std::is_same_v<InputType, int8_t> || std::is_same_v<InputType, int16_t>,
                   "Only int8_t or int16_t input is supported");
+    // InputBiased128 (EVAL-01): opt-in "+128 input-bias" mode for the signed-input int8
+    // path. The caller must have folded -128*Srow(weight) into `bias` at load time. Only
+    // meaningful with SignedInput and int8 input; a no-op unless USE_VNNI is defined.
+    static_assert(!InputBiased128 || SignedInput, "InputBiased128 requires SignedInput");
+    static_assert(!InputBiased128 || std::is_same_v<InputType, int8_t>,
+                  "InputBiased128 is only supported for int8_t input");
     static_assert(isAlignSizeOK(Alignment));
     assert(isPtrAligned<Alignment>(output));
     assert(isPtrAligned<Alignment>(input));
@@ -405,7 +453,10 @@ FORCE_INLINE AccType *linear(AccType         *output,
         assert(isPtrAligned<Alignment>(bias));
 
     typedef detail::Affine<OutSize, InSize, InputType, Alignment, Inst> Affine;
-    Affine::template forward<SignedInput, Bias, PreReLU, PostReLU>(output, input, weight, bias);
+    Affine::template forward<SignedInput, Bias, PreReLU, PostReLU, InputBiased128>(output,
+                                                                                  input,
+                                                                                  weight,
+                                                                                  bias);
 
     return output + OutSize;
 }

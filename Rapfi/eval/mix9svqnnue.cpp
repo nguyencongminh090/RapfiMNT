@@ -130,6 +130,34 @@ private:
     int getBucketIndex() { return 0; }
 };
 
+/// EVAL-01: fold the "+128 input-bias" correction into the value_corner_down bias.
+///
+/// The VNNI biased affine path (simd::linear<..., InputBiased128=true>) feeds
+/// (s ^ 0x80) == s + 128 to a single vpdpbusd, computing
+///   Sum_i (s_i + 128) * w[r][i] = Sum_i s_i * w[r][i]  +  128 * Sum_i w[r][i].
+/// Subtracting 128 * rowsum(w) from bias[r] here cancels the extra term, so the
+/// int32 accumulator is bit-identical to the unbiased signed-input path.
+///
+/// MUST be called on the ORIGINAL row-major weight, i.e. BEFORE
+/// simd::preprocessLinear permutes it. Gated on the SAME USE_VNNI macro as the
+/// kernel XOR path so a build never applies one without the other. No-op otherwise.
+void foldValueCornerDownInputBias(const int8_t *weight, int32_t *bias, int outSize, int inSize)
+{
+#if defined(USE_VNNI)
+    for (int r = 0; r < outSize; r++) {
+        int32_t rowsum = 0;
+        for (int c = 0; c < inSize; c++)
+            rowsum += static_cast<int32_t>(weight[r * inSize + c]);
+        bias[r] -= 128 * rowsum;
+    }
+#else
+    (void)weight;
+    (void)bias;
+    (void)outSize;
+    (void)inSize;
+#endif
+}
+
 }  // namespace Evaluation::mix9svq
 
 namespace {
@@ -202,6 +230,13 @@ struct Mix9svqWeightLoader : WeightLoader<mix9svq::Weight>
     {
         simd::preprocessLinear<OutSize * 2, InSize>(b.value_corner_up1.weight);
         simd::preprocessLinear<OutSize * 2, InSize>(b.value_corner_up2.weight);
+        // EVAL-01: fold the VNNI +128 input-bias correction into value_corner_down's
+        // bias BEFORE preprocessLinear scrambles the (still row-major) weight. No-op
+        // on non-VNNI builds. The matching kernel XOR path is gated on the same macro.
+        foldValueCornerDownInputBias(b.value_corner_down.weight,
+                                     b.value_corner_down.bias,
+                                     OutSize,
+                                     OutSize);
         simd::preprocessLinear<OutSize, OutSize>(b.value_corner_down.weight);
     }
 };
@@ -234,10 +269,15 @@ starBlock(int8_t output[OutSize], int8_t input[InSize], const StarBlockWeight<Ou
     simd::dot2<OutSize, 128>(dotsum, up1, up2);
 
     alignas(Alignment) int32_t outputi32[OutSize];
-    simd::linear<OutSize, OutSize, true>(outputi32,
-                                         dotsum,
-                                         w.value_corner_down.weight,
-                                         w.value_corner_down.bias);
+    // EVAL-01: InputBiased128=true -> single vpdpbusd on (dotsum ^ 0x80); the
+    // -128*rowsum(w) correction was folded into value_corner_down.bias at load time
+    // (foldValueCornerDownInputBias). Template args:
+    // <OutSize, InSize, SignedInput, Bias, PreReLU, PostReLU, InputBiased128>.
+    simd::linear<OutSize, OutSize, /*SignedInput=*/true, /*Bias=*/true, /*PreReLU=*/false,
+                 /*PostReLU=*/false, /*InputBiased128=*/true>(outputi32,
+                                                              dotsum,
+                                                              w.value_corner_down.weight,
+                                                              w.value_corner_down.bias);
     simd::crelu<OutSize, 128>(output, outputi32);
 }
 
