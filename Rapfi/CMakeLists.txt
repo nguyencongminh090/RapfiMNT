@@ -148,6 +148,12 @@ option(USE_ORT_GPU_EP "Enable ONNX GPU execution providers" OFF)
 option(ORT_ROOTDIR "Root directory of onnxruntime" "")
 
 option(ENABLE_LTO "Enable link time optimization" OFF)
+# Profile-guided optimization (GNU/Clang only). See scripts/pgo_build.sh for the full cycle.
+#   GENERATE: build an instrumented binary that writes profile data when run.
+#   USE:      rebuild using PGO_PROFILE (Clang: merged .profdata file; GCC: directory with .gcda).
+set(PGO_MODE "OFF" CACHE STRING "Profile-guided optimization mode: OFF, GENERATE or USE")
+set_property(CACHE PGO_MODE PROPERTY STRINGS OFF GENERATE USE)
+set(PGO_PROFILE "" CACHE PATH "Profile data used when PGO_MODE=USE")
 option(FORCE_ASSERTION "Enable force assertion for all build type" OFF)
 option(USE_ASAN "Enable address sanitizer" OFF)
 
@@ -501,6 +507,38 @@ if(ENABLE_LTO)
     endif()
 endif()
 
+#==========================================================
+# Profile-guided optimization (applies to the `rapfi` target only, never to the tests)
+
+if(NOT PGO_MODE STREQUAL "OFF")
+    if(NOT PGO_MODE STREQUAL "GENERATE" AND NOT PGO_MODE STREQUAL "USE")
+        message(FATAL_ERROR "PGO_MODE must be OFF, GENERATE or USE (got '${PGO_MODE}').")
+    endif()
+    if(NOT (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang") OR MSVC OR EMSCRIPTEN)
+        message(FATAL_ERROR "PGO_MODE is only supported with GCC or Clang (not MSVC/clang-cl/Emscripten/AppleClang).")
+    endif()
+
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        set(PGO_GENERATE_FLAGS "-fprofile-instr-generate")
+        set(PGO_USE_FLAGS "-fprofile-instr-use=${PGO_PROFILE}")
+    else()
+        set(PGO_GENERATE_FLAGS "-fprofile-generate")
+        set(PGO_USE_FLAGS "-fprofile-use=${PGO_PROFILE}" "-fprofile-correction" "-Wno-missing-profile")
+    endif()
+
+    if(PGO_MODE STREQUAL "GENERATE")
+        message(STATUS "PGO: instrumented build (${PGO_GENERATE_FLAGS}).")
+        target_compile_options(rapfi PRIVATE ${PGO_GENERATE_FLAGS})
+        target_link_options(rapfi PRIVATE ${PGO_GENERATE_FLAGS})
+    else()
+        if(NOT PGO_PROFILE OR NOT EXISTS "${PGO_PROFILE}")
+            message(FATAL_ERROR "PGO_MODE=USE requires PGO_PROFILE to point to an existing profile (got '${PGO_PROFILE}').")
+        endif()
+        message(STATUS "PGO: optimized build using ${PGO_PROFILE}.")
+        target_compile_options(rapfi PRIVATE ${PGO_USE_FLAGS})
+    endif()
+endif()
+
 if(MSVC)
     if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
         message(STATUS "Setting up build for MSVC Clang-CL.")
@@ -669,6 +707,8 @@ if(BUILD_TESTS AND NOT EMSCRIPTEN)
     endif()
     get_target_property(_rapfi_opts rapfi COMPILE_OPTIONS)
     if(_rapfi_opts)
+        # The tests must not be instrumented or profile-optimized (see PGO_MODE).
+        list(REMOVE_ITEM _rapfi_opts ${PGO_GENERATE_FLAGS} ${PGO_USE_FLAGS})
         target_compile_options(rapfi_tests PRIVATE ${_rapfi_opts})
     endif()
 

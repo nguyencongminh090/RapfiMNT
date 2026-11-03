@@ -10,6 +10,7 @@ _(none)_
 
 ## Done
 
+- [BUILD-01 — Profile-guided optimization (PGO) build](docs/instruction/BUILD-01-pgo-build.md)
 - [VCN-02 — VCN tree search: attack-oriented search quality and real-world correctness](docs/instruction/VCN-02-attack-search-quality.md)
 - [VCN — Victory by Continuous N-level attack search mode (VC2..VC4; VC5 internal)](docs/instruction/VCN-search-mode.md)
 - [EVAL-01 — VNNI signed-input affine via +128 input-bias trick](docs/instruction/EVAL-01-vnni-i8i8-input-bias.md)
