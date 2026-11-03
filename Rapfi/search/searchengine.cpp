@@ -41,11 +41,11 @@
 
 namespace Search {
 
-namespace {
-
 /// Generate the root move list for the main thread from the current board
-/// position and options: applies block-move filtering, balance2 move pair
-/// expansion, and root symmetry filtering.
+/// position and options. When options.rootMovesWhitelist is non-empty the list
+/// is used verbatim (see below); otherwise this applies block-move filtering,
+/// balance2 move pair expansion, and root symmetry filtering.
+/// Declared in searchengine.h so the unit tests can drive it directly.
 void generateRootMoves(SearchThread &th)
 {
     auto addMoveToRootMoves = [&th](Pos m) {
@@ -78,6 +78,19 @@ void generateRootMoves(SearchThread &th)
             th.rootMoves.emplace_back(m);
         }
     };
+
+    // User-supplied root move allow-list (YXANALZ): when non-empty, use exactly this
+    // list as the depth-0 root candidates. Skip MovePicker, block-move filtering and
+    // symmetry filtering entirely - the user's list is honoured verbatim, in order.
+    // Balance2 pair expansion is unreachable here: the only caller that sets the
+    // whitelist (analyzeMoves()) forces balanceMode = BALANCE_NONE.
+    if (!th.options().rootMovesWhitelist.empty()) {
+        assert(th.options().balanceMode == Search::SearchOptions::BALANCE_NONE
+               && "rootMovesWhitelist is not supported together with a balance mode");
+        for (Pos m : th.options().rootMovesWhitelist)
+            th.rootMoves.emplace_back(m);
+        return;
+    }
 
     // Generate root moves for main search thread
     MovePicker movePicker(th.options().rule,
@@ -120,6 +133,8 @@ void generateRootMoves(SearchThread &th)
         }
     }
 }
+
+namespace {
 
 const char *DefaultSearcherName = "alphabeta";
 

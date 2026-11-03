@@ -160,6 +160,13 @@ struct SearchOptions
     /// Blocked moves, which are filtered out before searching
     std::vector<Pos> blockMoves;
 
+    /// User-supplied root move allow-list (inverse of blockMoves). When non-empty,
+    /// generateRootMoves() uses exactly this list as the depth-0 root candidates,
+    /// bypassing MovePicker, block filtering and symmetry filtering. Empty by default,
+    /// so every existing command keeps the current root-generation behaviour. Set only
+    /// by the YXANALZ handler and cleared (one-shot) at every other think entry point.
+    std::vector<Pos> rootMovesWhitelist;
+
     /// Checks if we are in analysis mode.
     bool isAnalysisMode() const { return !timeLimit && !maxNodes; }
     /// Set time control config according to the rule:

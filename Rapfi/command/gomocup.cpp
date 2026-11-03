@@ -506,6 +506,10 @@ void takeBack()
 
 void begin()
 {
+    // The YXANALZ root-move whitelist is one-shot: drop any list left by a prior
+    // YXANALZ turn so it cannot leak into this search.
+    options.rootMovesWhitelist.clear();
+
     if (board->ply() != 0)
         ERRORL("Board is not empty.");
     else
@@ -514,6 +518,9 @@ void begin()
 
 void turn()
 {
+    // One-shot YXANALZ whitelist: clear before this normal turn search.
+    options.rootMovesWhitelist.clear();
+
     auto pos = parseLegalCoord(std::cin, *board);
     if (!pos.has_value())
         return;
@@ -527,6 +534,8 @@ void turn()
 void getPosition(bool startThink)
 {
     board->newGame(options.rule);
+    // One-shot YXANALZ whitelist: clear before rebuilding the position.
+    options.rootMovesWhitelist.clear();
     options.multiPV     = 1;
     options.balanceMode = Search::SearchOptions::BALANCE_NONE;
 
@@ -655,8 +664,69 @@ void getBlock(bool remove = false)
 
 void nbest()
 {
+    // One-shot YXANALZ whitelist: YXNBEST generates its own root list.
+    options.rootMovesWhitelist.clear();
     std::cin >> options.multiPV;
     think(*board, std::max<uint16_t>(options.multiPV, 1));
+}
+
+/// YXANALZ handler: analyze an explicit user-supplied allow-list of depth-0 root
+/// moves for the side to move on the current board, instead of the engine-generated
+/// candidate list. Reads "x,y" tokens until DONE / EOF, validates each with
+/// parseLegalCoord (in-board + empty), then additionally rejects PASS, Renju
+/// forbidden points for black, and de-duplicates. If no move is valid, warns and
+/// does not search. Otherwise forces
+/// balanceMode = BALANCE_NONE, sets multiPV to the whitelist size and calls think(),
+/// which searches every listed move as its own PV line (reused printPvCompletes path).
+void analyzeMoves()
+{
+    // Rebuild the whitelist from scratch every time.
+    options.rootMovesWhitelist.clear();
+    std::vector<Pos> whitelist;
+
+    while (true) {
+        std::string coordStr;
+        std::cin >> coordStr;
+        if (std::cin.eof())
+            break;
+        upperInplace(coordStr);
+        if (coordStr == "DONE")
+            break;
+
+        std::stringstream ss;
+        ss << coordStr;
+        // parseLegalCoord prints its own error for an out-of-board / occupied /
+        // forbidden-point coord and returns nullopt -> just skip that entry.
+        std::optional<Pos> pos = parseLegalCoord(ss, *board);
+        if (!pos.has_value())
+            continue;
+        if (*pos == Pos::PASS) {
+            ERRORL("Analyze move can not be a pass, ignored.");
+            continue;
+        }
+        // parseLegalCoord only checks in-board + emptiness, not the Renju
+        // forbidden-point rule. A forbidden point is not a legal move for black,
+        // so drop it here rather than feeding an illegal root move to the search.
+        if (options.rule.rule == RENJU && board->sideToMove() == BLACK
+            && board->checkForbiddenPoint(*pos)) {
+            ERRORL("Analyze move is a forbidden point, ignored.");
+            continue;
+        }
+        if (std::count(whitelist.begin(), whitelist.end(), *pos))
+            continue;  // silently de-duplicate
+
+        whitelist.push_back(*pos);
+    }
+
+    if (whitelist.empty()) {
+        ERRORL("No valid analyze move");
+        return;
+    }
+
+    options.rootMovesWhitelist = std::move(whitelist);
+    options.balanceMode        = Search::SearchOptions::BALANCE_NONE;
+    options.multiPV = std::max<uint16_t>(1, (uint16_t)options.rootMovesWhitelist.size());
+    think(*board, options.multiPV);
 }
 
 void showForbid()
@@ -677,6 +747,9 @@ void showForbid()
 
 void balance(Search::SearchOptions::BalanceMode mode)
 {
+    // One-shot YXANALZ whitelist: clear before a balance search.
+    options.rootMovesWhitelist.clear();
+
     std::cin >> options.balanceBias;
 
     // Revert bias for balance two mode
@@ -691,12 +764,17 @@ void balance(Search::SearchOptions::BalanceMode mode)
 
 void searchDefend()
 {
+    // One-shot YXANALZ whitelist: YXSEARCHDEFEND generates its own root list.
+    options.rootMovesWhitelist.clear();
     options.multiPV = board->movesLeft();
     think(*board, std::max<uint16_t>(options.multiPV, 1));
 }
 
 void swap2board()
 {
+    // One-shot YXANALZ whitelist: clear before a swap2 search (getPosition() also
+    // clears it, but keep this explicit alongside the other think entry points).
+    options.rootMovesWhitelist.clear();
     options.rule.opRule = GameRule::SWAP2;
     getPosition(false);
 
@@ -896,6 +974,7 @@ bool runProtocol()
     else if (cmd == "YXBLOCKUNDO")         CheckBoardOK([] { getBlock(true); });
     else if (cmd == "YXBLOCKRESET")        CheckBoardOK([] { options.blockMoves.clear(); });
     else if (cmd == "YXNBEST")             CheckBoardOK(nbest);
+    else if (cmd == "YXANALZ")             CheckBoardOK(analyzeMoves);
     else if (cmd == "YXSHOWFORBID")        CheckBoardOK(showForbid);
     else if (cmd == "YXBALANCEONE")        CheckBoardOK([] { balance(Search::SearchOptions::BALANCE_ONE); });
     else if (cmd == "YXBALANCETWO")        CheckBoardOK([] { balance(Search::SearchOptions::BALANCE_TWO); });
