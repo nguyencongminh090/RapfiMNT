@@ -52,7 +52,8 @@ safe; they are not paperwork, and none of them scales with the size of the chang
    *should* move it needs a measurement, not an opinion.
 
    Baseline (gcc 15.2.0, Release, AVX512+VNNI, `echo BENCH | ./pbrain-rapfi`, first measured
-   2026-09-09): **Search Bench Nodes `16733809`, Hash `4621a98a`.**
+   2026-11-03, after syncing upstream 0.44.1): **Search Bench Nodes `17621937`, Hash `8c1f72e5`.**
+   (Previous baseline `16733809` / `4621a98a`, 2026-09-09, applies to older todo records.)
 4. **Tests actually evaluated.** Confirm the test binary was built with asserts live — see
    "Verification without a UI".
 

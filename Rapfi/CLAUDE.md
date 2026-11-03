@@ -22,7 +22,8 @@ Code, identifiers, commit messages and docs stay in English; only the conversati
   A new test file must be added to `TEST_DRIVER_SOURCES` in `CMakeLists.txt`.
 - `FORCE_ASSERTION=ON` keeps asserts in the engine for debug runs; not for benchmarking.
 - Regression: `echo BENCH | ./pbrain-rapfi` (gcc 15.2.0, Release, AVX512+VNNI) must stay **Nodes
-  `16733809`, Hash `4621a98a`** unless the change is meant to move it, in which case record why and
+  `17621937`, Hash `8c1f72e5`** (built-in config, upstream 0.44.1; was `16733809` / `4621a98a`
+  before the 2026-11-03 upstream sync) unless the change is meant to move it, in which case record why and
   the new value in the todo file. VCN scripts: `tests/vcn_{measure,selfplay,sweep}.sh`.
 - Index: `.codegraph/` is a local CodeGraph index; use `codegraph_explore` before grep/Read; do not commit it.
 
