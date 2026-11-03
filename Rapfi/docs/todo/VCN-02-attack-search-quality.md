@@ -1,6 +1,6 @@
 # VCN-02 — VCN tree search: attack-oriented search quality and real-world correctness
 
-**Status:** in progress. Items 1 and 1b done; item 4 closed (old pruning kept, one iteration
+**Status:** closed 2026-11-03 with known limitations (items 5 and 7 not planned, see §Known limitations). Items 1 and 1b done; item 4 closed (old pruning kept, one iteration
 fix) (2026-10-06). Item 6 (threat ordering) implemented and measured (-32% nodes with NNUE, wins 147→149, one known regression #117); item 5's value change is deferred. Acceptance
 position `h8j9f6i10` recorded, tracked by the move G5, not by the value (see §Acceptance position).
 
