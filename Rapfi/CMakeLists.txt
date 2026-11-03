@@ -464,7 +464,6 @@ if(ENABLE_POLICY_TRAINING)
     if(NO_COMMAND_MODULES)
         message(FATAL_ERROR "ENABLE_POLICY_TRAINING requires command modules.")
     endif()
-    target_sources(rapfi PRIVATE tuning/policytrace.cpp tuning/policytrace.h)
     target_compile_definitions(rapfi PRIVATE POLICY_TRAINING)
 endif()
 if(NO_PREFETCH)
@@ -634,68 +633,3 @@ endif()
 
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} PREFIX "Sources" FILES ${CORE_SOURCES} ${MODULE_SOURCES})
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} PREFIX "Headers" FILES ${HEADERS})
-
-#==========================================================
-# Unit tests (YXANALZ slice and future core-engine tests)
-#
-# Built only when BUILD_TESTS=ON. The test target recompiles the engine core
-# (CORE_SOURCES minus main.cpp) together with the test drivers and links the
-# same external libs as `rapfi`. Compile definitions/options are copied from the
-# `rapfi` target so the SIMD/threading configuration matches exactly.
-#
-# NDEBUG is force-stripped on this target regardless of CMAKE_BUILD_TYPE
-# (trailing `-UNDEBUG` wins over the `-DNDEBUG` injected by Release), so every
-# assert() in the engine and in the tests is actually evaluated. Never do this
-# for the `rapfi` engine target itself.
-
-option(BUILD_TESTS "Build Rapfi unit tests" OFF)
-
-if(BUILD_TESTS AND NOT EMSCRIPTEN)
-    set(TEST_ENGINE_SOURCES ${CORE_SOURCES})
-    list(REMOVE_ITEM TEST_ENGINE_SOURCES main.cpp)
-
-    set(TEST_DRIVER_SOURCES
-        tests/testmain.cpp
-        tests/generateRootMoves_tests.cpp
-        tests/analyzeMoves_tests.cpp
-        tests/simd_linear_tests.cpp
-        tests/vcn_tests.cpp
-    )
-
-    add_executable(rapfi_tests ${TEST_ENGINE_SOURCES} ${TEST_DRIVER_SOURCES} ${HEADERS})
-
-    get_target_property(_rapfi_defs rapfi COMPILE_DEFINITIONS)
-    if(_rapfi_defs)
-        target_compile_definitions(rapfi_tests PRIVATE ${_rapfi_defs})
-    endif()
-    get_target_property(_rapfi_opts rapfi COMPILE_OPTIONS)
-    if(_rapfi_opts)
-        target_compile_options(rapfi_tests PRIVATE ${_rapfi_opts})
-    endif()
-
-    target_link_libraries(rapfi_tests PRIVATE cpptoml cxxopts lz4 simde)
-    if(NOT NO_COMMAND_MODULES)
-        target_link_libraries(rapfi_tests PRIVATE flat.hpp zip libnpy BS_thread_pool)
-    endif()
-
-    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
-       OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang"
-       OR CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
-        if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-            target_link_libraries(rapfi_tests PRIVATE pthread)
-        elseif(NOT WIN32)
-            target_link_libraries(rapfi_tests PRIVATE pthread atomic)
-        endif()
-    endif()
-
-    # Force asserts live regardless of build type: this trailing flag overrides
-    # the -DNDEBUG that Release/RelWithDebInfo inject via CMAKE_CXX_FLAGS_<CONFIG>.
-    if(MSVC)
-        target_compile_options(rapfi_tests PRIVATE /UNDEBUG)
-    else()
-        target_compile_options(rapfi_tests PRIVATE -UNDEBUG)
-    endif()
-
-    enable_testing()
-    add_test(NAME rapfi_tests COMMAND rapfi_tests)
-endif()

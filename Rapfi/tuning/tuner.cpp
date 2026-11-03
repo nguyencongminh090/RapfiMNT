@@ -58,7 +58,6 @@
 namespace {
 
 using Tuning::Float;
-using Tuning::LossType;
 using Tuning::PolicyCandidate;
 using Tuning::PolicyTargetTerm;
 using Tuning::PreparedCacheKey;
@@ -200,16 +199,10 @@ inline Float sigmoid(Float x)
     return Float(1) / (Float(1) + std::exp(-x));
 }
 
-inline Float lossFunction(LossType lt, Float logit, Float target)
+// Binary cross-entropy relative to the target entropy; the half scale is
+// shared by calibration, reporting, and the matching logit gradient.
+inline Float lossFunction(Float logit, Float target)
 {
-    Float pred = sigmoid(logit);
-    switch (lt) {
-    case LossType::L1: return std::abs(target - pred);
-    case LossType::L2: {
-        Float dist = target - pred;
-        return dist * dist;
-    }
-    case LossType::BCE: {
         Float loss =
             std::max(logit, Float(0)) - logit * target + std::log1p(std::exp(-std::abs(logit)));
         Float targetBias = 0;
@@ -219,20 +212,10 @@ inline Float lossFunction(LossType lt, Float logit, Float target)
             targetBias += (1 - target) * std::log1p(-target);
         return (loss + targetBias) / 2;
     }
-    }
-    throw std::logic_error("unknown loss type");
-}
 
-inline Float lossFunctionLogitGrad(LossType lt, Float logit, Float target)
+inline Float lossFunctionLogitGrad(Float logit, Float target)
 {
-    Float pred = sigmoid(logit);
-    Float diff = pred - target;
-    switch (lt) {
-    case LossType::L1: return ((Float(0) < diff) - (diff < Float(0))) * pred * (Float(1) - pred);
-    case LossType::L2: return Float(2) * diff * pred * (Float(1) - pred);
-    case LossType::BCE: return diff / 2;
-    }
-    throw std::logic_error("unknown loss type");
+    return (sigmoid(logit) - target) / 2;
 }
 
 template <typename T, typename UnaryOp>
@@ -294,8 +277,7 @@ template <bool UseTunedEval>
 Float computeEvalLoss(const PreparedCorpus         &corpus,
                       size_t                        sample,
                       const std::vector<TuneParam> &params,
-                      Float                         K,
-                      LossType                      loss)
+                      Float                         K)
 {
     if (corpus.evalOffsets()[sample] == corpus.evalOffsets()[sample + 1])
         return 0;
@@ -303,7 +285,7 @@ Float computeEvalLoss(const PreparedCorpus         &corpus,
     Float eval   = UseTunedEval ? computeLinearEval(corpus, sample, params)
                                 : Float(corpus.staticEvals()[sample]);
     Float result = Float(corpus.results()[sample]) * Float(0.5);
-    return lossFunction(loss, eval * K, result);
+    return lossFunction(eval * K, result);
 }
 
 void computeEvalGradient(const PreparedCorpus         &corpus,
@@ -311,7 +293,6 @@ void computeEvalGradient(const PreparedCorpus         &corpus,
                          std::vector<TuneGradient>    &grads,
                          const std::vector<TuneParam> &params,
                          Float                         K,
-                         LossType                      loss,
                          Float                         sampleWeight)
 {
     uint32_t begin = corpus.evalOffsets()[sample];
@@ -321,7 +302,7 @@ void computeEvalGradient(const PreparedCorpus         &corpus,
 
     Float       result    = Float(corpus.results()[sample]) * Float(0.5);
     Float       logit     = computeLinearEval(corpus, sample, params) * K;
-    Float       dL_dEval  = lossFunctionLogitGrad(loss, logit, result) * K * sampleWeight;
+    Float       dL_dEval  = lossFunctionLogitGrad(logit, result) * K * sampleWeight;
     const auto &evalTerms = corpus.evalTerms();
     for (uint32_t i = begin; i < end; i++)
         grads[evalTerms[i].index] += evalTerms[i].coeff * dL_dEval;
@@ -436,28 +417,31 @@ Tuning::TuningConfig validatedCurriculumConfig(const std::vector<Tuning::TuningP
             throw std::invalid_argument(
                 "tuning curriculum phase MultiPV eval scale requires a positive temperature");
         if (!(phase.tuneEval || phase.tuneMoveScore || phase.trainCompactPolicy))
+            throw std::invalid_argument("tuning curriculum phases require an active objective");
+        if (phase.trainCompactPolicy && phase.tuneMoveScore)
             throw std::invalid_argument(
-                "tuning curriculum phases require an active objective");
+                "compact_policy and move_score must use separate curriculum phases");
         if (hasTraditionalPhase && phase.trainCompactPolicy && !phase.tuneEval
-            && !phase.tuneMoveScore && i + 1 != phases.size())
+            && !phase.tuneMoveScore)
             throw std::invalid_argument(
-                "a pure compact-policy phase must end a mixed tuning curriculum");
-        if (!std::isfinite(phaseConfig.learningRate) || phaseConfig.learningRate <= 0)
-            throw std::invalid_argument(
-                "tuning curriculum phase learning rate must be finite and positive");
-        if (!std::isfinite(phaseConfig.weightDecay) || phaseConfig.weightDecay < 0)
-            throw std::invalid_argument(
-                "tuning curriculum phase weight decay must be finite and nonnegative");
-        if (phaseConfig.learningRateSchedule != Tuning::LearningRateSchedule::Constant
-            && (!std::isfinite(phaseConfig.finalLearningRate) || phaseConfig.finalLearningRate <= 0
-                || phaseConfig.finalLearningRate > phaseConfig.learningRate))
-            throw std::invalid_argument("tuning curriculum phase final learning rate is invalid");
+                "compact-policy-only phases require a separate tuning invocation");
+        if (phase.tuneEval || phase.tuneMoveScore) {
+            if (!std::isfinite(phaseConfig.learningRate) || phaseConfig.learningRate <= 0)
+                throw std::invalid_argument(
+                    "tuning curriculum phase learning rate must be finite and positive");
+            if (!std::isfinite(phaseConfig.weightDecay) || phaseConfig.weightDecay < 0)
+                throw std::invalid_argument(
+                    "tuning curriculum phase weight decay must be finite and nonnegative");
+            if (phaseConfig.learningRateSchedule != Tuning::LearningRateSchedule::Constant
+                && (!std::isfinite(phaseConfig.finalLearningRate)
+                    || phaseConfig.finalLearningRate <= 0
+                    || phaseConfig.finalLearningRate > phaseConfig.learningRate))
+                throw std::invalid_argument(
+                    "tuning curriculum phase final learning rate is invalid");
+        }
         if (phaseConfig.multiPVPolicyTemperature > 0 && !phaseConfig.tuneMoveScore)
             throw std::invalid_argument(
                 "tuning curriculum phase MultiPV targets require move-score tuning");
-        if (phaseConfig.multiPVPolicyTemperature > 0 && config.moveScoreLossGamma != 0)
-            throw std::invalid_argument(
-                "tuning curriculum phase MultiPV targets require move-score-loss-gamma=0");
         if (phase.projectMoveScoreAtEnd && !phase.tuneMoveScore)
             throw std::invalid_argument(
                 "project_move_score_at_end requires an active move_score objective");
@@ -1109,10 +1093,8 @@ void Tuner::runImpl(size_t                               epochs,
     // Set Float output precision
     std::cout << std::setprecision(std::min(std::numeric_limits<Float>::digits10, 7)) << std::fixed;
 
-    auto emitCompactPolicyStatistic = [&](size_t globalEpoch,
-                                          size_t phaseIndex,
-                                          size_t localEpoch,
-                                          double scalingFactor) {
+    auto emitCompactPolicyStatistic =
+        [&](size_t globalEpoch, size_t phaseIndex, size_t localEpoch, double scalingFactor) {
         if (!callback)
             return;
         TuningStatistic stat {};
@@ -1128,8 +1110,7 @@ void Tuner::runImpl(size_t                               epochs,
     };
 
     const bool compactOnlyCurriculum =
-        phases
-        && std::all_of(phases->begin(), phases->end(), [](const TuningPhase &phase) {
+        phases && std::all_of(phases->begin(), phases->end(), [](const TuningPhase &phase) {
                return phase.trainCompactPolicy && !phase.tuneEval && !phase.tuneMoveScore;
            });
     if (compactOnlyCurriculum) {
@@ -1143,8 +1124,10 @@ void Tuner::runImpl(size_t                               epochs,
             for (size_t localEpoch = firstLocalEpoch; localEpoch <= phase.epochs; localEpoch++) {
                 if (phaseIndex != 0 || localEpoch != 0)
                     globalEpoch++;
-                emitCompactPolicyStatistic(
-                    globalEpoch, phaseIndex, localEpoch, Evaluation::ScalingFactor);
+                emitCompactPolicyStatistic(globalEpoch,
+                                           phaseIndex,
+                                           localEpoch,
+                                           Evaluation::ScalingFactor);
             }
         }
         if (globalEpoch != epochs)
@@ -1185,14 +1168,16 @@ void Tuner::runImpl(size_t                               epochs,
 
     // Init gradient array and optimizer
     std::vector<TuneGradient> gradients(tuneParams.size());
-    std::vector<TuneParam>    parameterLearningRates;
     AdamOptimizer<TuneParam>  optim(tuneParams.size(),
                                    TuneParam(config.learningRate),
                                    TuneParam(config.weightDecay));
     MESSAGEL("Start training for "
-             << epochs << " epochs, initial lr = " << optim.currentLR()
-             << ", final lr = " << learningRateForEpoch(config, epochs, epochs) << ", batch size = "
-             << config.batchSize << ", number of batches = " << numBatches << ".");
+             << epochs << " epochs, initial lr = " << optim.currentLR() << ", final lr = "
+             << learningRateForEpoch(config,
+                                     phases ? phases->front().epochs : epochs,
+                                     phases ? phases->front().epochs : epochs)
+             << ", batch size = " << config.batchSize << ", number of batches = " << numBatches
+             << ".");
 
     auto updateBatch = [&](const PreparedCorpus        &entries,
                            size_t                       batchBegin,
@@ -1204,7 +1189,7 @@ void Tuner::runImpl(size_t                               epochs,
             }))
             throw std::runtime_error("non-finite gradient in tuning batch");
         if (phaseObjectiveMasking)
-            optim.stepMasked(tuneParams, gradients, parameterLearningRates, trainableParams);
+            optim.stepMasked(tuneParams, gradients, trainableParams);
         else
             optim.step(tuneParams, gradients);
     };
@@ -1219,8 +1204,7 @@ void Tuner::runImpl(size_t                               epochs,
                  << ", validation samples "
                  << (valFileCorpus ? valFileCorpus->size() : valTuneEntries.size()) << ", batch "
                  << config.batchSize << ", cache " << config.preparedCachePath.string()
-                 << (config.tuneMoveScore
-                         ? ", MultiPV temperature "
+                 << (config.tuneMoveScore ? ", MultiPV temperature "
                                + std::to_string(config.multiPVPolicyTemperature)
                          : std::string())
                  << ".");
@@ -1239,7 +1223,6 @@ void Tuner::runImpl(size_t                               epochs,
             if ((*phases)[phaseIndex].coalesceMoveScoreAtEnd) {
                 coalesceMoveScoreLayout(optim);
                 gradients.assign(tuneParams.size(), TuneGradient(0));
-                parameterLearningRates.clear();
                 partitionGradients.clear();
                 for (size_t future = phaseIndex + 1; future < inactiveCorpusStates.size(); future++)
                     inactiveCorpusStates[future] = CorpusState {};
@@ -1247,22 +1230,10 @@ void Tuner::runImpl(size_t                               epochs,
             phaseIndex++;
             applyPhaseConfig((*phases)[phaseIndex]);
             const TuningPhase &nextPhase = (*phases)[phaseIndex];
-            if (nextPhase.trainCompactPolicy && !nextPhase.tuneEval && !nextPhase.tuneMoveScore) {
-                if (phaseIndex + 1 != phases->size())
-                    throw std::logic_error(
-                        "a pure compact-policy phase must end a mixed tuning curriculum");
-                MESSAGEL("Terminal compact-policy phase "
-                         << (phaseIndex + 1) << '/' << phases->size() << " [" << nextPhase.name
-                         << "] begins at global epoch " << epoch << '.');
-                for (size_t localEpoch = 1; localEpoch <= nextPhase.epochs; localEpoch++)
-                    emitCompactPolicyStatistic(
-                        epoch + localEpoch - 1, phaseIndex, localEpoch, 1.0 / double(K));
-                if (epoch + nextPhase.epochs - 1 != epochs)
-                    throw std::logic_error("terminal compact-policy epoch count mismatch");
-                Time totalElapsed = now() - initTime;
-                MESSAGEL("Training completed in " << (totalElapsed / 1000) << " seconds.");
-                return;
-            }
+            // Compact residuals must use the frozen base that final export installs.
+            // The new phase has no move-score objective, so this does not reproject it.
+            if (nextPhase.trainCompactPolicy)
+                installParams();
             optim.setWeightDecay(TuneParam(config.weightDecay));
             if (!inactiveCorpusStates[phaseIndex].prepared) {
                 prepareCorpus(*(*phases)[phaseIndex].trainingDataset,
@@ -1281,8 +1252,7 @@ void Tuner::runImpl(size_t                               epochs,
                 << (valFileCorpus ? valFileCorpus->size() : valTuneEntries.size()) << ", batch "
                 << config.batchSize << ", cache " << config.preparedCachePath.string()
                 << (config.tuneMoveScore
-                        ? ", MultiPV temperature "
-                              + std::to_string(config.multiPVPolicyTemperature)
+                        ? ", MultiPV temperature " + std::to_string(config.multiPVPolicyTemperature)
                         : std::string())
                 << ".");
             if (config.tuneEval && !config.usePreviousScalingFactor) {
@@ -1293,13 +1263,9 @@ void Tuner::runImpl(size_t                               epochs,
         }
 
         if (epoch > 0) {
-            const bool   localSchedule  = phases && (*phases)[phaseIndex].localLearningRateSchedule;
-            const size_t scheduleEpoch  = localSchedule ? phaseEpoch + 1 : epoch;
-            const size_t scheduleEpochs = localSchedule ? (*phases)[phaseIndex].epochs : epochs;
+            const size_t scheduleEpoch  = phases ? phaseEpoch + 1 : epoch;
+            const size_t scheduleEpochs = phases ? (*phases)[phaseIndex].epochs : epochs;
             optim.setLR(learningRateForEpoch(config, scheduleEpoch, scheduleEpochs));
-            if (phaseObjectiveMasking) {
-                parameterLearningRates.assign(tuneParams.size(), optim.currentLR());
-            }
             if (trainFileCorpus) {
                 size_t batchesProcessed = 0;
                 for (size_t shard = 0; shard < trainFileCorpus->shardCount(); shard++) {
@@ -1326,10 +1292,7 @@ void Tuner::runImpl(size_t                               epochs,
         // Recalibrate against the parameters updated by this epoch before
         // reporting metrics or exporting a checkpoint with the new scale.
         if (config.tuneEval && !config.usePreviousScalingFactor && epoch > 0
-            && config.recomputeInterval
-            && ((phases && (*phases)[phaseIndex].localRecomputeSchedule ? phaseEpoch : epoch)
-                    % config.recomputeInterval
-                == 0)
+            && config.recomputeInterval && phaseEpoch % config.recomputeInterval == 0
             && !recalibratedAtBoundary) {
             K = searchOptimalInvScalingFactor(true);
         }
@@ -1552,8 +1515,7 @@ std::vector<Float> Tuner::computeEvaluationLossGrid(const std::vector<Float> &ca
                                 ::computeEvalLoss<UseTunedEval>(entries,
                                                                 sample,
                                                                 tuneParams,
-                                                                candidates[candidate],
-                                                                config.lossType)
+                                                                candidates[candidate])
                                 * sampleWeight;
                     }
                     return blockLosses;
@@ -1586,112 +1548,13 @@ std::vector<Float> Tuner::computeEvaluationLossGrid(const std::vector<Float> &ca
     return total;
 }
 
-/// computeEvaluationLoss() computes loss between the current tuned/static
-/// evaluation and target win rate in all tune entries using the given K.
-template <bool UseTunedEval>
-Float Tuner::computeEvaluationLoss(Float K, bool validation) const
-{
-    if (!config.tuneEval)
-        return Float(0.0);
-
-    const FileBackedCorpus *fileCorpus = validation ? valFileCorpus.get() : trainFileCorpus.get();
-    if (fileCorpus) {
-        if (fileCorpus->empty())
-            return Float(0.0);
-
-        Float total = 0;
-        for (size_t shard = 0; shard < fileCorpus->shardCount(); shard++) {
-            PreparedCorpus entries = fileCorpus->load(shard);
-            total += parallelIndexReduce<Float>(threadPool,
-                                                entries.size(),
-                                                Float(0.0),
-                                                [this, &entries, K](size_t sample) {
-                                                    return ::computeEvalLoss<UseTunedEval>(
-                                                        entries,
-                                                        sample,
-                                                        tuneParams,
-                                                        K,
-                                                        config.lossType);
-                                                });
-        }
-        return total / Float(fileCorpus->size());
-    }
-
-    const PreparedCorpus &entries = validation ? valTuneEntries : trainTuneEntries;
-
-    if (entries.empty())
-        return Float(0.0);
-
-    return parallelIndexReduce<Float>(threadPool,
-                                      entries.size(),
-                                      Float(0.0),
-                                      [this, &entries, K, validation](size_t logicalSample) {
-                                          size_t sample = !validation && !trainSampleOrder.empty()
-                                                              ? trainSampleOrder[logicalSample]
-                                                              : logicalSample;
-                                          return ::computeEvalLoss<UseTunedEval>(entries,
-                                                                                 sample,
-                                                                                 tuneParams,
-                                                                                 K,
-                                                                                 config.lossType);
-                                      })
-           / Float(entries.size());
-}
-
-/// computeMoveScoreLoss() computes loss of current move scores between
-/// the target best move in all tune entries.
-Float Tuner::computeMoveScoreLoss(bool validation) const
-{
-    if (!config.tuneMoveScore)
-        return Float(0.0);
-
-    const MoveScoreLossSettings settings = makeMoveScoreLossSettings(config);
-    const FileBackedCorpus *fileCorpus   = validation ? valFileCorpus.get() : trainFileCorpus.get();
-    if (fileCorpus) {
-        if (fileCorpus->empty())
-            return Float(0.0);
-
-        Float total = 0;
-        for (size_t shard = 0; shard < fileCorpus->shardCount(); shard++) {
-            PreparedCorpus entries = fileCorpus->load(shard);
-            total += parallelIndexReduce<Float>(
-                threadPool,
-                entries.size(),
-                Float(0.0),
-                [this, &entries, &settings](size_t sample) {
-                    return detail::computeMoveScoreLoss(entries, sample, tuneParams, settings);
-                });
-        }
-        return total / Float(fileCorpus->size());
-    }
-
-    const PreparedCorpus &entries = validation ? valTuneEntries : trainTuneEntries;
-
-    if (entries.empty())
-        return Float(0.0);
-
-    return parallelIndexReduce<Float>(
-               threadPool,
-               entries.size(),
-               Float(0.0),
-               [this, &entries, &settings, validation](size_t logicalSample) {
-                   size_t sample = !validation && !trainSampleOrder.empty()
-                                       ? trainSampleOrder[logicalSample]
-                                       : logicalSample;
-                   return detail::computeMoveScoreLoss(entries, sample, tuneParams, settings);
-               })
-           / Float(entries.size());
-}
-
 std::pair<Float, Float> Tuner::computeLosses(Float K, bool validation) const
 {
     const FileBackedCorpus *fileCorpus   = validation ? valFileCorpus.get() : trainFileCorpus.get();
     const MoveScoreLossSettings settings = makeMoveScoreLossSettings(config);
     auto sampleLoss = [this, K, &settings](const PreparedCorpus &entries, size_t sample) {
         return LossPair {
-            config.tuneEval
-                ? ::computeEvalLoss<true>(entries, sample, tuneParams, K, config.lossType)
-                : Float(0),
+            config.tuneEval ? ::computeEvalLoss<true>(entries, sample, tuneParams, K) : Float(0),
             config.tuneMoveScore
                 ? detail::computeMoveScoreLoss(entries, sample, tuneParams, settings)
                 : Float(0),
@@ -1756,11 +1619,7 @@ Tuner::computeValidationLossesByBoard(Float K) const
                         total.samples[boardSize]++;
                         if (config.tuneEval)
                             total.losses[boardSize].value +=
-                                ::computeEvalLoss<true>(entries,
-                                                        sample,
-                                                        tuneParams,
-                                                        K,
-                                                        config.lossType);
+                                ::computeEvalLoss<true>(entries, sample, tuneParams, K);
                         if (config.tuneMoveScore)
                             total.losses[boardSize].policy +=
                                 detail::computeMoveScoreLoss(entries, sample, tuneParams, settings);
@@ -1838,13 +1697,7 @@ void Tuner::computeGradientBatch(std::vector<TuneGradient>   &grads,
                     if (boardSize == 0 || boardSize > MAX_BOARD_SIZE)
                         throw std::runtime_error("prepared sample board size exceeds engine limit");
                     Float sampleWeight = trainBoardSampleWeights[boardSize];
-                    ::computeEvalGradient(entries,
-                                          sample,
-                                          localGrads,
-                                          tuneParams,
-                                          K,
-                                          config.lossType,
-                                          sampleWeight);
+                    ::computeEvalGradient(entries, sample, localGrads, tuneParams, K, sampleWeight);
                     detail::computeMoveScoreGradient(entries,
                                                      sample,
                                                      localGrads,

@@ -35,13 +35,13 @@ class Evaluator;  // forward declaration (eval/evaluator.h)
 /// EvaluatorConfig groups the classical/evaluator switching margins and draw
 /// adjustments read from "[model.evaluator]". One mutable global instance
 /// (EvalCfg) holds the live configuration; config.cpp's readEvaluator fills it
-/// (behind the type+weights gate - a margins-only table has no effect), and
+/// (a present table must include a type and nonempty weights), and
 /// the gomocup INFO handlers assign the draw fields directly.
 struct EvaluatorConfig
 {
-    float marginWinLossScale[RULE_NB]    = {1.18f, 1.18f, 1.18f};
-    float marginWinLossExponent[RULE_NB] = {3.07f, 3.07f, 3.07f};
-    float marginScale[RULE_NB]           = {395.0f, 395.0f, 395.0f};
+    float marginWinLossScale[RULE_NB]    = {1.22f, 0.86f, 1.24f};
+    float marginWinLossExponent[RULE_NB] = {3.04f, 3.44f, 2.56f};
+    float marginScale[RULE_NB]           = {351.0f, 379.2f, 389.4f};
     float drawBlackWinRate               = 0.5f;
     float drawRatio                      = 1.0f;
 };

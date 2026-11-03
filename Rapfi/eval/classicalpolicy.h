@@ -18,9 +18,9 @@
 
 #pragma once
 
-#include "../core/pos.h"
 #include "scoretables.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -57,19 +57,17 @@ constexpr size_t policyPatternStorageIndex(Pattern4 pattern)
     return size_t(pattern) - (pattern > FORBID);
 }
 
+/// Packed current-model rows omit QUIET and FORBID; installation also rebuilds activation.
+using StoredPolicyCrossTable =
+    std::array<Score,
+               PolicyStoredContextCount * PolicyStoredPatternCount * PolicyStoredPatternCount>;
+
 extern Score   POLICY_CROSS[RULE_NB + 1][PolicyContextCount][PATTERN4_NB][PATTERN4_NB];
 extern uint8_t POLICY_CROSS_ACTIVE_MASK[RULE_NB + 1];
-extern bool    POLICY_CROSS_PRESENT;
 
 void resetPolicyCross();
-void activatePolicyCross();
-void refreshPolicyCrossActivation();
-bool hasDefaultPolicyCross();
-
-inline bool isPolicyCrossPresent()
-{
-    return POLICY_CROSS_PRESENT;
-}
+void                   installPolicyCross(size_t table, const StoredPolicyCrossTable &values);
+StoredPolicyCrossTable storedPolicyCross(size_t table);
 
 inline uint8_t policyCrossActiveMask(Rule rule, Color sideToMove)
 {
@@ -101,10 +99,10 @@ struct ClassicalPolicyBlend
 
 inline constexpr int ClassicalPolicyBlendWeights[RULE_NB + 1][ClassicalPolicyBlend::COMPONENT_NB] =
     {
-        {230, 264, -20, 119},
-        {256, 256, 0, 0},
-        {256, 256, 0, 0},
-        {256, 256, 0, 0},
+        {235, 264, -25, 121},
+        {292, 265, 14, 16},
+        {271, 247, 17, 6},
+        {289, 272, 16, 40},
 };
 
 inline const int *classicalPolicyBlendWeights(Rule rule, Color sideToMove)
@@ -142,7 +140,34 @@ inline int composeClassicalPolicyScore(const int *weights,
                                        weights[ClassicalPolicyBlend::OPPONENT_DEFENSE]);
 }
 
-int classicalPolicyBaseScore(Rule rule, Color self, PatternCode pcodeBlack, PatternCode pcodeWhite);
+inline int classicalPolicyBaseScore(Rule        rule,
+                                    Color       self,
+                                    PatternCode pcodeBlack,
+                                    PatternCode pcodeWhite,
+                                    const int  *weights)
+{
+    const Color         opponent               = ~self;
+    const MoveScorePair patternScores[SIDE_NB] = {
+        getMoveScorePair(rule, BLACK, pcodeBlack),
+        getMoveScorePair(rule, WHITE, pcodeWhite),
+    };
+    return composeClassicalPolicyScore(weights,
+                                       patternScores[self].byOwner,
+                                       patternScores[opponent].byOpponent,
+                                       patternScores[opponent].byOwner,
+                                       patternScores[self].byOpponent);
+}
+
+/// Returns the wide base before adding the compact residual and saturating.
+inline int
+classicalPolicyBaseScore(Rule rule, Color self, PatternCode pcodeBlack, PatternCode pcodeWhite)
+{
+    return classicalPolicyBaseScore(rule,
+                                    self,
+                                    pcodeBlack,
+                                    pcodeWhite,
+                                    classicalPolicyBlendWeights(rule, self));
+}
 
 /// Position-bound classical policy scorer. Context and blend selection are computed once,
 /// while score() remains an inline per-candidate hot-path operation.
@@ -156,27 +181,15 @@ public:
                 Pattern4    selfPattern,
                 Pattern4    opponentPattern) const
     {
-        MoveScorePair patternScores[SIDE_NB] = {
-            getMoveScorePair(rule_, BLACK, pcodeBlack),
-            getMoveScorePair(rule_, WHITE, pcodeWhite),
-        };
-        const Score selfAttack      = patternScores[self_].byOwner;
-        const Score selfDefense     = patternScores[opponent_].byOpponent;
-        const Score opponentAttack  = patternScores[opponent_].byOwner;
-        const Score opponentDefense = patternScores[self_].byOpponent;
-        int result = composeClassicalPolicyScore(
-            blendWeights_, selfAttack, selfDefense, opponentAttack, opponentDefense);
+        int result = classicalPolicyBaseScore(rule_, self_, pcodeBlack, pcodeWhite, blendWeights_);
         if (policyCrossActive_)
             result += getPolicyCross(rule_, self_, context_, selfPattern, opponentPattern);
         return clampMoveScore(result);
     }
 
-    Score score(const Board &board, Pos pos) const;
-
 private:
     Rule          rule_;
     Color         self_;
-    Color         opponent_;
     const int    *blendWeights_;
     PolicyContext context_;
     bool          policyCrossActive_;

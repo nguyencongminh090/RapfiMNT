@@ -257,18 +257,12 @@ namespace {
     std::vector<double> initialParameters(const std::vector<int> &destinationTables)
     {
         std::vector<double> parameters(ParameterCount * destinationTables.size());
-        for (size_t tableSlot = 0; tableSlot < destinationTables.size(); tableSlot++)
-            for (size_t context = 0; context < ContextCount; context++)
-                for (size_t self = 0; self < PatternCount; self++)
-                    for (size_t opponent = 0; opponent < PatternCount; opponent++) {
-                        const size_t index = tableSlot * ParameterCount
-                                             + (context * PatternCount + self) * PatternCount
-                                             + opponent;
-                        parameters[index] = Evaluation::POLICY_CROSS
-                            [destinationTables[tableSlot]][context]
-                            [Evaluation::policyPatternFromStorageIndex(self)]
-                            [Evaluation::policyPatternFromStorageIndex(opponent)];
-                    }
+        for (size_t tableSlot = 0; tableSlot < destinationTables.size(); tableSlot++) {
+            const auto values = Evaluation::storedPolicyCross(destinationTables[tableSlot]);
+            std::copy(values.begin(),
+                      values.end(),
+                      parameters.begin() + tableSlot * ParameterCount);
+        }
         return parameters;
     }
 
@@ -286,19 +280,13 @@ namespace {
     void installParameters(const std::vector<Score> &parameters,
                            const std::vector<int>   &destinationTables)
     {
-        for (size_t tableSlot = 0; tableSlot < destinationTables.size(); tableSlot++)
-            for (size_t context = 0; context < ContextCount; context++)
-                for (size_t self = 0; self < PatternCount; self++)
-                    for (size_t opponent = 0; opponent < PatternCount; opponent++) {
-                        const size_t index = tableSlot * ParameterCount
-                                             + (context * PatternCount + self) * PatternCount
-                                             + opponent;
-                        Evaluation::POLICY_CROSS[destinationTables[tableSlot]][context]
-                                                [Evaluation::policyPatternFromStorageIndex(self)]
-                                                [Evaluation::policyPatternFromStorageIndex(
-                                                    opponent)] = parameters[index];
-                    }
-        Evaluation::activatePolicyCross();
+        for (size_t tableSlot = 0; tableSlot < destinationTables.size(); tableSlot++) {
+            Evaluation::StoredPolicyCrossTable values;
+            std::copy_n(parameters.begin() + tableSlot * ParameterCount,
+                        ParameterCount,
+                        values.begin());
+            Evaluation::installPolicyCross(destinationTables[tableSlot], values);
+        }
     }
 
 }  // namespace

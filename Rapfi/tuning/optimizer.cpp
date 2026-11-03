@@ -50,13 +50,11 @@ AdamOptimizer<T>::AdamOptimizer(std::size_t numParams,
 template <typename T>
 void AdamOptimizer<T>::stepMasked(std::vector<T>             &params,
                                   const std::vector<T>       &gradients,
-                                  const std::vector<T>       &learningRates,
                                   const std::vector<uint8_t> &activeMask)
 {
     const size_t numParams = params.size();
     assert(numParams == m.size());
     assert(numParams == gradients.size());
-    assert(numParams == learningRates.size());
     assert(numParams == activeMask.size());
 
     for (size_t i = 0; i < numParams; i++) {
@@ -64,8 +62,7 @@ void AdamOptimizer<T>::stepMasked(std::vector<T>             &params,
             nextParams[i] = params[i];
             continue;
         }
-        const T parameterLR = learningRates[i];
-        if (!std::isfinite(parameterLR) || parameterLR <= 0)
+        if (!std::isfinite(lr) || lr <= 0)
             throw std::invalid_argument("Adam received an invalid active parameter learning rate");
 
         if (activeStepCounts[i] == std::numeric_limits<size_t>::max())
@@ -80,7 +77,7 @@ void AdamOptimizer<T>::stepMasked(std::vector<T>             &params,
         const T      vCorr           = T(double(v[i]) / biasCorrection2);
         const T      nextParam =
             params[i]
-            - parameterLR * (mCorr / (std::sqrt(vCorr) + epsilon) + weightDecay * params[i]);
+            - lr * (mCorr / (std::sqrt(vCorr) + epsilon) + weightDecay * params[i]);
         if (!std::isfinite(m[i]) || !std::isfinite(v[i]) || !std::isfinite(nextParam))
             throw std::runtime_error("Adam produced a non-finite optimizer state");
         nextParams[i] = nextParam;
@@ -91,30 +88,9 @@ void AdamOptimizer<T>::stepMasked(std::vector<T>             &params,
 template <typename T>
 void AdamOptimizer<T>::step(std::vector<T> &params, const std::vector<T> &gradients)
 {
-    stepImpl(params, gradients, nullptr);
-}
-
-template <typename T>
-void AdamOptimizer<T>::step(std::vector<T>       &params,
-                            const std::vector<T> &gradients,
-                            const std::vector<T> &learningRates)
-{
-    stepImpl(params, gradients, &learningRates);
-}
-
-template <typename T>
-void AdamOptimizer<T>::stepImpl(std::vector<T>       &params,
-                                const std::vector<T> &gradients,
-                                const std::vector<T> *learningRates)
-{
     const size_t numParams = params.size();
     assert(numParams == m.size());
     assert(numParams == gradients.size());
-    assert(!learningRates || numParams == learningRates->size());
-    if (learningRates)
-        for (T parameterLR : *learningRates)
-            if (!std::isfinite(parameterLR) || parameterLR <= 0)
-                throw std::invalid_argument("Adam received an invalid parameter learning rate");
 
     stepCount++;
 
@@ -131,10 +107,9 @@ void AdamOptimizer<T>::stepImpl(std::vector<T>       &params,
         T m_corr = T(double(m[i]) / biasCorrection1);
         T v_corr = T(double(v[i]) / biasCorrection2);
 
-        const T parameterLR = learningRates ? (*learningRates)[i] : lr;
-        T       nextParam =
+        T nextParam =
             params[i]
-            - parameterLR * (m_corr / (std::sqrt(v_corr) + epsilon) + weightDecay * params[i]);
+            - lr * (m_corr / (std::sqrt(v_corr) + epsilon) + weightDecay * params[i]);
         if (!std::isfinite(m[i]) || !std::isfinite(v[i]) || !std::isfinite(nextParam))
             throw std::runtime_error("Adam produced a non-finite optimizer state");
         nextParams[i] = nextParam;

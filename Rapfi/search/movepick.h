@@ -52,7 +52,8 @@ public:
     /// Gets the next move in the sorted move list.
     [[nodiscard]] Pos operator()();
 
-    /// Whether this movepicker has policy score from the evaluator.
+    /// Whether evaluator-policy search heuristics may use this picker's scores.
+    /// Classical scoring leaves this false; forced one-hot normalization also sets it.
     bool hasPolicyScore() const { return hasPolicy; }
     /// Whether this movepicker computes normalized policy score.
     bool hasNormalizedPolicy() const { return useNormalizedPolicy; }
@@ -70,11 +71,10 @@ public:
 private:
     enum PickType { Next, Best };
     enum ScoreType {
-        CLASSICAL    = 0b0001,
-        POLICY       = 0b0010,
-        MAIN_HISTORY = 0b0100,
-        COUNTER_MOVE = 0b1000,
-        VCN_ATTACK   = 0b10000,  ///< threat-strength tiers first (VCN attacker)
+        CLASSICAL_ONLY = 0,
+        POLICY         = 0b001,
+        MAIN_HISTORY   = 0b010,
+        COUNTER_MOVE   = 0b100,
     };
 
     template <PickType T, typename Pred>
@@ -82,12 +82,14 @@ private:
     template <ScoreType T>
     void scoreAllMoves();
     /// Score all generated moves and partial-sort them best-first: by policy when
-    /// normalized policy is enabled, otherwise by classical scores plus the extra
-    /// heuristic terms in `ExtraFlags`.
+    /// normalized policy is enabled, otherwise by source scores plus the extra
+    /// heuristic terms in `ExtraFlags`. The source is evaluator policy when available,
+    /// with Classical scoring as the fallback. Normalized priors omit history terms.
     template <ScoreType ExtraFlags>
     void scoreAndSortMoves();
 #ifdef POLICY_TRAINING
-    void beginPolicyTrace(uint8_t context, bool p3Active);
+    void beginPolicyTrace();
+    void recordPolicyTraceCandidate(const ScoredMove &move, int historyBonus, int counterMoveBonus);
     void capturePolicyTraceOrder();
 #endif
     ScoredMove *begin() { return curMove; }
@@ -99,9 +101,6 @@ private:
     Rule               rule;
     Pos                ttMove;
     bool               allowPlainB4InVCF;
-    bool               generatePassMove;  ///< VCN defender: offer Pos::PASS before board moves
-    bool               fullBoardVCF;      ///< VCN VC4 attacker: QVCF fours from the whole board
-    bool               vcnAttackOrder;    ///< VCN attacker: threat-strength ordering in MAIN
     bool               hasPolicy;
     bool               useNormalizedPolicy;
     // BUG: stored but not yet applied - scoreAllMoves() calls applySoftmax() at the
@@ -133,11 +132,6 @@ struct MovePicker::ExtraArgs<MovePicker::MAIN>
     MoveHistoryScoring historyScoring;
     bool               useNormalizedPolicy  = false;
     float              normalizedPolicyTemp = 1.0f;
-    /// Offer Pos::PASS as an early move for the VCN defender (never against a five).
-    bool generatePassMove = false;
-    /// Order moves by the strength of their own threat first (VCN attacker): fours, then threes,
-    /// then twos, then the rest. Only reorders; the move set is unchanged.
-    bool vcnAttackOrder = false;
 };
 
 template <>
@@ -146,12 +140,6 @@ struct MovePicker::ExtraArgs<MovePicker::QVCF>
     Pos      ttMove;
     Depth    depth;  // negative depth in qvcf search
     Pattern4 previousSelfP4[2];
-    /// Enumerate plain E_BLOCK4 moves regardless of depth/previous patterns (VCN VC4 attacker).
-    bool forceAllowB4InVCF = false;
-    /// Generate every four (plain block fours included) over the whole candidate area instead of
-    /// only around the side's last stone (VCN VC4 attacker, where the VCF is a proof step rather
-    /// than a quiescence).
-    bool fullBoardVCF = false;
 };
 
 }  // namespace Search

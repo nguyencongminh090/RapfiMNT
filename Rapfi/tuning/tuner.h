@@ -53,9 +53,6 @@ using Float        = double;  // stable scalar intermediates and global reductio
 using TuneParam    = float;   // high-cardinality parameter and optimizer state
 using TuneGradient = float;   // persistent/per-partition gradient storage
 
-/// LossType represents a type of loss function to use.
-enum class LossType { L1, L2, BCE };
-
 /// Parameterization and target interpretation used by a training corpus.
 /// Bootstrap preserves the master-era joint value/policy geometry; new
 /// training should normally use Current.
@@ -133,7 +130,6 @@ struct TuningConfig
     double                             finalLearningRate     = 0.0;
     LearningRateSchedule               learningRateSchedule  = LearningRateSchedule::Constant;
     double                             weightDecay                  = 0.0;
-    double                             moveScoreLossGamma           = 0.0;
     double                             multiPVPolicyTemperature     = 0.0;
     double                             multiPVPolicyEvalScale       = 0.0;
     double                             moveScoreScale               = 24.0;
@@ -142,7 +138,6 @@ struct TuningConfig
     Score                              moveScoreMax                 = 999;
     bool                               projectMoveScoreScale        = false;
     double                             moveScoreReferenceDispersion = 0.0;
-    LossType                           lossType                     = LossType::BCE;
     bool                               shuffleTuneEntries           = false;
     bool                               tuneEval                     = true;
     bool                               tuneMoveScore                = false;
@@ -197,15 +192,14 @@ struct TuningPhase
     double                             weightDecay               = 0.0;
     LearningRateSchedule               learningRateSchedule      = LearningRateSchedule::Constant;
     size_t                             recomputeInterval         = 0;
-    bool                               localLearningRateSchedule = false;
-    bool                               localRecomputeSchedule    = false;
     bool                               projectMoveScoreAtEnd     = false;
     bool                               coalesceMoveScoreAtEnd    = false;
     BoardSizeWeighting                 boardSizeWeighting = BoardSizeWeighting::SampleFrequency;
 };
 
 /// TuningStatistic struct records all current statistic in tuning process.
-/// This can be used to produce a training record for reporting.
+/// Losses describe floating parameters before table quantization/projection and
+/// the command callback's compact-policy update, not the serialized model.
 struct TuningStatistic
 {
     struct BoardValidationLoss
@@ -278,7 +272,8 @@ public:
 
     void run(size_t epochs, std::function<void(TuningStatistic)> callback = nullptr);
     void runCurriculum(std::function<void(TuningStatistic)> callback = nullptr);
-    void saveParams() const;
+    /// Install quantized/projected tables without changing floating optimizer state.
+    void                              installParams() const;
     std::vector<BoardSampleStatistic> boardSampleStatistics() const;
     std::vector<BoardSampleStatistic> boardSampleStatistics(size_t phaseIndex) const;
 
@@ -390,9 +385,6 @@ private:
     Float            searchOptimalInvScalingFactor(bool useTunedEval) const;
     template <bool UseTunedEval>
     std::vector<Float> computeEvaluationLossGrid(const std::vector<Float> &candidates) const;
-    template <bool UseTunedEval = true>
-    Float                   computeEvaluationLoss(Float K, bool validation) const;
-    Float                   computeMoveScoreLoss(bool validation) const;
     std::pair<Float, Float> computeLosses(Float K, bool validation) const;
     std::vector<TuningStatistic::BoardValidationLoss> computeValidationLossesByBoard(Float K) const;
     std::array<size_t, MAX_BOARD_SIZE + 1>            computeTrainingBoardSampleCounts(
@@ -422,11 +414,6 @@ private:
 
     /* helper functions to add typed params to synced tune params */
 
-    template <typename T, size_t ParamPerElem = 1>
-    void addSingleParam(std::string            layoutTag,
-                        T                     &param,
-                        ParamGetter<const T &> getter,
-                        ParamSetter<T &>       setter);
     template <typename T, size_t Length, size_t ParamPerElem = 1>
     void addArrayParams(std::string layoutTag,
                         T (&paramArray)[Length],
@@ -435,46 +422,6 @@ private:
 };
 
 }  // namespace Tuning
-
-template <typename T, size_t ParamPerElem>
-inline void Tuning::Tuner::addSingleParam(std::string            layoutTag,
-                                          T                     &param,
-                                          ParamGetter<const T &> getter,
-                                          ParamSetter<T &>       setter)
-{
-    static_assert(std::is_trivially_copyable<T>::value,
-                  "tuning parameter elements must be trivially copyable");
-    auto stagerGetter = getter;
-    auto stagerSetter = setter;
-    addParams(
-        std::move(layoutTag),
-        &param,  // std::addressof() might be better
-        1,
-        sizeof(T),
-        ParamPerElem,
-        [getter = std::move(getter)](void *addr, size_t offset) -> TuneParam {
-            return getter(*static_cast<const T *>(addr), offset);
-        },
-        [setter = std::move(setter)](void *addr, size_t offset, TuneParam param) -> void {
-            setter(*static_cast<T *>(addr), offset, param);
-        },
-        [getter = std::move(stagerGetter),
-         setter = std::move(stagerSetter)](const void                   *addr,
-                                           const std::vector<TuneParam> &params) -> StagedParams {
-            if (params.size() != ParamPerElem)
-                throw std::invalid_argument("staged tuning parameter count mismatch");
-            T staged = *static_cast<const T *>(addr);
-            for (size_t offset = 0; offset < ParamPerElem; offset++)
-                setter(staged, offset, params[offset]);
-            StagedParams result;
-            result.params.reserve(ParamPerElem);
-            for (size_t offset = 0; offset < ParamPerElem; offset++)
-                result.params.push_back(getter(staged, offset));
-            result.objectBytes.resize(sizeof(T));
-            std::memcpy(result.objectBytes.data(), &staged, sizeof(T));
-            return result;
-        });
-}
 
 template <typename T, size_t Length, size_t ParamPerElem>
 inline void Tuning::Tuner::addArrayParams(std::string layoutTag,

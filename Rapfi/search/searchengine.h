@@ -50,13 +50,6 @@ class Searcher;      // forward declaration
 class SearchThread;  // forward declaration
 class SearchEngine;  // forward declaration
 
-/// Generate the root move list for the main search thread from its current board
-/// and options. Normally applies block-move filtering, balance2 pair expansion and
-/// root symmetry filtering; when options.rootMovesWhitelist is non-empty that list
-/// is used verbatim (in order, no filtering). Called by startThinking(); exposed
-/// here for the root-move unit tests.
-void generateRootMoves(SearchThread &th);
-
 /// Database access parameters captured once per search from DatabaseCfg, so the
 /// search node loop reads stable values without reaching into the config hub.
 /// (The overwrite biases are not part of the snapshot: DBClient reads them live

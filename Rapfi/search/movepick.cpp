@@ -33,19 +33,15 @@
 namespace {
 
 /// Move picking stages.
-/// Usual procedure: X_TT -> X_PASS (VCN defender only) -> X_MOVES -> ALLMOVES.
-/// DEFENDFIVE has no pass stage: a five must always be blocked.
+/// Usual procedure: X_TT -> X_MOVES -> ALLMOVES.
 enum Stages {
     MAIN_TT,
-    MAIN_PASS,
     MAIN_MOVES,
     DEFENDFIVE_TT,
     DEFENDFIVE_MOVES,
     DEFENDFOUR_TT,
-    DEFENDFOUR_PASS,
     DEFENDFOUR_MOVES,
     DEFENDB4F3_TT,
-    DEFENDB4F3_PASS,
     DEFENDB4F3_MOVES,
     QVCF_TT,
     QVCF_MOVES,
@@ -122,9 +118,6 @@ MovePicker::MovePicker(Rule rule, const Board &board, ExtraArgs<MovePicker::ROOT
     , rule(rule)
     , ttMove(Pos::NONE)
     , allowPlainB4InVCF(false)
-    , generatePassMove(false)
-    , fullBoardVCF(false)
-    , vcnAttackOrder(false)
     , hasPolicy(false)
     , useNormalizedPolicy(args.useNormalizedPolicy)
     , normalizedPolicyTemp(args.normalizedPolicyTemp)
@@ -154,7 +147,7 @@ MovePicker::MovePicker(Rule rule, const Board &board, ExtraArgs<MovePicker::ROOT
         endMove = generate<DEFEND_FOUR | ALL>(board, curMove);
         endMove = generateVCFMoves(rule, board, endMove);
         if (useNormalizedPolicy)
-            scoreAllMoves<ScoreType(CLASSICAL | POLICY)>();
+            scoreAllMoves<POLICY>();
     }
     else if (board.p4Count(oppo, C_BLOCK4_FLEX3)
              && (rule != Rule::RENJU || validateOpponentCMove(board))) {
@@ -166,12 +159,12 @@ MovePicker::MovePicker(Rule rule, const Board &board, ExtraArgs<MovePicker::ROOT
             endMove = generateVCFMoves(rule, board, endMove);
 
         if (useNormalizedPolicy)
-            scoreAllMoves<ScoreType(CLASSICAL | POLICY)>();
+            scoreAllMoves<POLICY>();
     }
     else {
         endMove = generate<ALL>(board, curMove);
         if (useNormalizedPolicy)
-            scoreAllMoves<ScoreType(CLASSICAL | POLICY)>();
+            scoreAllMoves<POLICY>();
     }
 
     if (useNormalizedPolicy)
@@ -185,9 +178,6 @@ MovePicker::MovePicker(Rule rule, const Board &board, ExtraArgs<MovePicker::MAIN
     , historyScoring(args.historyScoring)
     , rule(rule)
     , allowPlainB4InVCF(false)
-    , generatePassMove(args.generatePassMove)
-    , fullBoardVCF(false)
-    , vcnAttackOrder(args.vcnAttackOrder)
     , hasPolicy(false)
     , useNormalizedPolicy(args.useNormalizedPolicy)
     , normalizedPolicyTemp(args.normalizedPolicyTemp)
@@ -198,16 +188,20 @@ MovePicker::MovePicker(Rule rule, const Board &board, ExtraArgs<MovePicker::MAIN
     Color self = board.sideToMove(), oppo = ~self;
     bool  ttmValid;
 
+    // A TT probe can decode Pos::PASS from an aliased empty entry. PASS does
+    // not address a board cell, so normalize it to NONE before any pattern
+    // lookup (isLegal alone would accept it as a passable move).
+    if (args.ttMove == Pos::PASS)
+        args.ttMove = Pos::NONE;
+
     if (board.p4Count(oppo, A_FIVE)) {
         stage    = DEFENDFIVE_TT;
-        ttmValid = args.ttMove != Pos::PASS && board.pattern4(args.ttMove, oppo) == A_FIVE;
+        ttmValid = board.pattern4(args.ttMove, oppo) == A_FIVE;
     }
     else if (board.p4Count(oppo, B_FLEX4)) {
         stage = DEFENDFOUR_TT;
 
-        // A pass has no pattern; it is a valid ttMove only for the VCN defender
-        ttmValid = args.ttMove == Pos::PASS
-                   || board.pattern4(args.ttMove, BLACK) >= E_BLOCK4
+        ttmValid = board.pattern4(args.ttMove, BLACK) >= E_BLOCK4
                    || board.pattern4(args.ttMove, BLACK) == FORBID
                    || board.pattern4(args.ttMove, WHITE) >= E_BLOCK4;
     }
@@ -220,10 +214,6 @@ MovePicker::MovePicker(Rule rule, const Board &board, ExtraArgs<MovePicker::MAIN
         stage    = MAIN_TT;
         ttmValid = true;
     }
-
-    // A pass ttMove is only meaningful while this picker generates the VCN defender's pass
-    if (args.ttMove == Pos::PASS)
-        ttmValid = ttmValid && generatePassMove && stage != DEFENDFIVE_TT;
 
     // check legality for defence ttmove
     ttmValid = ttmValid && board.isLegal(args.ttMove);
@@ -239,11 +229,8 @@ MovePicker::MovePicker(Rule rule, const Board &board, ExtraArgs<MovePicker::QVCF
     , historyScoring()
     , rule(rule)
     , allowPlainB4InVCF(
-          args.forceAllowB4InVCF || args.depth >= DEPTH_QVCF_FULL
+          args.depth >= DEPTH_QVCF_FULL
           || (args.previousSelfP4[0] >= D_BLOCK4_PLUS && args.previousSelfP4[1] >= D_BLOCK4_PLUS))
-    , generatePassMove(false)
-    , fullBoardVCF(args.fullBoardVCF)
-    , vcnAttackOrder(false)
     , hasPolicy(false)
     , useNormalizedPolicy(false)
     , normalizedPolicyTemp(1.0f)
@@ -254,13 +241,19 @@ MovePicker::MovePicker(Rule rule, const Board &board, ExtraArgs<MovePicker::QVCF
     Color self = board.sideToMove(), oppo = ~self;
     bool  ttmValid;
 
+    // A TT probe can decode Pos::PASS from an aliased empty entry. PASS does
+    // not address a board cell, so normalize it to NONE before any pattern
+    // lookup (isLegal alone would accept it as a passable move).
+    if (args.ttMove == Pos::PASS)
+        args.ttMove = Pos::NONE;
+
     if (board.p4Count(oppo, A_FIVE)) {
         stage    = DEFENDFIVE_TT;
-        ttmValid = args.ttMove != Pos::PASS && board.pattern4(args.ttMove, oppo) == A_FIVE;
+        ttmValid = board.pattern4(args.ttMove, oppo) == A_FIVE;
     }
     else {
         stage    = QVCF_TT;
-        ttmValid = args.ttMove != Pos::PASS && board.pattern4(args.ttMove, self) >= E_BLOCK4;
+        ttmValid = board.pattern4(args.ttMove, self) >= E_BLOCK4;
     }
 
     // check legality for defence ttmove
@@ -323,27 +316,10 @@ Pos MovePicker::pickNextMove(Pred filter)
     return Pos::NONE;
 }
 
-/// Ordering bonus for the VCN attacker by the strength of a move's own threat. The tiers sit well
-/// above the policy score range (int16, observed about -111..387 with the network), so a four
-/// is tried before a three, a three before a two, and those before every non-threat move; within
-/// a tier the policy/history order decides. The sizes are not tuned, the tier order is the design.
-constexpr int vcnThreatBonus(Pattern4 p4)
-{
-    if (p4 >= E_BLOCK4)
-        return 12000;
-    if (p4 >= H_FLEX3)
-        return 8000;
-    if (p4 >= I_BLOCK3_PLUS || p4 == J_FLEX2_2X || p4 == K_BLOCK3 || p4 == L_FLEX2)
-        return 4000;
-    return 0;
-}
-
 /// Score all remaining moves according to score type.
 template <MovePicker::ScoreType Type>
 void MovePicker::scoreAllMoves()
 {
-    static_assert(bool(Type & CLASSICAL));
-
     using Evaluation::Evaluator;
     using Evaluation::PolicyBuffer;
     using PolicyBufferStorage = std::aligned_storage_t<sizeof(PolicyBuffer), alignof(PolicyBuffer)>;
@@ -352,27 +328,16 @@ void MovePicker::scoreAllMoves()
     Color               self = board.sideToMove(), oppo = ~self;
     PolicyBuffer       *policyBuf = reinterpret_cast<PolicyBuffer *>(&policyBufferStorage);
     Evaluator *evaluator = board.thisThread() ? board.thisThread()->evaluator.get() : nullptr;
-    const bool useClassicalFallback = !(bool(Type & POLICY) && evaluator);
+    const bool useEvaluatorPolicy = bool(Type & POLICY) && evaluator;
     std::optional<Evaluation::ClassicalPolicyScorer> classicalPolicy;
-    if (useClassicalFallback)
+    if (!useEvaluatorPolicy)
         classicalPolicy.emplace(rule, board);
 #ifdef POLICY_TRAINING
-    const bool traceRequested =
-        traceEligible && board.thisThread() && board.thisThread()->engine.policyTraceSession();
-#else
-    constexpr bool traceRequested = false;
-#endif
-    const Evaluation::PolicyContext policyContext =
-        useClassicalFallback && traceRequested ? Evaluation::classifyPolicyContext(board)
-                                               : Evaluation::QUIET;
-    const bool policyCrossActive =
-        Evaluation::policyCrossActiveMask(rule, self) & uint8_t(1U << policyContext);
-#ifdef POLICY_TRAINING
-    if (traceEligible && useClassicalFallback && curMove != endMove)
-        beginPolicyTrace(policyContext, policyCrossActive);
+    if (!useEvaluatorPolicy)
+        beginPolicyTrace();
 #endif
 
-    if (bool(Type & POLICY) && evaluator) {
+    if (useEvaluatorPolicy) {
         new (policyBuf) Evaluation::PolicyBuffer(board.size());
 
         // Set compute flag for all moves in move list
@@ -386,28 +351,16 @@ void MovePicker::scoreAllMoves()
 
     for (auto &m : *this) {
         int score;
-#ifdef POLICY_TRAINING
-        int positionScore = 0, p3Residual = 0;
-#endif
-        if (bool(Type & POLICY) && evaluator) {
+        if (useEvaluatorPolicy) {
             score = m.rawScore = policyBuf->score(m.pos);
             maxPolicyScore     = std::max(maxPolicyScore, m.rawScore);
         }
         else {
             const auto [pcodeBlack, pcodeWhite] = board.pcodePair(m.pos);
-#ifdef POLICY_TRAINING
-            positionScore = Evaluation::classicalPolicyBaseScore(rule,
-                                                                  self,
-                                                                  pcodeBlack,
-                                                                  pcodeWhite);
-#endif
             score = m.rawScore = classicalPolicy->score(pcodeBlack,
                                                         pcodeWhite,
                                                         board.pattern4(m.pos, self),
                                                         board.pattern4(m.pos, oppo));
-#ifdef POLICY_TRAINING
-            p3Residual = score - positionScore;
-#endif
         }
 
         int historyBonus = 0;
@@ -434,31 +387,9 @@ void MovePicker::scoreAllMoves()
             }
         }
 
-        int threatBonus = 0;
-        if (bool(Type & VCN_ATTACK))
-            threatBonus = vcnThreatBonus(board.pattern4(m.pos, self));
-
-        m.score = Evaluation::clampMoveScore(score + historyBonus + counterMoveBonus + threatBonus);
+        m.score = Evaluation::clampMoveScore(score + historyBonus + counterMoveBonus);
 #ifdef POLICY_TRAINING
-        if (traceEvent && !policyTraceCandidate(m.pos)) {
-            Tuning::PolicyTraceCandidate candidate {};
-            candidate.move             = m.pos;
-            candidate.generatedOrdinal = static_cast<uint16_t>(traceEvent->candidates.size());
-            candidate.selectionOrdinal = std::numeric_limits<uint16_t>::max();
-            candidate.policyOrdinal    = std::numeric_limits<uint16_t>::max();
-            candidate.filter           = Tuning::PolicyTraceFilter::None;
-            candidate.disposition      = Tuning::PolicyTraceDisposition::Pending;
-            candidate.selfPattern      = board.pattern4(m.pos, self);
-            candidate.opponentPattern  = board.pattern4(m.pos, oppo);
-            candidate.positionScore    = positionScore;
-            candidate.p3Residual       = p3Residual;
-            candidate.mainHistory      = historyBonus;
-            candidate.counterMove      = counterMoveBonus;
-            candidate.finalScore       = m.score;
-            candidate.teacherLogit     = m.rawScore;
-            candidate.bound            = BOUND_NONE;
-            traceEvent->candidates.push_back(candidate);
-        }
+        recordPolicyTraceCandidate(m, historyBonus, counterMoveBonus);
 #endif
     }
 
@@ -493,11 +424,11 @@ template <MovePicker::ScoreType ExtraFlags>
 void MovePicker::scoreAndSortMoves()
 {
     if (useNormalizedPolicy) {
-        scoreAllMoves<ScoreType(CLASSICAL | POLICY)>();
+        scoreAllMoves<POLICY>();
         fastPartialSort(curMove, endMove, 0, ScoredMove::PolicyComparator {});
     }
     else {
-        scoreAllMoves<ScoreType(CLASSICAL | POLICY | ExtraFlags)>();
+        scoreAllMoves<ScoreType(POLICY | ExtraFlags)>();
         fastPartialSort(curMove, endMove, 0, ScoredMove::ScoreComparator {});
     }
 #ifdef POLICY_TRAINING
@@ -517,29 +448,13 @@ top:
     case DEFENDB4F3_TT:
     case QVCF_TT: ++stage; return ttMove;
 
-    case MAIN_PASS:
-    case DEFENDFOUR_PASS:
-    case DEFENDB4F3_PASS:
-        ++stage;  // advance to the matching *_MOVES stage
-        if (generatePassMove                     // only the VCN defender may pass
-            && board.getLastMove() != Pos::PASS  // never pass twice in a row
-            && ttMove != Pos::PASS) {            // a pass ttMove has already been returned
-            curScore       = 0;
-            curPolicy      = 0.0f;
-            return Pos::PASS;
-        }
-        goto top;
-
     case MAIN_MOVES:
         assert(!board.p4Count(~board.sideToMove(), A_FIVE));
         assert(!board.p4Count(~board.sideToMove(), B_FLEX4));
 
         curMove = moves;
         endMove = generate<ALL>(board, curMove);
-        if (vcnAttackOrder)
-            scoreAndSortMoves<ScoreType(MAIN_HISTORY | COUNTER_MOVE | VCN_ATTACK)>();
-        else
-            scoreAndSortMoves<ScoreType(MAIN_HISTORY | COUNTER_MOVE)>();
+        scoreAndSortMoves<ScoreType(MAIN_HISTORY | COUNTER_MOVE)>();
 
         stage = ALLMOVES;
         goto top;
@@ -587,9 +502,7 @@ top:
 
     case QVCF_MOVES:
         curMove = moves;
-        if (fullBoardVCF)  // every four, wherever it is (the VCN VC4 attacker proves a VCF)
-            endMove = generateVCFMoves(rule, board, curMove);
-        else {
+        {
             Pos selfLast = board.getLastActualMoveOfSide(board.sideToMove());
             endMove =
                 (allowPlainB4InVCF ? generateNeighbors<VCF>
@@ -600,7 +513,7 @@ top:
                                                                     RANGE_SQUARE2_LINE4.size());
         }
 
-        scoreAllMoves<CLASSICAL>();
+        scoreAllMoves<CLASSICAL_ONLY>();
         fastPartialSort(curMove, endMove, 0, ScoredMove::ScoreComparator {});
 #ifdef POLICY_TRAINING
         capturePolicyTraceOrder();
@@ -618,14 +531,18 @@ top:
 }
 
 #ifdef POLICY_TRAINING
-void MovePicker::beginPolicyTrace(uint8_t context, bool p3Active)
+void MovePicker::beginPolicyTrace()
 {
-    if (traceEvent || !board.thisThread())
+    if (!traceEligible || curMove == endMove || traceEvent || !board.thisThread())
         return;
     Tuning::PolicyTraceSession *session = board.thisThread()->engine.policyTraceSession();
     if (!session)
         return;
 
+    // Trace the actual context even when zero residual tables let the scorer skip it.
+    const Evaluation::PolicyContext context = Evaluation::classifyPolicyContext(board);
+    const bool                      p3Active =
+        Evaluation::policyCrossActiveMask(rule, board.sideToMove()) & uint8_t(1U << context);
     const Tuning::PolicyTraceEventContext eventContext =
         session->beginEvent(board.thisThread()->id);
     traceEvent                = std::make_unique<Tuning::PolicyTraceEvent>();
@@ -650,6 +567,35 @@ void MovePicker::beginPolicyTrace(uint8_t context, bool p3Active)
     traceEvent->history.reserve(board.ply());
     for (int i = 0; i < board.ply(); i++)
         traceEvent->history.push_back(board.getHistoryMove(i));
+}
+
+void MovePicker::recordPolicyTraceCandidate(const ScoredMove &move,
+                                            int               historyBonus,
+                                            int               counterMoveBonus)
+{
+    if (!traceEvent || policyTraceCandidate(move.pos))
+        return;
+
+    const Color self                    = board.sideToMove();
+    const auto [pcodeBlack, pcodeWhite] = board.pcodePair(move.pos);
+    const int baseScore = Evaluation::classicalPolicyBaseScore(rule, self, pcodeBlack, pcodeWhite);
+    Tuning::PolicyTraceCandidate candidate {};
+    candidate.move             = move.pos;
+    candidate.generatedOrdinal = static_cast<uint16_t>(traceEvent->candidates.size());
+    candidate.selectionOrdinal = std::numeric_limits<uint16_t>::max();
+    candidate.policyOrdinal    = std::numeric_limits<uint16_t>::max();
+    candidate.filter           = Tuning::PolicyTraceFilter::None;
+    candidate.disposition      = Tuning::PolicyTraceDisposition::Pending;
+    candidate.selfPattern      = board.pattern4(move.pos, self);
+    candidate.opponentPattern  = board.pattern4(move.pos, ~self);
+    candidate.positionScore    = baseScore;
+    candidate.p3Residual       = int(move.rawScore) - baseScore;
+    candidate.mainHistory      = historyBonus;
+    candidate.counterMove      = counterMoveBonus;
+    candidate.finalScore       = move.score;
+    candidate.teacherLogit     = move.rawScore;
+    candidate.bound            = BOUND_NONE;
+    traceEvent->candidates.push_back(candidate);
 }
 
 void MovePicker::capturePolicyTraceOrder()

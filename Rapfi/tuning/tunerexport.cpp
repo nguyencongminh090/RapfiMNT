@@ -187,8 +187,9 @@ makeMoveScoreReference(const TuningConfig                            &config,
 
 namespace Tuning {
 
-/// saveParams() saves tuneParams back to their associated config value
-void Tuner::saveParams() const
+/// Quantize floating parameters into live tables, then apply the configured projection.
+/// This does not feed quantization back into optimizer state or serialize a model.
+void Tuner::installParams() const
 {
     for (const ParamsSyncRecord &record : syncRecords) {
         assert(tuneParams.size() >= record.baseIndex + record.numElems * record.paramPerElem);
@@ -204,7 +205,7 @@ void Tuner::saveParams() const
             for (size_t side = 0; side < 2; side++)
                 record.scores[i][side] =
                     decodeMoveScoreParam(tuneParams[record.parameterIndices[i][side]]);
-    MESSAGEL(tuneParams.size() << " parameters saved.");
+    MESSAGEL(tuneParams.size() << " parameters installed.");
     projectMoveScoreScale();
 }
 
@@ -214,7 +215,7 @@ void Tuner::synchronizeProjectedMoveScores()
         throw std::logic_error(
             "move-score projection boundary requires active projected move-score tuning");
 
-    saveParams();
+    installParams();
     if (tiedMoveScoreSyncRecords.empty())
         throw std::logic_error("move-score projection requires a coalesced tied layout");
     for (const TiedMoveScoreSyncRecord &record : tiedMoveScoreSyncRecords)

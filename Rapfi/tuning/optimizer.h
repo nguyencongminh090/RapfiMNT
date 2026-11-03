@@ -36,12 +36,8 @@ public:
                   T           epsilon     = T(1e-8));
 
     void step(std::vector<T> &params, const std::vector<T> &gradients);
-    void step(std::vector<T>       &params,
-              const std::vector<T> &gradients,
-              const std::vector<T> &learningRates);
     void stepMasked(std::vector<T>             &params,
                     const std::vector<T>       &gradients,
-                    const std::vector<T>       &learningRates,
                     const std::vector<uint8_t> &activeMask);
 
     /// Builds an optimizer whose state follows a complete partition of the
@@ -56,10 +52,6 @@ public:
     void setWeightDecay(T newWeightDecay) { weightDecay = newWeightDecay; }
 
 private:
-    void stepImpl(std::vector<T>       &params,
-                  const std::vector<T> &gradients,
-                  const std::vector<T> *learningRates);
-
     std::vector<T>           m, v, nextParams;
     std::vector<std::size_t> activeStepCounts;
     T                        lr, weightDecay;

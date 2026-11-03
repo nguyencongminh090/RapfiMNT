@@ -145,7 +145,7 @@ PreparedCacheKey Tuner::makePreparedCacheKey(const std::vector<std::filesystem::
         throw std::invalid_argument("prepared caching requires dataset paths and a dataset format");
 
     Sha256 hasher;
-    hashString(hasher, "rapfi-classical-prepared-corpus-v23");
+    hashString(hasher, "rapfi-classical-prepared-corpus-v24");
     hashString(hasher, role);
     hashString(hasher, datasetFormat);
     hashUint64(hasher, config.maxTuneEntries);
@@ -190,7 +190,12 @@ PreparedCacheKey Tuner::makePreparedCacheKey(const std::vector<std::filesystem::
                        ? "bootstrap-untied-two-term-v1"
                        : "tied-global-two-term-v1");
 
-    PreparedCacheKey key;
+    struct SourceIdentity {
+        uintmax_t   size;
+        std::string digest;
+    };
+    std::unordered_map<std::string, SourceIdentity> knownSources;
+    PreparedCacheKey                               key;
     key.sourcePaths.reserve(sourcePaths.size());
     for (const std::filesystem::path &sourcePath : sourcePaths) {
         std::error_code       error;
@@ -206,7 +211,37 @@ PreparedCacheKey Tuner::makePreparedCacheKey(const std::vector<std::filesystem::
         std::string configuredPath = configured.generic_u8string();
         std::string canonicalPath  = canonical.generic_u8string();
 
+        auto found = knownSources.find(canonicalPath);
+        if (found == knownSources.end()) {
+            uintmax_t fileSize = std::filesystem::file_size(canonical, error);
+            if (error)
+                throw std::runtime_error("unable to inspect tuning dataset source: "
+                                         + canonical.string());
+            auto modified = std::filesystem::last_write_time(canonical, error);
+            if (error)
+                throw std::runtime_error("unable to read tuning dataset timestamp: "
+                                         + canonical.string());
+            std::string digest = sha256Hex(sha256File(canonical));
+            uintmax_t verifiedSize = std::filesystem::file_size(canonical, error);
+            if (error)
+                throw std::runtime_error("unable to recheck tuning dataset source: "
+                                         + canonical.string());
+            auto verifiedModified = std::filesystem::last_write_time(canonical, error);
+            if (error || verifiedSize != fileSize || verifiedModified != modified)
+                throw std::runtime_error("tuning dataset source changed while hashing: "
+                                         + canonical.string());
+            found = knownSources.emplace(canonicalPath,
+                                         SourceIdentity {fileSize, std::move(digest)}).first;
+        }
+        std::filesystem::path verifiedCanonical =
+            std::filesystem::weakly_canonical(configured, error);
+        if (error || verifiedCanonical != canonical)
+            throw std::runtime_error("tuning dataset alias changed while hashing: "
+                                     + configured.string());
+
         hashString(hasher, canonicalPath);
+        hashUint64(hasher, found->second.size);
+        hashString(hasher, found->second.digest);
         key.sourcePaths.push_back({std::move(configuredPath), std::move(canonicalPath)});
     }
     key.fingerprint = sha256Hex(hasher.finish());

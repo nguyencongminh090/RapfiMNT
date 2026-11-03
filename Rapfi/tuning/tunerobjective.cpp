@@ -31,8 +31,7 @@ namespace Tuning::detail {
 namespace {
 
     Float policyScore(const PolicyCandidate        &candidate,
-                      const std::vector<TuneParam> &params,
-                      const MoveScoreLossSettings &)
+                      const std::vector<TuneParam> &params)
     {
         return params[candidate.indices[0]] + params[candidate.indices[1]];
     }
@@ -53,7 +52,7 @@ MoveScoreLossSettings makeMoveScoreLossSettings(const Tuning::TuningConfig &conf
                             ? Float(1)
                             : Float(config.moveScoreScale)
                                   / Float(Evaluation::PolicyBuffer::ScoreScale);
-    return {Float(config.moveScoreLossGamma), logitFactor};
+    return {logitFactor};
 }
 
 Float computeMoveScoreLoss(const PreparedCorpus         &corpus,
@@ -71,7 +70,7 @@ Float computeMoveScoreLoss(const PreparedCorpus         &corpus,
     uint32_t    targetBegin = corpus.policyTargetOffsets()[sample];
     uint32_t    targetEnd   = corpus.policyTargetOffsets()[sample + 1];
     auto        score       = [&](const PolicyCandidate &candidate) {
-        return policyScore(candidate, params, settings);
+        return policyScore(candidate, params);
     };
     Float maxScore = std::numeric_limits<Float>::lowest();
     for (uint32_t i = begin; i < end; i++)
@@ -81,26 +80,19 @@ Float computeMoveScoreLoss(const PreparedCorpus         &corpus,
     for (uint32_t i = begin; i < end; i++)
         sumExp += std::exp(score(candidates[i]) * settings.logitFactor - maxScore);
 
-    if (settings.gamma == 0) {
-        if (targetBegin == targetEnd)
-            return maxScore + std::log(sumExp)
-                   - score(candidates[begin + best]) * settings.logitFactor;
+    if (targetBegin == targetEnd)
+        return maxScore + std::log(sumExp)
+               - score(candidates[begin + best]) * settings.logitFactor;
 
-        Float targetMass  = 0;
-        Float targetScore = 0;
-        for (uint32_t i = targetBegin; i < targetEnd; i++) {
-            const PolicyTargetTerm &target = corpus.policyTargets()[i];
-            targetMass += target.weight;
-            targetScore +=
-                target.weight * score(candidates[begin + target.candidate]) * settings.logitFactor;
-        }
-        return maxScore + std::log(sumExp) - targetScore / targetMass;
+    Float targetMass  = 0;
+    Float targetScore = 0;
+    for (uint32_t i = targetBegin; i < targetEnd; i++) {
+        const PolicyTargetTerm &target = corpus.policyTargets()[i];
+        targetMass += target.weight;
+        targetScore +=
+            target.weight * score(candidates[begin + target.candidate]) * settings.logitFactor;
     }
-
-    Float scoreClass  = score(candidates[begin + best]) * settings.logitFactor - maxScore;
-    Float xClass      = std::exp(scoreClass) / sumExp;
-    Float focalWeight = std::pow(Float(1) - xClass, settings.gamma);
-    return focalWeight * (-scoreClass + std::log(sumExp));
+    return maxScore + std::log(sumExp) - targetScore / targetMass;
 }
 
 void computeMoveScoreGradient(const PreparedCorpus         &corpus,
@@ -120,7 +112,7 @@ void computeMoveScoreGradient(const PreparedCorpus         &corpus,
     uint32_t    targetBegin = corpus.policyTargetOffsets()[sample];
     uint32_t    targetEnd   = corpus.policyTargetOffsets()[sample + 1];
     auto        score       = [&](const PolicyCandidate &candidate) {
-        return policyScore(candidate, params, settings);
+        return policyScore(candidate, params);
     };
     auto addGradient = [&](const PolicyCandidate &candidate, Float gradient) {
         accumulatePolicyGradient(candidate, grads, gradient * sampleWeight);
@@ -133,53 +125,33 @@ void computeMoveScoreGradient(const PreparedCorpus         &corpus,
     for (uint32_t i = begin; i < end; i++)
         sumExp += std::exp(score(candidates[i]) * settings.logitFactor - maxScore);
 
-    Float invSumExp = Float(1) / sumExp;
-    if (settings.gamma == 0) {
-        Float gradientScale = CoeffScale * settings.logitFactor;
-        Float targetMass    = 0;
-        for (uint32_t i = targetBegin; i < targetEnd; i++)
-            targetMass += corpus.policyTargets()[i].weight;
+    Float invSumExp     = Float(1) / sumExp;
+    Float gradientScale = CoeffScale * settings.logitFactor;
+    Float targetMass    = 0;
+    for (uint32_t i = targetBegin; i < targetEnd; i++)
+        targetMass += corpus.policyTargets()[i].weight;
 
-        if (targetBegin == targetEnd) {
-            for (uint32_t i = begin; i < end; i++) {
-                Float probability =
-                    std::exp(score(candidates[i]) * settings.logitFactor - maxScore) * invSumExp;
-                Float dCEdScore = i == begin + best ? probability - 1 : probability;
-                addGradient(candidates[i], gradientScale * dCEdScore);
-            }
+    if (targetBegin == targetEnd) {
+        for (uint32_t i = begin; i < end; i++) {
+            Float probability =
+                std::exp(score(candidates[i]) * settings.logitFactor - maxScore) * invSumExp;
+            Float dCEdScore = i == begin + best ? probability - 1 : probability;
+            addGradient(candidates[i], gradientScale * dCEdScore);
         }
-        else {
-            for (uint32_t i = begin; i < end; i++) {
-                Float probability =
-                    std::exp(score(candidates[i]) * settings.logitFactor - maxScore) * invSumExp;
-                addGradient(candidates[i], gradientScale * probability);
-            }
-            Float invTargetMass = Float(1) / targetMass;
-            for (uint32_t i = targetBegin; i < targetEnd; i++) {
-                const PolicyTargetTerm &term   = corpus.policyTargets()[i];
-                const PolicyCandidate  &target = candidates[begin + term.candidate];
-                Float                   weight = term.weight * invTargetMass;
-                addGradient(target, -gradientScale * weight);
-            }
-        }
-        return;
     }
-
-    Float bestExp = std::exp(score(candidates[begin + best]) * settings.logitFactor - maxScore);
-    Float Pt      = bestExp * invSumExp;
-    Float logPt =
-        score(candidates[begin + best]) * settings.logitFactor - maxScore - std::log(sumExp);
-    Float PtClamped        = std::clamp(Pt, Float(1e-6), Float(1 - 1e-6));
-    Float PtLogPtDivPtSub1 = PtClamped / (PtClamped - 1) * logPt;
-    Float dFLdCE = std::pow(1 - Pt, settings.gamma) * (settings.gamma * PtLogPtDivPtSub1 + 1);
-
-    for (uint32_t i = begin; i < end; i++) {
-        Float probability =
-            std::exp(score(candidates[i]) * settings.logitFactor - maxScore) * invSumExp;
-        Float dCEdScore = i == begin + best ? Pt - 1 : probability;
-        Float dFLdScore = dFLdCE * dCEdScore;
-        Float gradient  = CoeffScale * settings.logitFactor * dFLdScore;
-        addGradient(candidates[i], gradient);
+    else {
+        for (uint32_t i = begin; i < end; i++) {
+            Float probability =
+                std::exp(score(candidates[i]) * settings.logitFactor - maxScore) * invSumExp;
+            addGradient(candidates[i], gradientScale * probability);
+        }
+        Float invTargetMass = Float(1) / targetMass;
+        for (uint32_t i = targetBegin; i < targetEnd; i++) {
+            const PolicyTargetTerm &term   = corpus.policyTargets()[i];
+            const PolicyCandidate  &target = candidates[begin + term.candidate];
+            Float                   weight = term.weight * invTargetMass;
+            addGradient(target, -gradientScale * weight);
+        }
     }
 }
 

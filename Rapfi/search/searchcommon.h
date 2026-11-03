@@ -30,27 +30,6 @@ class Board;
 
 namespace Search {
 
-/// Level N of VCN (Victory by Continuous N-level attack) search. The attacker must win while the
-/// defender may pass; every defender pass moves the attacker one level up, so level N allows the
-/// defender at most (5 - N) passes before the attacker has to win outright.
-/// Scoped on purpose: `GenType::VC2` in movegen.h is an unrelated global enumerator.
-enum class VCNLevel : int8_t {
-    None,  ///< VCN mode disabled
-    VC2,   ///< Defender may pass (attacker moves to VC3 after each pass)
-    VC3,   ///< Defender may pass (attacker moves to VC4 after each pass)
-    VC4,   ///< Attacker may only play VCF; a defender pass moves the attacker to VC5
-    VC5,   ///< Attacker must already have a five on the board
-};
-
-/// VCNMode stores the configuration of a VCN search.
-struct VCNMode
-{
-    Color    attacker = BLACK;         ///< Side that must win by continuous attack
-    VCNLevel n        = VCNLevel::None;  ///< Starting level; None means VCN is disabled
-
-    bool enabled() const { return n != VCNLevel::None; }
-};
-
 /// Make a balanced value from original value and balance bias.
 /// @param value The original value.
 /// @param bias Value bias for balanced value.
@@ -180,17 +159,6 @@ struct SearchOptions
 
     /// Blocked moves, which are filtered out before searching
     std::vector<Pos> blockMoves;
-
-    /// User-supplied root move allow-list (inverse of blockMoves). When non-empty,
-    /// generateRootMoves() uses exactly this list as the depth-0 root candidates,
-    /// bypassing MovePicker, block filtering and symmetry filtering. Empty by default,
-    /// so every existing command keeps the current root-generation behaviour. Set only
-    /// by the YXANALZ handler and cleared (one-shot) at every other think entry point.
-    std::vector<Pos> rootMovesWhitelist;
-
-    /// VCN (Victory by Continuous N-level attack) search configuration. Disabled by default;
-    /// set only by the YXVCN handler for the duration of one search.
-    VCNMode vcnMode;
 
     /// Checks if we are in analysis mode.
     bool isAnalysisMode() const { return !timeLimit && !maxNodes; }

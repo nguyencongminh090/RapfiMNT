@@ -82,7 +82,7 @@ inline Value evaluateBasic(const StateInfo &st, Color self)
 /// Finds a margin for switching to classical evaluation if
 /// it falls outside alpha-beta window with this margin.
 template <Rule R>
-inline int classicalEvalMargin(Value bound)
+inline int computeClassicalEvalMargin(Value bound)
 {
     float winLossRate = 2 * (Evaluation::valueToWinRate(bound) - 0.5f);
     float x           = EvalCfg.marginWinLossScale[R] * winLossRate;
@@ -90,31 +90,139 @@ inline int classicalEvalMargin(Value bound)
     return (int)(EvalCfg.marginScale[R] * ::expf(-::powf(x2, EvalCfg.marginWinLossExponent[R])));
 }
 
+using ClassicalMarginTables =
+    std::array<std::array<int, VALUE_EVAL_MAX - VALUE_EVAL_MIN + 1>, RULE_NB>;
+
+ClassicalMarginTables makeClassicalMarginTables()
+{
+    ClassicalMarginTables tables;
+    for (int value = VALUE_EVAL_MIN; value <= VALUE_EVAL_MAX; value++) {
+        const int index = value - VALUE_EVAL_MIN;
+        tables[FREESTYLE][index] = computeClassicalEvalMargin<FREESTYLE>(Value(value));
+        tables[STANDARD][index]  = computeClassicalEvalMargin<STANDARD>(Value(value));
+        tables[RENJU][index]     = computeClassicalEvalMargin<RENJU>(Value(value));
+    }
+    return tables;
+}
+
+// EvalCfg and ScalingFactor have constant-initialized defaults. Populate every rule
+// before search can use the table, including callers without an external config.
+ClassicalMarginTables classicalMarginTables = makeClassicalMarginTables();
+
+template <Rule R>
+inline int classicalEvalMargin(Value bound)
+{
+    assert(VALUE_EVAL_MIN <= bound && bound <= VALUE_EVAL_MAX);
+    const int margin = classicalMarginTables[R][bound - VALUE_EVAL_MIN];
+    assert(margin == computeClassicalEvalMargin<R>(bound));
+    return margin;
+}
+
 }  // namespace
 
 namespace Evaluation {
 
+// Value/win-rate conversions and readout construction share this scale.
+float ScalingFactor = 200.0f;
+
+void refreshClassicalMarginTables()
+{
+    classicalMarginTables = makeClassicalMarginTables();
+}
+
+namespace {
+
+    ClassicalValueReadouts valueReadouts;
+    std::array<std::array<Value, VALUE_EVAL_MAX - VALUE_EVAL_MIN + 1>, RULE_NB + 1>
+         valueReadoutCaches {};
+    void refreshClassicalValueReadoutCaches()
+    {
+        static constexpr std::array<double, ClassicalValueReadout::KnotCount> XKnots =
+            {0.0, 0.5, 1.0, 2.0, 4.0, 8.0};
+        const double scale = ScalingFactor;
+
+        for (size_t readoutIndex = 0; readoutIndex < valueReadouts.size(); readoutIndex++) {
+            if (!valueReadouts[readoutIndex].knotsActive)
+                continue;
+            const auto &yKnots = valueReadouts[readoutIndex].knots;
+            auto       &cache  = valueReadoutCaches[readoutIndex];
+            for (int raw = VALUE_EVAL_MIN; raw <= VALUE_EVAL_MAX; raw++) {
+                double x = std::abs(double(raw)) / scale;
+                double y;
+                if (x >= XKnots.back())
+                    y = yKnots.back() + x - XKnots.back();
+                else {
+                    size_t hi = 1;
+                    while (x > XKnots[hi])
+                        hi++;
+                    size_t lo = hi - 1;
+                    double t  = (x - XKnots[lo]) / (XKnots[hi] - XKnots[lo]);
+                    y         = yKnots[lo] + t * (yKnots[hi] - yKnots[lo]);
+                }
+                double mapped               = std::copysign(y * scale, double(raw));
+                cache[raw - VALUE_EVAL_MIN] = Value(
+                    std::clamp<long long>(std::llround(mapped), VALUE_EVAL_MIN, VALUE_EVAL_MAX));
+            }
+        }
+    }
+
+    Value applyClassicalValueReadout(Rule rule, Color self, Value rawValue)
+    {
+        assert(VALUE_EVAL_MIN <= rawValue && rawValue <= VALUE_EVAL_MAX);
+        const int table = tableIndex(rule, self);
+        return valueReadouts[table].knotsActive
+                   ? valueReadoutCaches[table][int(rawValue) - VALUE_EVAL_MIN]
+                   : rawValue;
+    }
+
+}  // namespace
+
+void setScalingFactor(float scale)
+{
+    assert(std::isfinite(scale) && scale > 0.0f);
+    ScalingFactor = scale;
+    refreshClassicalValueReadoutCaches();
+    refreshClassicalMarginTables();
+}
+
+const ClassicalValueReadouts &classicalValueReadouts()
+{
+    return valueReadouts;
+}
+
+void installClassicalValueReadouts(const ClassicalValueReadouts &readouts)
+{
+    valueReadouts = readouts;
+    refreshClassicalValueReadoutCaches();
+}
+
 const int ClassicalValueBlendWeights[RULE_NB + 1][ClassicalValueBlend::COMPONENT_NB] = {
-    {128, 128, 256},
-    {128, 128, 256},
-    {128, 128, 256},
-    {128, 128, 256},
+    {149, 106, 267},
+    {155, 116, 268},
+    {137, 122, 263},
+    {138, 125, 261},
 };
 
-Value composeClassicalValue(Rule  rule,
-                            Color self,
-                            Value currentBasic,
-                            Value previousBasic,
-                            Value currentThreat)
-{
-    const int *weights = ClassicalValueBlendWeights[tableIndex(rule, self)];
+namespace {
 
-    int64_t weightedValue =
-        int64_t(weights[ClassicalValueBlend::CURRENT_BASIC]) * int64_t(currentBasic)
-        + int64_t(weights[ClassicalValueBlend::PREVIOUS_BASIC]) * int64_t(previousBasic)
-        + int64_t(weights[ClassicalValueBlend::CURRENT_THREAT]) * int64_t(currentThreat);
-    return Value(weightedValue / ClassicalValueBlend::Scale);
-}
+    // Both basic terms use the current side-to-move perspective. Divide the complete
+    // 64-bit weighted sum once, then clamp before the optional integer readout lookup.
+    Value composeClassicalValue(Rule  rule,
+                                Color self,
+                                Value currentBasic,
+                                Value previousBasic,
+                                Value currentThreat)
+    {
+        const int *weights = ClassicalValueBlendWeights[tableIndex(rule, self)];
+
+        int64_t weightedValue =
+            int64_t(weights[ClassicalValueBlend::CURRENT_BASIC]) * int64_t(currentBasic)
+            + int64_t(weights[ClassicalValueBlend::PREVIOUS_BASIC]) * int64_t(previousBasic)
+            + int64_t(weights[ClassicalValueBlend::CURRENT_THREAT]) * int64_t(currentThreat);
+        return Value(weightedValue / ClassicalValueBlend::Scale);
+    }
+
+}  // namespace
 
 /// Calculates the final evaluation of a board.
 /// @note Board must have at least one stone placed (`ply() > 0`).
@@ -134,7 +242,7 @@ Value evaluate(const Board &board, Value alpha, Value beta)
         std::clamp(composeClassicalValue(R, self, currentBasic, previousBasic, currentThreat),
                    VALUE_EVAL_MIN,
                    VALUE_EVAL_MAX);
-    Value classicalEval = computeClassicalValue(R, self, eval);
+    Value classicalEval = applyClassicalValueReadout(R, self, eval);
 
     if (board.evaluator()) {
         // Use evaluator eval if classical eval are in alpha-beta window margin
@@ -179,14 +287,8 @@ Value evaluate(const Board &board, Rule rule)
             std::clamp(composeClassicalValue(rule, self, currentBasic, currentBasic, currentThreat),
                        VALUE_EVAL_MIN,
                        VALUE_EVAL_MAX);
-        return computeClassicalValue(rule, self, eval);
+        return applyClassicalValueReadout(rule, self, eval);
     }
-}
-
-Value computeClassicalValue(Rule rule, Color self, Value rawValue)
-{
-    return isClassicalValueReadoutActive(rule, self) ? mapClassicalValue(rule, self, rawValue)
-                                                     : rawValue;
 }
 
 ValueType computeEvaluatorValue(const Board &board)

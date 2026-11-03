@@ -92,13 +92,13 @@ struct PolicyTraceCandidate
     PolicyTraceDisposition disposition;
     Pattern4               selfPattern;
     Pattern4               opponentPattern;
-    int32_t                positionScore;
-    int32_t                p3Residual;
+    int32_t                positionScore;  ///< Wide Classical base before residual and saturation.
+    int32_t                p3Residual;     ///< Saturated raw score minus base; an effective delta.
     int32_t                mainHistory;
     int32_t                counterMove;
     int32_t                finalScore;
-    // Raw position-policy logit. Any hard/soft target transform is a trainer
-    // setting so multiple objectives can be compared on the identical corpus.
+    // Saturated source score captured before history terms and prior normalization.
+    // Hard/soft target transforms are trainer settings, so objectives share a corpus.
     int32_t              teacherLogit;
     int32_t              alphaBefore;
     uint16_t             moveCount;

@@ -35,9 +35,9 @@
 #define CXXOPTS_NO_REGEX
 #include <cmath>
 #include <csignal>
+#include <cstdlib>
 #include <cxxopts.hpp>
 #include <fstream>
-#include <functional>
 #include <iterator>
 #include <limits>
 #include <numeric>
@@ -45,32 +45,39 @@
 #include <random>
 #include <stdexcept>
 
-static std::function<void(int)> signalFunc;
-static void                     setupSignalHandler(std::function<void(int)> handler)
-{
-    signalFunc         = std::move(handler);
-    auto signalHandler = [](int signal) {
-        if (signalFunc)
-            signalFunc(signal);
-    };
+// A signal handler may only perform async-signal-safe operations, so
+// termination requests are recorded here and honored by the selfplay loop
+// between games, where flushing the dataset is safe. Fault signals exit
+// immediately: the process state is undefined and flushing from the handler
+// could corrupt the very dataset an orderly exit is supposed to protect.
+static volatile std::sig_atomic_t terminationSignal = 0;
 
-    std::signal(SIGINT, signalHandler);
-    std::signal(SIGTERM, signalHandler);
-    std::signal(SIGSEGV, signalHandler);
-    std::signal(SIGILL, signalHandler);
-    std::signal(SIGABRT, signalHandler);
-    std::signal(SIGFPE, signalHandler);
+static void setupSignalHandler()
+{
+    auto terminationHandler = [](int signal) {
+        if (terminationSignal)  // exit immediately on a repeated request
+            std::_Exit(EXIT_FAILURE);
+        terminationSignal = signal;
+    };
+    auto faultHandler = [](int) { std::_Exit(EXIT_FAILURE); };
+
+    std::signal(SIGINT, terminationHandler);
+    std::signal(SIGTERM, terminationHandler);
+    std::signal(SIGSEGV, faultHandler);
+    std::signal(SIGILL, faultHandler);
+    std::signal(SIGABRT, faultHandler);
+    std::signal(SIGFPE, faultHandler);
 #ifdef SIGHUP
-    std::signal(SIGHUP, signalHandler);
+    std::signal(SIGHUP, terminationHandler);
 #endif
 #ifdef SIGQUIT
-    std::signal(SIGQUIT, signalHandler);
+    std::signal(SIGQUIT, terminationHandler);
 #endif
 }
 
 static void resetSignalHandler()
 {
-    signalFunc = nullptr;
+    terminationSignal = 0;
     std::signal(SIGINT, SIG_DFL);
     std::signal(SIGTERM, SIG_DFL);
     std::signal(SIGSEGV, SIG_DFL);
@@ -88,10 +95,7 @@ static void resetSignalHandler()
 class SignalHandlerScope
 {
 public:
-    explicit SignalHandlerScope(std::function<void(int)> handler)
-    {
-        setupSignalHandler(std::move(handler));
-    }
+    SignalHandlerScope() { setupSignalHandler(); }
     ~SignalHandlerScope() { resetSignalHandler(); }
 
     SignalHandlerScope(const SignalHandlerScope &)            = delete;
@@ -880,7 +884,7 @@ SelfplayConfig parseSelfplayArguments(int argc, char *argv[])
                 if ((cfg.boardSizeMin != 15 && cfg.boardSizeMin != 20)
                     || cfg.boardSizeMin != cfg.boardSizeMax)
                     throw std::invalid_argument(
-                        "policy tracing currently supports f15 or f20 per run");
+                        "policy tracing requires board size 15 or 20 per run");
                 if (cfg.numThreads != 1 || cfg.multipv != 1)
                     throw std::invalid_argument(
                         "policy tracing currently requires one search thread and MultiPV 1");
@@ -949,20 +953,9 @@ void Command::selfplay(int argc, char *argv[]) try
     }
 #endif
 
-    // Setup signal handler to close dataset file when receiving signal. Termination
-    // requests exit cleanly; fault signals (SIGSEGV etc.) still flush the writer but
-    // must report the crash and exit nonzero instead of masquerading as success.
-    SignalHandlerScope signalHandler([&](int signal) {
-        bool requested = signal == SIGINT || signal == SIGTERM;
-        if (requested)
-            MESSAGEL("Gracefully exiting...");
-        else
-            ERRORL("Terminated by signal " << signal << ", flushing dataset...");
-        dataWriter.reset();
-        // Do not destroy the trace session here: a search worker may still reference it.
-        // Process exit cannot publish its staged corpus, so the partial trace remains invalid.
-        std::exit(requested ? 0 : EXIT_FAILURE);
-    });
+    // Record termination signals so the game loop below can close the dataset
+    // file and exit at a safe point.
+    SignalHandlerScope signalHandler;
 
     if (cfg.openings.size())
         MESSAGEL("Read " << cfg.openings.size() << " openings for selfplay.");
@@ -996,6 +989,20 @@ void Command::selfplay(int argc, char *argv[]) try
 
     Time startTime = now(), lastTime = startTime;
     for (size_t i = 0; i < cfg.numGames;) {
+        // Honor a termination request between games, where no writer or search
+        // is running: flush the dataset file and exit. The staged policy trace
+        // is not published, as an interrupted run cannot be verified complete.
+        if (int signal = terminationSignal) {
+            bool requested = signal == SIGINT || signal == SIGTERM;
+            if (requested)
+                MESSAGEL("Gracefully exiting...");
+            else
+                ERRORL("Terminated by signal " << signal << ", flushing dataset...");
+            Search::Engine.setNumThreads(0);
+            dataWriter.reset();
+            std::exit(requested ? EXIT_SUCCESS : EXIT_FAILURE);
+        }
+
         Board board(boardSizeDis(prng));
         board.newGame(cfg.rule);
 
@@ -1041,9 +1048,15 @@ void Command::selfplay(int argc, char *argv[]) try
     }
 
 #ifdef POLICY_TRAINING
-    if (policyTraceSession) {
+    if (policyTraceSession)
         Search::Engine.setPolicyTraceSession(nullptr);
-        Search::Engine.setNumThreads(0);
+#endif
+
+    // Release workers while the signal scope and writers are still alive.
+    Search::Engine.setNumThreads(0);
+
+#ifdef POLICY_TRAINING
+    if (policyTraceSession) {
         const PolicyTraceSummary written = policyTraceSession->finalize();
         if (written.events == 0)
             throw std::runtime_error("policy trace contains no events");
@@ -1053,10 +1066,6 @@ void Command::selfplay(int argc, char *argv[]) try
     }
 #endif
 
-    // Release rule-specific worker state while the command's signal callback and
-    // writer are still alive. This avoids deferring evaluator/thread destruction to
-    // static shutdown, after the callback's captured locals no longer exist.
-    Search::Engine.setNumThreads(0);
     dataWriter.reset();
 
     MESSAGEL("Completed playing " << cfg.numGames << " games.");

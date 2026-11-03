@@ -83,6 +83,8 @@ static_assert(clampMoveScore(-40000) == std::numeric_limits<Score>::min());
 
 /// Scaling factor of the sigmoid that maps Value to winning rate.
 extern float ScalingFactor;
+/// Install a finite positive scale and refresh scale-dependent readout caches.
+void setScalingFactor(float scale);
 
 /// Eval and score tables. Renju is asymmetric, so it gets separate black/white
 /// tables and the arrays have one extra slot; index them via tableIndex().
@@ -99,28 +101,6 @@ extern MoveScorePair P4SCORES[RULE_NB + 1][PCODE_NB];
 constexpr int tableIndex(Rule r, Color c)
 {
     return r + (r == Rule::RENJU ? c : 0);
-}
-
-/// Optional low-dimensional post-processing for a rule's classical value.
-/// The readout is an odd monotone piecewise-linear map over normalized value,
-/// with fixed x knots {0, 0.5, 1, 2, 4, 8}. The knots live in config.toml so
-/// the underlying model artifact remains independently reproducible.
-struct ClassicalValueReadout
-{
-    static constexpr size_t KnotCount = 6;
-
-    bool                          knotsActive = false;
-    std::array<double, KnotCount> knots {};
-};
-
-extern std::array<ClassicalValueReadout, RULE_NB + 1> CLASSICAL_VALUE_READOUTS;
-
-void  refreshClassicalValueReadoutCaches();
-Value mapClassicalValue(Rule rule, Color self, Value rawValue);
-
-inline bool isClassicalValueReadoutActive(Rule rule, Color self)
-{
-    return CLASSICAL_VALUE_READOUTS[tableIndex(rule, self)].knotsActive;
 }
 
 /// Lookup eval table with color and pcode of rule R.

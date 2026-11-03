@@ -41,11 +41,11 @@
 
 namespace Search {
 
+namespace {
+
 /// Generate the root move list for the main thread from the current board
-/// position and options. When options.rootMovesWhitelist is non-empty the list
-/// is used verbatim (see below); otherwise this applies block-move filtering,
-/// balance2 move pair expansion, and root symmetry filtering.
-/// Declared in searchengine.h so the unit tests can drive it directly.
+/// position and options: applies block-move filtering, balance2 move pair
+/// expansion, and root symmetry filtering.
 void generateRootMoves(SearchThread &th)
 {
     auto addMoveToRootMoves = [&th](Pos m) {
@@ -78,19 +78,6 @@ void generateRootMoves(SearchThread &th)
             th.rootMoves.emplace_back(m);
         }
     };
-
-    // User-supplied root move allow-list (YXANALZ): when non-empty, use exactly this
-    // list as the depth-0 root candidates. Skip MovePicker, block-move filtering and
-    // symmetry filtering entirely - the user's list is honoured verbatim, in order.
-    // Balance2 pair expansion is unreachable here: the only caller that sets the
-    // whitelist (analyzeMoves()) forces balanceMode = BALANCE_NONE.
-    if (!th.options().rootMovesWhitelist.empty()) {
-        assert(th.options().balanceMode == Search::SearchOptions::BALANCE_NONE
-               && "rootMovesWhitelist is not supported together with a balance mode");
-        for (Pos m : th.options().rootMovesWhitelist)
-            th.rootMoves.emplace_back(m);
-        return;
-    }
 
     // Generate root moves for main search thread
     MovePicker movePicker(th.options().rule,
@@ -133,8 +120,6 @@ void generateRootMoves(SearchThread &th)
         }
     }
 }
-
-namespace {
 
 const char *DefaultSearcherName = "alphabeta";
 
@@ -412,10 +397,12 @@ bool SearchEngine::tryTrivialBestmove(SearchThread &main)
 
         return true;  // abnormal case: GUI might have a bug
     }
-    // If we are winning, return directly
-    else if (main.board->p4Count(main.board->sideToMove(), A_FIVE)) {
-        assert(main.board->pattern4(main.rootMoves[0].pv[0], main.board->sideToMove())
-               == A_FIVE);
+    // If we are winning, return directly. The winning square can be absent
+    // from the root move list (e.g. filtered by blockMoves), in which case
+    // rootMoves[0] is an arbitrary candidate and the normal search must run.
+    else if (main.board->p4Count(main.board->sideToMove(), A_FIVE)
+             && main.board->pattern4(main.rootMoves[0].pv[0], main.board->sideToMove())
+                    == A_FIVE) {
         main.rootMoves[0].value = mate_in(1);
         ctx.bestMove            = main.rootMoves[0].pv[0];
 
@@ -470,6 +457,11 @@ void SearchEngine::clear(bool clearAllMemory)
 {
     if (threads_.empty())
         setNumThreads(Config::GeneralCfg.defaultThreadNum);
+
+    // A stop request only sets the terminate flag; threads drain their
+    // current search asynchronously. Wait for them to go idle before the
+    // searcher mutates state they still read (TT, reduction tables).
+    waitForIdle();
 
     if (searcher())
         searcher()->clear(*this, clearAllMemory);

@@ -61,6 +61,7 @@ std::unique_ptr<Board>        board;
 Search::SearchOptions         options;
 bool                          GUIMode   = false;
 std::atomic_bool              thinking  = false;
+std::atomic_bool              exiting   = false;
 std::optional<CandidateRange> candRange = std::nullopt;
 
 void sendActionAndUpdateBoard(ActionType action, Pos bestMove)
@@ -106,10 +107,6 @@ void think(Board                             &board,
     options.swapable            = swapable;
     options.disableOpeningQuery = disableOpeningQuery;
 
-    // In VCN mode the side to move is always the attacker
-    if (options.vcnMode.enabled())
-        options.vcnMode.attacker = board.sideToMove();
-
     // If threads are pondering, stop them now and wait for them to finish.
     // This must precede the config reload below: loadConfig quiesces the
     // search threads without signaling them to stop.
@@ -122,25 +119,36 @@ void think(Board                             &board,
         loadConfig();
 
     thinking = true;
-    Search::Engine.startThinking(board, options, false, [&, startTime = now()]() {
-        {
+    Search::Engine.startThinking(board, options, false, [startTime = now()]() {
+        // This callback runs on the main search thread while the protocol
+        // thread may be reading commands. Hold protocolMutex over the whole
+        // callback: `thinking` only becomes false under the lock, so once the
+        // protocol thread observes it false and acquires the lock, the shared
+        // options and board are fully settled and any ponder search has been
+        // started. This orders the ponder startup before any later stop
+        // request or board reallocation issued by a protocol command.
 #ifdef MULTI_THREADING
-            std::lock_guard<std::mutex> lock(protocolMutex);
+        std::lock_guard<std::mutex> lock(protocolMutex);
 #endif
 
-            sendActionAndUpdateBoard(Search::Engine.ctx.resultAction,
-                                     Search::Engine.ctx.bestMove);
-            thinking = false;
-        }
+        sendActionAndUpdateBoard(Search::Engine.ctx.resultAction, Search::Engine.ctx.bestMove);
+        thinking = false;
 
         // Subtract used match time
         Time usedTime = now() - startTime;
         if (options.timeLimit && options.matchTime > 0)
             options.timeLeft = std::max(options.timeLeft - usedTime, (Time)0);
 
-        // Start pondering search if needed
-        if (Search::Engine.ctx.startPonderAfterThinking)
-            Search::Engine.startThinking(board, options, true);
+        // Start pondering search if needed. The global board is re-fetched
+        // under the lock (it cannot be reallocated while we hold it), and no
+        // ponder search may start once the protocol loop is exiting, as
+        // nothing would stop it. Pondering requires a worker thread: in a
+        // single-threaded build the ponder search would run synchronously on
+        // the protocol thread and could never receive a stop command.
+#ifdef MULTI_THREADING
+        if (Search::Engine.ctx.startPonderAfterThinking && !exiting)
+            Search::Engine.startThinking(*GomocupProtocol::board, options, true);
+#endif
     });
 }
 
@@ -249,27 +257,6 @@ void getOption()
     else if (token == "MAX_DEPTH") {
         std::cin >> options.maxDepth;
     }
-    else if (token == "VCTHREAD") {
-        // Yixin-Board "checkmate in global search": 0 off, 1 VCT (= VC3), 2 VC2.
-        // 3 (VC4) is an extension the GUI never sends. VC5 is internal and not selectable.
-        std::cin >> val;
-        switch (val) {
-        case 0: options.vcnMode.n = Search::VCNLevel::None; break;
-        case 1:
-            options.vcnMode.n = Search::VCNLevel::VC3;
-            MESSAGEL("VCN Mode enabled: VCT (Defender passes 2 times)");
-            break;
-        case 2:
-            options.vcnMode.n = Search::VCNLevel::VC2;
-            MESSAGEL("VCN Mode enabled: VC2 (Defender passes 3 times)");
-            break;
-        case 3:
-            options.vcnMode.n = Search::VCNLevel::VC4;
-            MESSAGEL("VCN Mode enabled: VC4 (Defender passes 1 time)");
-            break;
-        default: ERRORL("Unknown vcthread value: " << val << ", must be 0..3."); break;
-        }
-    }
     else if (token == "START_DEPTH") {
         std::cin >> options.startDepth;
     }
@@ -332,7 +319,7 @@ void getOption()
     // Protocol-required no-ops: these Gomocup/Yixin-Board options are accepted
     // (their value must be consumed from the stream) but deliberately ignored.
     else if (token == "GAME_TYPE" || token == "TIME_INCREMENT" || token == "THREAD_SPLIT_DEPTH"
-             || token == "CHECKMATE" || token == "NBESTSYM") {
+             || token == "CHECKMATE" || token == "NBESTSYM" || token == "VCTHREAD") {
         std::cin >> val;
     }
     else if (token == "FOLDER") {
@@ -519,10 +506,6 @@ void takeBack()
 
 void begin()
 {
-    // The YXANALZ root-move whitelist is one-shot: drop any list left by a prior
-    // YXANALZ turn so it cannot leak into this search.
-    options.rootMovesWhitelist.clear();
-
     if (board->ply() != 0)
         ERRORL("Board is not empty.");
     else
@@ -531,9 +514,6 @@ void begin()
 
 void turn()
 {
-    // One-shot YXANALZ whitelist: clear before this normal turn search.
-    options.rootMovesWhitelist.clear();
-
     auto pos = parseLegalCoord(std::cin, *board);
     if (!pos.has_value())
         return;
@@ -547,8 +527,6 @@ void turn()
 void getPosition(bool startThink)
 {
     board->newGame(options.rule);
-    // One-shot YXANALZ whitelist: clear before rebuilding the position.
-    options.rootMovesWhitelist.clear();
     options.multiPV     = 1;
     options.balanceMode = Search::SearchOptions::BALANCE_NONE;
 
@@ -596,6 +574,14 @@ void getPosition(bool startThink)
         if (side == WALL)  // Currently wall is not supported
             continue;
 
+        // Cap the total number of moves: one entry may add an extra pass plus
+        // the move itself, and the per-ply board state arrays hold at most
+        // cellCount()*2 moves.
+        if (board->ply() + 2 > board->cellCount() * 2) {
+            ERRORL("Too many moves in the position.");
+            return;
+        }
+
         // Make sure current side to move correspond to the input side
         // If not, we add an extra PASS move to flip the side
         if (side == SELF && board->sideToMove() != selfColor
@@ -608,6 +594,14 @@ void getPosition(bool startThink)
 
         if (pos == Pos::PASS && checkLastMoveIsNotPass(*board))
             return;
+
+        // The read loop validated coordinates against an empty board, so
+        // duplicated coordinates can only be rejected here, against the
+        // actual position built so far.
+        if (!board->isLegal(pos)) {
+            ERRORL("Coord is not valid or empty.");
+            return;
+        }
 
         board->move(options.rule, pos);
     }
@@ -628,16 +622,23 @@ void getBlock(bool remove = false)
         std::cin >> coordStr;
         upperInplace(coordStr);
 
-        if (coordStr == "DONE")
+        if (coordStr == "DONE" || std::cin.eof())
             break;
 
+        // Reset the stream to hold only this token, so that a previous bad
+        // token can not break the parse of the following coordinates
+        ss.str(coordStr);
         ss.clear();
-        ss << coordStr;
-        ss >> x >> comma >> y;
+        if (!(ss >> x >> comma >> y)) {
+            ERRORL("Block coord is a pass or invalid.");
+            continue;
+        }
 
         Pos pos = inputCoordConvert(x, y, board->size(), Config::GeneralCfg.ioCoordMode);
-        if (!board->isInBoard(pos) || pos == Pos::PASS)
+        if (!board->isInBoard(pos) || pos == Pos::PASS) {
             ERRORL("Block coord is a pass or invalid.");
+            continue;
+        }
 
         bool alreadyInList = std::count(options.blockMoves.begin(), options.blockMoves.end(), pos);
         if (!remove) {
@@ -654,90 +655,8 @@ void getBlock(bool remove = false)
 
 void nbest()
 {
-    // One-shot YXANALZ whitelist: YXNBEST generates its own root list.
-    options.rootMovesWhitelist.clear();
     std::cin >> options.multiPV;
     think(*board, std::max<uint16_t>(options.multiPV, 1));
-}
-
-/// YXANALZ handler: analyze an explicit user-supplied allow-list of depth-0 root
-/// moves for the side to move on the current board, instead of the engine-generated
-/// candidate list. Reads "x,y" tokens until DONE / EOF, validates each with
-/// parseLegalCoord (in-board + empty), then additionally rejects PASS, Renju
-/// forbidden points for black, and de-duplicates. If no move is valid, warns and
-/// does not search. Otherwise forces
-/// balanceMode = BALANCE_NONE, sets multiPV to the whitelist size and calls think(),
-/// which searches every listed move as its own PV line (reused printPvCompletes path).
-void analyzeMoves()
-{
-    // Rebuild the whitelist from scratch every time.
-    options.rootMovesWhitelist.clear();
-    std::vector<Pos> whitelist;
-
-    while (true) {
-        std::string coordStr;
-        std::cin >> coordStr;
-        if (std::cin.eof())
-            break;
-        upperInplace(coordStr);
-        if (coordStr == "DONE")
-            break;
-
-        std::stringstream ss;
-        ss << coordStr;
-        // parseLegalCoord prints its own error for an out-of-board / occupied /
-        // forbidden-point coord and returns nullopt -> just skip that entry.
-        std::optional<Pos> pos = parseLegalCoord(ss, *board);
-        if (!pos.has_value())
-            continue;
-        if (*pos == Pos::PASS) {
-            ERRORL("Analyze move can not be a pass, ignored.");
-            continue;
-        }
-        // parseLegalCoord only checks in-board + emptiness, not the Renju
-        // forbidden-point rule. A forbidden point is not a legal move for black,
-        // so drop it here rather than feeding an illegal root move to the search.
-        if (options.rule.rule == RENJU && board->sideToMove() == BLACK
-            && board->checkForbiddenPoint(*pos)) {
-            ERRORL("Analyze move is a forbidden point, ignored.");
-            continue;
-        }
-        if (std::count(whitelist.begin(), whitelist.end(), *pos))
-            continue;  // silently de-duplicate
-
-        whitelist.push_back(*pos);
-    }
-
-    if (whitelist.empty()) {
-        ERRORL("No valid analyze move");
-        return;
-    }
-
-    options.rootMovesWhitelist = std::move(whitelist);
-    options.balanceMode        = Search::SearchOptions::BALANCE_NONE;
-    options.multiPV = std::max<uint16_t>(1, (uint16_t)options.rootMovesWhitelist.size());
-    think(*board, options.multiPV);
-}
-
-/// YXVCN handler: run one search in VCN mode at level 2..4 (the side to move is the attacker),
-/// then restore the level set by INFO VCTHREAD. The level is copied into the search context when
-/// thinking starts, so restoring it right after think() returns is safe.
-void searchVCN()
-{
-    int64_t level = 0;
-    std::cin >> level;
-    if (level < 2 || level > 4) {
-        ERRORL("YXVCN level must be 2..4.");
-        return;
-    }
-
-    options.rootMovesWhitelist.clear();
-    options.multiPV = 1;
-
-    const Search::VCNLevel prevLevel = options.vcnMode.n;
-    options.vcnMode.n                = static_cast<Search::VCNLevel>(level - 1);
-    think(*board);
-    options.vcnMode.n = prevLevel;
 }
 
 void showForbid()
@@ -758,9 +677,6 @@ void showForbid()
 
 void balance(Search::SearchOptions::BalanceMode mode)
 {
-    // One-shot YXANALZ whitelist: clear before a balance search.
-    options.rootMovesWhitelist.clear();
-
     std::cin >> options.balanceBias;
 
     // Revert bias for balance two mode
@@ -775,17 +691,12 @@ void balance(Search::SearchOptions::BalanceMode mode)
 
 void searchDefend()
 {
-    // One-shot YXANALZ whitelist: YXSEARCHDEFEND generates its own root list.
-    options.rootMovesWhitelist.clear();
     options.multiPV = board->movesLeft();
     think(*board, std::max<uint16_t>(options.multiPV, 1));
 }
 
 void swap2board()
 {
-    // One-shot YXANALZ whitelist: clear before a swap2 search (getPosition() also
-    // clears it, but keep this explicit alongside the other think entry points).
-    options.rootMovesWhitelist.clear();
     options.rule.opRule = GameRule::SWAP2;
     getPosition(false);
 
@@ -924,8 +835,24 @@ bool runProtocol()
 
     // clang-format off
     if (cmd == "END")                          return Search::Engine.stopThinking(), true;
-    else if (cmd == "STOP" || cmd == "YXSTOP") return Search::Engine.stopThinking(), false;
-    else if (thinking)                         return false;
+    else if (cmd == "STOP" || cmd == "YXSTOP") {
+        // Raw stop first for minimal latency mid-search. A stop that races the
+        // finish callback loses: the callback's nested ponder startThinking
+        // resets the terminate flag after us. Acquiring protocolMutex
+        // serializes behind any in-flight callback, so the second stop lands
+        // on a just-started ponder; when nothing is running it is a no-op
+        // cleared by the next startThinking.
+        Search::Engine.stopThinking();
+#ifdef MULTI_THREADING
+        std::lock_guard<std::mutex> stopLock(protocolMutex);
+        Search::Engine.stopThinking();
+#endif
+        return false;
+    }
+    // Any other command is dropped while thinking; discard the rest of its
+    // line as well, so its argument tokens are not parsed as commands later.
+    else if (thinking)
+        return std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n'), false;
 
 #ifdef MULTI_THREADING
     std::lock_guard<std::mutex> lock(protocolMutex);
@@ -969,8 +896,6 @@ bool runProtocol()
     else if (cmd == "YXBLOCKUNDO")         CheckBoardOK([] { getBlock(true); });
     else if (cmd == "YXBLOCKRESET")        CheckBoardOK([] { options.blockMoves.clear(); });
     else if (cmd == "YXNBEST")             CheckBoardOK(nbest);
-    else if (cmd == "YXANALZ")             CheckBoardOK(analyzeMoves);
-    else if (cmd == "YXVCN")               CheckBoardOK(searchVCN);
     else if (cmd == "YXSHOWFORBID")        CheckBoardOK(showForbid);
     else if (cmd == "YXBALANCEONE")        CheckBoardOK([] { balance(Search::SearchOptions::BALANCE_ONE); });
     else if (cmd == "YXBALANCETWO")        CheckBoardOK([] { balance(Search::SearchOptions::BALANCE_TWO); });
@@ -1048,6 +973,19 @@ void Command::gomocupLoop()
         // from std::cin would block so this may not necessary.
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
 #endif
+    }
+
+    // Forbid the search-finish callback from starting a new ponder search, and
+    // stop a running one (a ponder search never stops by itself), otherwise the
+    // wait below would never return. A normal search is left to finish so that
+    // its best move is still printed.
+    {
+#ifdef MULTI_THREADING
+        std::lock_guard<std::mutex> lock(protocolMutex);
+#endif
+        GomocupProtocol::exiting = true;
+        if (Search::Engine.ctx.inPonder)
+            Search::Engine.stopThinking();
     }
 
     // If there is any thread still running, wait until they exited.

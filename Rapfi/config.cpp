@@ -23,6 +23,7 @@
 #include "core/iohelper.h"
 #include "database/dbconfig.h"
 #include "eval/classicalpolicy.h"
+#include "eval/eval.h"
 #include "eval/evalconfig.h"
 #include "eval/scoretables.h"
 #include "game/pattern.h"
@@ -59,9 +60,7 @@ constexpr uint32_t I(uint32_t y, uint32_t x)
 
 constexpr std::array<char, 8> ClassicalModelExtensionMagic =
     {'R', 'F', 'C', 'L', 'M', 'O', 'D', '1'};
-constexpr uint32_t ClassicalModelCompactP3LegacyVersion = 7;
 constexpr uint32_t ClassicalModelCompactP3Version       = 8;
-constexpr uint32_t LegacyModelPolicyTableCount          = 1;
 constexpr uint32_t ModelPolicyTableCount                = RULE_NB + 1;
 constexpr uint32_t ModelPolicyContextCount              = Evaluation::PolicyStoredContextCount;
 constexpr uint32_t ModelBlendComponentCount             = 0;
@@ -74,18 +73,13 @@ static_assert(ModelPolicyContextCount == Evaluation::QUIET);
 static_assert(Evaluation::QUIET + 1 == Evaluation::POLICY_CONTEXT_NB);
 static_assert(ModelPolicyContextCount < Evaluation::PolicyContextCount);
 
-using StoredPolicyCross =
-    Score[ModelPolicyContextCount][PolicyCrossPatternCount][PolicyCrossPatternCount];
-using StoredPolicyCrossTables = Score[ModelPolicyTableCount][ModelPolicyContextCount]
-                                     [PolicyCrossPatternCount][PolicyCrossPatternCount];
+using StoredPolicyCrossTables =
+    std::array<Evaluation::StoredPolicyCrossTable, ModelPolicyTableCount>;
+static_assert(sizeof(StoredPolicyCrossTables) == ClassicalModelCompactP3PayloadBytes);
 
 }  // namespace
 
 namespace Evaluation {
-
-/// Scaling Factor is used for conversion between eval value and win rate.
-/// Formula: win rate = sigmoid(eval / ScalingFactor)
-float ScalingFactor = 200.0f;
 
 // Classical evaluation and score tables
 // Note that Renju has asymmetry eval and score
@@ -93,48 +87,6 @@ float ScalingFactor = 200.0f;
 Eval                                           EVALS[RULE_NB + 1][PCODE_NB];
 Eval                                           EVALS_THREAT[RULE_NB + 1][THREAT_NB];
 MoveScorePair                                  P4SCORES[RULE_NB + 1][PCODE_NB];
-std::array<ClassicalValueReadout, RULE_NB + 1> CLASSICAL_VALUE_READOUTS;
-std::array<std::array<Value, VALUE_EVAL_MAX - VALUE_EVAL_MIN + 1>, RULE_NB + 1>
-     CLASSICAL_VALUE_READOUT_CACHES {};
-void refreshClassicalValueReadoutCaches()
-{
-    static constexpr std::array<double, ClassicalValueReadout::KnotCount> XKnots =
-        {0.0, 0.5, 1.0, 2.0, 4.0, 8.0};
-    const double scale = ScalingFactor;
-
-    for (size_t readoutIndex = 0; readoutIndex < CLASSICAL_VALUE_READOUTS.size();
-         readoutIndex++) {
-        if (!CLASSICAL_VALUE_READOUTS[readoutIndex].knotsActive)
-            continue;
-        const auto &yKnots = CLASSICAL_VALUE_READOUTS[readoutIndex].knots;
-        auto       &cache  = CLASSICAL_VALUE_READOUT_CACHES[readoutIndex];
-        for (int raw = VALUE_EVAL_MIN; raw <= VALUE_EVAL_MAX; raw++) {
-            double x = std::abs(double(raw)) / scale;
-            double y;
-            if (x >= XKnots.back())
-                y = yKnots.back() + x - XKnots.back();
-            else {
-                size_t hi = 1;
-                while (x > XKnots[hi])
-                    hi++;
-                size_t lo = hi - 1;
-                double t  = (x - XKnots[lo]) / (XKnots[hi] - XKnots[lo]);
-                y         = yKnots[lo] + t * (yKnots[hi] - yKnots[lo]);
-            }
-            double mapped = std::copysign(y * scale, double(raw));
-            cache[raw - VALUE_EVAL_MIN] =
-                Value(std::clamp<long long>(std::llround(mapped), VALUE_EVAL_MIN, VALUE_EVAL_MAX));
-        }
-    }
-}
-
-Value mapClassicalValue(Rule rule, Color self, Value rawValue)
-{
-    assert(VALUE_EVAL_MIN <= rawValue && rawValue <= VALUE_EVAL_MAX);
-    return CLASSICAL_VALUE_READOUT_CACHES[tableIndex(rule, self)]
-                                         [int(rawValue) - VALUE_EVAL_MIN];
-}
-
 }  // namespace Evaluation
 
 namespace Config {
@@ -158,8 +110,7 @@ struct PendingConfig
     Search::TimeConfig                                     time     = Search::TimeCfg;
     Database::DatabaseConfig                               database = Database::DatabaseCfg;
     Evaluation::EvaluatorConfig                            eval     = Evaluation::EvalCfg;
-    std::array<Evaluation::ClassicalValueReadout, RULE_NB + 1> valueReadouts =
-        Evaluation::CLASSICAL_VALUE_READOUTS;
+    Evaluation::ClassicalValueReadouts valueReadouts = Evaluation::classicalValueReadouts();
 
     /// "[search] default_searcher" was present: switch the searcher at commit.
     std::optional<std::string> searcherName;
@@ -201,12 +152,18 @@ void readValueModel(const cpptoml::table &t, SetterType setter);
 /// evaluator maker install. A load that fails in any way leaves the previous
 /// configuration and engine state fully intact. The one exception is the
 /// classical model surface written by readModel (EVALS / P4SCORES /
-/// ScalingFactor, and binary_file via loadModelFromFile): those tables are
-/// still written in place during parse.
+/// ScalingFactor and related tables): those values are still written in place
+/// during parse. Binary model loads publish only after the whole file validates;
+/// an inline TOML model can still leave partial changes on a parse failure.
 /// @param configStream A input stream that contains a config file.
 /// @return Returns true if loading succeeded, otherwise returns false.
 bool Config::loadConfig(std::istream &configStream)
 {
+    if (!configStream || configStream.peek() == std::istream::traits_type::eof()) {
+        ERRORL("Failed to load config: config stream is unreadable or empty");
+        return false;
+    }
+
     // Callers signal stopThinking() but do not wait, so quiesce the search
     // threads before touching any state they read: the classical model tables
     // are written in place during parse, and the commit publishes the config
@@ -244,11 +201,8 @@ bool Config::loadConfig(std::istream &configStream)
     Search::TimeCfg                      = pending.time;
     Database::DatabaseCfg                = pending.database;
     Evaluation::EvalCfg                  = pending.eval;
-    Evaluation::CLASSICAL_VALUE_READOUTS = pending.valueReadouts;
-    if (std::any_of(Evaluation::CLASSICAL_VALUE_READOUTS.begin(),
-                    Evaluation::CLASSICAL_VALUE_READOUTS.end(),
-                    [](const auto &readout) { return readout.knotsActive; }))
-        Evaluation::refreshClassicalValueReadoutCaches();
+    Evaluation::refreshClassicalMarginTables();
+    Evaluation::installClassicalValueReadouts(pending.valueReadouts);
 
     // The searcher switch precedes the TT resize: setupSearcher carries the
     // old searcher's memory limit onto the new one, and the resize then
@@ -277,18 +231,20 @@ void Config::readRequirement(const cpptoml::table &t)
 {
     auto [major, minor, revision] = getVersionNumbers();
     uint64_t rapVer = ((uint64_t)major << 32) | ((uint64_t)minor << 16) | (uint64_t)revision;
+    auto composeVersion = [](const std::vector<int64_t> &ver, const char *key) {
+        if (ver.size() != 3)
+            throw std::runtime_error(std::string("illegal ") + key);
+        for (int64_t component : ver)
+            if (component < 0 || component > 0xFFFF)
+                throw std::runtime_error(std::string("illegal ") + key);
+        return ((uint64_t)ver[0] << 32) | ((uint64_t)ver[1] << 16) | (uint64_t)ver[2];
+    };
     if (auto minVer = t.get_array_of<int64_t>("min_version")) {
-        if (minVer->size() != 3)
-            throw std::runtime_error("illegal min_version");
-        uint64_t cfgVer = ((*minVer)[0] << 32) | ((*minVer)[1] << 16) | (*minVer)[2];
-        if (cfgVer > rapVer)
+        if (composeVersion(*minVer, "min_version") > rapVer)
             throw std::runtime_error("config requires newer version of rapfi");
     }
     if (auto maxVer = t.get_array_of<int64_t>("max_version")) {
-        if (maxVer->size() != 3)
-            throw std::runtime_error("illegal max_version");
-        uint64_t cfgVer = ((*maxVer)[0] << 32) | ((*maxVer)[1] << 16) | (*maxVer)[2];
-        if (cfgVer < rapVer)
+        if (composeVersion(*maxVer, "max_version") < rapVer)
             throw std::runtime_error("config requires older version of rapfi");
     }
 }
@@ -369,7 +325,15 @@ void Config::readGeneral(const cpptoml::table &t, PendingConfig &pending)
 
     // Read memory reserved for each rule
     if (auto table = t.get_array("memory_reserved_mb")) {
-        if (auto array = table->get_array_of<int64_t>()) {
+        auto array = table->get_array_of<int64_t>();
+        if (!array)
+            MESSAGEL("Warning: memory_reserved_mb array must hold only integers, ignored.");
+        else if (array->empty())
+            throw std::runtime_error("memory_reserved_mb array must not be empty");
+        else {
+            for (int64_t reservedMB : *array)
+                if (reservedMB < 0)
+                    throw std::runtime_error("memory_reserved_mb must not be negative");
             for (int i = 0; i < RULE_NB; i++)
                 cfg.memoryReservedMB[i] = array->at(std::min<size_t>(i, array->size() - 1));
         }
@@ -460,7 +424,7 @@ void Config::readSearch(const cpptoml::table &t, PendingConfig &pending)
 }
 
 /// Read model table of all rules in the config. The classical model values
-/// (EVALS / P4SCORES / ScalingFactor and optional binary context-policy rows)
+/// (EVALS / P4SCORES / ScalingFactor and compact policy rows)
 /// are written in place, not staged.
 void Config::readModel(const cpptoml::table &t, PendingConfig &pending)
 {
@@ -475,90 +439,57 @@ void Config::readModel(const cpptoml::table &t, PendingConfig &pending)
             throw std::runtime_error("failed to load classic model file");
     }
     else {
-        // Inline/legacy TOML models carry neither threat tables nor optional
-        // binary extensions. Reset both before applying inline values.
+        // Inline TOML definitions carry neither threat tables nor compact policy rows.
+        // Reset both before applying the retained built-in/table definitions.
         Evaluation::resetPolicyCross();
         std::memset(Evaluation::EVALS_THREAT, 0, sizeof(Evaluation::EVALS_THREAT));
 
-        // Read Eval & Score
-        if (auto eval = t.get_table("eval")) {
-            for (Rule r : Rules) {
-                bool hasAsymmetryRenjuEval = false;
-                auto setEvalBlack          = [r](PatternCode pcode, Eval ev) {
-                    Evaluation::EVALS[r + BLACK][pcode] = ev;
-                };
-                auto setEvalWhite = [r](PatternCode pcode, Eval ev) {
-                    Evaluation::EVALS[r + WHITE][pcode] = ev;
-                };
-                auto ruleEval = eval->get_table(RuleName[r]);
-                if (!ruleEval)  // fallback
-                    ruleEval = eval;
-                else if (r == RENJU) {
-                    auto blackEval    = ruleEval->get_table("black");
-                    auto whiteEval    = ruleEval->get_table("white");
-                    auto fallbackEval = ruleEval->get_as<int64_t>("model_type") ? ruleEval : eval;
-                    if (hasAsymmetryRenjuEval = blackEval || whiteEval; hasAsymmetryRenjuEval) {
-                        readValueModel<Eval, -16384, 16383>(*(blackEval ? blackEval : fallbackEval),
-                                                            setEvalBlack);
-                        readValueModel<Eval, -16384, 16383>(*(whiteEval ? whiteEval : fallbackEval),
-                                                            setEvalWhite);
+        // Resolve the same rule/side inheritance once for both inline table kinds.
+        auto readInlineTables = [&](const auto &model, const auto &readTable) {
+            for (Rule rule : Rules) {
+                auto ruleModel = model->get_table(RuleName[rule]);
+                if (!ruleModel)
+                    ruleModel = model;
+                else if (rule == RENJU) {
+                    auto black = ruleModel->get_table("black");
+                    auto white = ruleModel->get_table("white");
+                    if (black || white) {
+                        auto fallback =
+                            ruleModel->template get_as<int64_t>("model_type") ? ruleModel : model;
+                        readTable(*(black ? black : fallback), Evaluation::tableIndex(rule, BLACK));
+                        readTable(*(white ? white : fallback), Evaluation::tableIndex(rule, WHITE));
+                        continue;
                     }
                 }
-
-                if (!hasAsymmetryRenjuEval) {
-                    if (r == RENJU) {
-                        readValueModel<Eval, -16384, 16383>(*ruleEval, setEvalBlack);
-                        readValueModel<Eval, -16384, 16383>(*ruleEval, setEvalWhite);
-                    }
-                    else {
-                        readValueModel<Eval, -16384, 16383>(*ruleEval, setEvalBlack);
-                    }
-                }
+                readTable(*ruleModel, Evaluation::tableIndex(rule, BLACK));
+                if (rule == RENJU)
+                    readTable(*ruleModel, Evaluation::tableIndex(rule, WHITE));
             }
-        }
+        };
 
-        if (auto score = t.get_table("score")) {
-            auto readScore = [](const cpptoml::table &t, int tableIdx) {
-                auto selfTable = t.get_table("self");
-                auto oppoTable = t.get_table("oppo");
-                readValueModel<Score, -8192, 8191>(selfTable ? *selfTable : t,
-                                                   [tableIdx](PatternCode pcode, Score score) {
+        if (auto eval = t.get_table("eval"))
+            readInlineTables(eval, [](const cpptoml::table &table, int tableIdx) {
+                readValueModel<Eval, -16384, 16383>(table,
+                                                    [tableIdx](PatternCode pcode, Eval value) {
+                                                        Evaluation::EVALS[tableIdx][pcode] = value;
+                                                    });
+            });
+
+        if (auto score = t.get_table("score"))
+            readInlineTables(score, [](const cpptoml::table &table, int tableIdx) {
+                auto selfTable = table.get_table("self");
+                auto oppoTable = table.get_table("oppo");
+                readValueModel<Score, -8192, 8191>(selfTable ? *selfTable : table,
+                                                   [tableIdx](PatternCode pcode, Score value) {
                                                        Evaluation::P4SCORES[tableIdx][pcode][0] =
-                                                           score;
+                                                           value;
                                                    });
-                readValueModel<Score, -8192, 8191>(oppoTable ? *oppoTable : t,
-                                                   [tableIdx](PatternCode pcode, Score score) {
+                readValueModel<Score, -8192, 8191>(oppoTable ? *oppoTable : table,
+                                                   [tableIdx](PatternCode pcode, Score value) {
                                                        Evaluation::P4SCORES[tableIdx][pcode][1] =
-                                                           score;
+                                                           value;
                                                    });
-            };
-            for (Rule r : Rules) {
-                bool hasAsymmetryRenjuScore = false;
-                auto ruleScore              = score->get_table(RuleName[r]);
-                if (!ruleScore)  // fallback
-                    ruleScore = score;
-                else if (r == RENJU) {
-                    auto blackScore = ruleScore->get_table("black");
-                    auto whiteScore = ruleScore->get_table("white");
-                    auto fallbackScore =
-                        ruleScore->get_as<int64_t>("model_type") ? ruleScore : score;
-                    if (hasAsymmetryRenjuScore = blackScore || whiteScore; hasAsymmetryRenjuScore) {
-                        readScore(*(blackScore ? blackScore : fallbackScore), r + BLACK);
-                        readScore(*(whiteScore ? whiteScore : fallbackScore), r + WHITE);
-                    }
-                }
-
-                if (!hasAsymmetryRenjuScore) {
-                    if (r == RENJU) {
-                        readScore(*ruleScore, r + BLACK);
-                        readScore(*ruleScore, r + WHITE);
-                    }
-                    else {
-                        readScore(*ruleScore, r);
-                    }
-                }
-            }
-        }
+            });
     }
 
     // Read scalingFactor
@@ -584,18 +515,12 @@ void Config::readModel(const cpptoml::table &t, PendingConfig &pending)
     };
     readReadoutKnots("value_readout_knots", FREESTYLE);
     readReadoutKnots("value_readout_knots_standard", STANDARD);
-    readReadoutKnots("value_readout_knots_renju", Evaluation::tableIndex(RENJU, BLACK));
-    readReadoutKnots("value_readout_knots_renju", Evaluation::tableIndex(RENJU, WHITE));
     readReadoutKnots("value_readout_knots_renju_black", Evaluation::tableIndex(RENJU, BLACK));
     readReadoutKnots("value_readout_knots_renju_white", Evaluation::tableIndex(RENJU, WHITE));
 
-    bool anyReadoutActive = std::any_of(pending.valueReadouts.begin(),
-                                        pending.valueReadouts.end(),
-                                        [](const auto &readout) { return readout.knotsActive; });
-    if (anyReadoutActive && (!std::isfinite(runtimeScalingFactor) || runtimeScalingFactor <= 0.0f))
-        throw std::runtime_error(
-            "classical value readout requires a finite positive scaling_factor");
-    Evaluation::ScalingFactor = runtimeScalingFactor;
+    if (!std::isfinite(runtimeScalingFactor) || runtimeScalingFactor <= 0.0f)
+        throw std::runtime_error("classical model requires a finite positive scaling_factor");
+    Evaluation::setScalingFactor(runtimeScalingFactor);
 
     // Read evaluator
     if (auto evaluator = t.get_table("evaluator"))
@@ -897,22 +822,9 @@ bool Config::loadModel(std::istream &inStream)
     if (!*in)
         return false;
 
-    auto publishBaseTables = [&]() {
-        Evaluation::ScalingFactor = static_cast<float>(scalingFactorF64);
-        std::memcpy(Evaluation::EVALS, evals, sizeof(Evaluation::EVALS));
-        std::memcpy(Evaluation::EVALS_THREAT, evalsThreat, sizeof(Evaluation::EVALS_THREAT));
-        std::memcpy(Evaluation::P4SCORES, scores, sizeof(Evaluation::P4SCORES));
-    };
-
-    // Files produced before the context-policy extension end after the score
-    // tables. They remain valid and use the engine's compiled blend rows.
-    if (in->peek() == std::ios::traits_type::eof()) {
-        if (in->bad())
-            return false;
-        publishBaseTables();
-        Evaluation::resetPolicyCross();
-        return true;
-    }
+    const float scalingFactor = static_cast<float>(scalingFactorF64);
+    if (!std::isfinite(scalingFactor) || scalingFactor <= 0.0f)
+        return false;
 
     std::array<char, ClassicalModelExtensionMagic.size()> magic;
     uint32_t version, payloadBytes, tableCount, contextCount, componentCount, patternCount;
@@ -923,38 +835,26 @@ bool Config::loadModel(std::istream &inStream)
     in->read(reinterpret_cast<char *>(&contextCount), sizeof(contextCount));
     in->read(reinterpret_cast<char *>(&componentCount), sizeof(componentCount));
     in->read(reinterpret_cast<char *>(&patternCount), sizeof(patternCount));
-    const bool legacyExtension = version == ClassicalModelCompactP3LegacyVersion
-                                 && tableCount == LegacyModelPolicyTableCount
-                                 && payloadBytes == PolicyCrossTableBytes;
-    const bool currentExtension = version == ClassicalModelCompactP3Version
-                                  && tableCount == ModelPolicyTableCount
-                                  && payloadBytes == ClassicalModelCompactP3PayloadBytes;
-    if (!*in || magic != ClassicalModelExtensionMagic || !(legacyExtension || currentExtension)
+    if (!*in || magic != ClassicalModelExtensionMagic || version != ClassicalModelCompactP3Version
+        || tableCount != ModelPolicyTableCount
+        || payloadBytes != ClassicalModelCompactP3PayloadBytes
         || contextCount != ModelPolicyContextCount || patternCount != PolicyCrossPatternCount
         || componentCount != ModelBlendComponentCount)
         return false;
 
-    StoredPolicyCrossTables policyCross {};
-    if (legacyExtension)
-        in->read(reinterpret_cast<char *>(policyCross[FREESTYLE]), sizeof(StoredPolicyCross));
-    else
-        in->read(reinterpret_cast<char *>(policyCross), sizeof(policyCross));
+    StoredPolicyCrossTables policyCross;
+    in->read(reinterpret_cast<char *>(policyCross.data()), sizeof(policyCross));
     if (!*in)
         return false;
 
     if (in->peek() != std::ios::traits_type::eof() || in->bad())
         return false;
-    publishBaseTables();
-    Evaluation::resetPolicyCross();
+    std::memcpy(Evaluation::EVALS, evals, sizeof(Evaluation::EVALS));
+    std::memcpy(Evaluation::EVALS_THREAT, evalsThreat, sizeof(Evaluation::EVALS_THREAT));
+    std::memcpy(Evaluation::P4SCORES, scores, sizeof(Evaluation::P4SCORES));
+    Evaluation::setScalingFactor(scalingFactor);
     for (size_t table = 0; table < ModelPolicyTableCount; table++)
-        for (size_t context = 0; context < ModelPolicyContextCount; context++)
-            for (size_t self = 0; self < PolicyCrossPatternCount; self++)
-                for (size_t opponent = 0; opponent < PolicyCrossPatternCount; opponent++)
-                    Evaluation::POLICY_CROSS[table][context]
-                                            [Evaluation::policyPatternFromStorageIndex(self)]
-                                            [Evaluation::policyPatternFromStorageIndex(opponent)] =
-                                                policyCross[table][context][self][opponent];
-    Evaluation::activatePolicyCross();
+        Evaluation::installPolicyCross(table, policyCross[table]);
     return true;
 }
 
@@ -981,10 +881,6 @@ void Config::exportModel(std::ostream &outStream)
         out->write(reinterpret_cast<char *>(scores), sizeof(scores));
     }
 
-    bool writePolicyCross =
-        Evaluation::isPolicyCrossPresent() || !Evaluation::hasDefaultPolicyCross();
-    if (!writePolicyCross)
-        return;
     out->write(ClassicalModelExtensionMagic.data(), ClassicalModelExtensionMagic.size());
     uint32_t version        = ClassicalModelCompactP3Version;
     uint32_t payloadBytes   = ClassicalModelCompactP3PayloadBytes;
@@ -1001,13 +897,6 @@ void Config::exportModel(std::ostream &outStream)
 
     StoredPolicyCrossTables policyCross;
     for (size_t table = 0; table < ModelPolicyTableCount; table++)
-        for (size_t context = 0; context < ModelPolicyContextCount; context++)
-            for (size_t self = 0; self < PolicyCrossPatternCount; self++)
-                for (size_t opponent = 0; opponent < PolicyCrossPatternCount; opponent++)
-                    policyCross[table][context][self][opponent] =
-                        Evaluation::POLICY_CROSS[table][context]
-                                                [Evaluation::policyPatternFromStorageIndex(self)]
-                                                [Evaluation::policyPatternFromStorageIndex(
-                                                    opponent)];
-    out->write(reinterpret_cast<const char *>(policyCross), sizeof(policyCross));
+        policyCross[table] = Evaluation::storedPolicyCross(table);
+    out->write(reinterpret_cast<const char *>(policyCross.data()), sizeof(policyCross));
 }

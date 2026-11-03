@@ -29,13 +29,10 @@
 /// @param ply The current search ply, used to encode mate distance into the returned value.
 /// @param beta Current beta value (alpha-beta only). Lets Renju skip the deeper, more expensive
 ///     mate types unless detecting one could still raise beta.
-/// @param vcfOnly Only report wins made of fours (VCN VC4 attacker). Skips the double-three rule:
-///     a double three is not a VCF, and the VCN defender may answer it with a pass.
 /// @return VALUE_ZERO when nothing conclusive is found. Otherwise a mate score (>= VALUE_MATE or
 ///     <= -VALUE_MATE) whose magnitude encodes the number of plies to the end of the game.
 template <Rule R>
-inline Value
-quickWinCheck(const Board &board, int ply, Value beta = VALUE_INFINITE, bool vcfOnly = false)
+inline Value quickWinCheck(const Board &board, int ply, Value beta = VALUE_INFINITE)
 {
     Color self = board.sideToMove(), oppo = ~self;
 
@@ -103,8 +100,8 @@ quickWinCheck(const Board &board, int ply, Value beta = VALUE_INFINITE, bool vcf
 
     check_flex3_2x:
         // F_FLEX3_2X winning type: a double flex three is unstoppable if the opponent has no
-        // block-four or flex-four reply to interrupt it first. Not a VCF, so not in vcfOnly mode.
-        if (!vcfOnly && board.p4Count(self, F_FLEX3_2X)) {
+        // block-four or flex-four reply to interrupt it first.
+        if (board.p4Count(self, F_FLEX3_2X)) {
             if (board.p4Count(oppo, B_FLEX4) + block4Count(oppo) == 0)
                 return mate_in(ply + 5);
         }

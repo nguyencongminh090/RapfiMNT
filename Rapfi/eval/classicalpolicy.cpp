@@ -26,41 +26,42 @@ namespace Evaluation {
 
 Score   POLICY_CROSS[RULE_NB + 1][PolicyContextCount][PATTERN4_NB][PATTERN4_NB];
 uint8_t POLICY_CROSS_ACTIVE_MASK[RULE_NB + 1] = {};
-bool    POLICY_CROSS_PRESENT                  = false;
 
 void resetPolicyCross()
 {
     std::memset(POLICY_CROSS, 0, sizeof(POLICY_CROSS));
     std::memset(POLICY_CROSS_ACTIVE_MASK, 0, sizeof(POLICY_CROSS_ACTIVE_MASK));
-    POLICY_CROSS_PRESENT = false;
 }
 
-void activatePolicyCross()
+void installPolicyCross(size_t table, const StoredPolicyCrossTable &values)
 {
-    POLICY_CROSS_PRESENT = true;
-    refreshPolicyCrossActivation();
+    assert(table < RULE_NB + 1);
+    std::memset(POLICY_CROSS[table], 0, sizeof(POLICY_CROSS[table]));
+    uint8_t activeMask = 0;
+    size_t  index      = 0;
+    for (size_t context = 0; context < PolicyStoredContextCount; context++)
+        for (size_t self = 0; self < PolicyStoredPatternCount; self++)
+            for (size_t opponent = 0; opponent < PolicyStoredPatternCount; opponent++) {
+                const Score score = values[index++];
+                POLICY_CROSS[table][context][policyPatternFromStorageIndex(self)]
+                            [policyPatternFromStorageIndex(opponent)] = score;
+                if (score != 0)
+                    activeMask |= uint8_t(1U << context);
+            }
+    POLICY_CROSS_ACTIVE_MASK[table] = activeMask;
 }
 
-void refreshPolicyCrossActivation()
+StoredPolicyCrossTable storedPolicyCross(size_t table)
 {
-    std::memset(POLICY_CROSS_ACTIVE_MASK, 0, sizeof(POLICY_CROSS_ACTIVE_MASK));
-    for (size_t table = 0; table < RULE_NB + 1; table++)
-        for (size_t context = 0; context < PolicyStoredContextCount; context++)
-            for (const auto &row : POLICY_CROSS[table][context])
-                for (Score score : row)
-                    if (score != 0)
-                        POLICY_CROSS_ACTIVE_MASK[table] |= uint8_t(1U << context);
-}
-
-bool hasDefaultPolicyCross()
-{
-    for (const auto &table : POLICY_CROSS)
-        for (const auto &context : table)
-            for (const auto &row : context)
-                for (Score score : row)
-                    if (score != 0)
-                        return false;
-    return true;
+    assert(table < RULE_NB + 1);
+    StoredPolicyCrossTable values;
+    size_t                 index = 0;
+    for (size_t context = 0; context < PolicyStoredContextCount; context++)
+        for (size_t self = 0; self < PolicyStoredPatternCount; self++)
+            for (size_t opponent = 0; opponent < PolicyStoredPatternCount; opponent++)
+                values[index++] = POLICY_CROSS[table][context][policyPatternFromStorageIndex(self)]
+                                              [policyPatternFromStorageIndex(opponent)];
+    return values;
 }
 
 PolicyContext classifyPolicyContext(const Board &board)
@@ -88,26 +89,9 @@ PolicyContext classifyPolicyContext(const Board &board)
     return QUIET;
 }
 
-int classicalPolicyBaseScore(Rule rule, Color self, PatternCode pcodeBlack, PatternCode pcodeWhite)
-{
-    Color         opponent               = ~self;
-    MoveScorePair patternScores[SIDE_NB] = {
-        getMoveScorePair(rule, BLACK, pcodeBlack),
-        getMoveScorePair(rule, WHITE, pcodeWhite),
-    };
-    const Score selfAttack      = patternScores[self].byOwner;
-    const Score selfDefense     = patternScores[opponent].byOpponent;
-    const Score opponentAttack  = patternScores[opponent].byOwner;
-    const Score opponentDefense = patternScores[self].byOpponent;
-    const int  *weights         = classicalPolicyBlendWeights(rule, self);
-    return composeClassicalPolicyScore(
-        weights, selfAttack, selfDefense, opponentAttack, opponentDefense);
-}
-
 ClassicalPolicyScorer::ClassicalPolicyScorer(Rule rule, const Board &board)
     : rule_(rule)
     , self_(board.sideToMove())
-    , opponent_(~self_)
     , blendWeights_(classicalPolicyBlendWeights(rule, self_))
     , context_(QUIET)
     , policyCrossActive_(false)
@@ -117,15 +101,6 @@ ClassicalPolicyScorer::ClassicalPolicyScorer(Rule rule, const Board &board)
         context_           = classifyPolicyContext(board);
         policyCrossActive_ = policyCrossMask & uint8_t(1U << context_);
     }
-}
-
-Score ClassicalPolicyScorer::score(const Board &board, Pos pos) const
-{
-    const auto [pcodeBlack, pcodeWhite] = board.pcodePair(pos);
-    return score(pcodeBlack,
-                 pcodeWhite,
-                 board.pattern4(pos, self_),
-                 board.pattern4(pos, opponent_));
 }
 
 }  // namespace Evaluation

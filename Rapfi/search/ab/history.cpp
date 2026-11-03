@@ -30,13 +30,13 @@ namespace {
 /// History and stats update bonus, based on depth
 constexpr int statBonus(Rule rule, Depth d)
 {
-    constexpr int StatBonusQuadratic[RULE_NB] = {25, 25, 25};
-    return std::min(static_cast<int>(StatBonusQuadratic[rule] * d * d + 105 * d - 157), 8927);
+    constexpr int StatBonusQuadratic[RULE_NB] = {29, 24, 23};
+    return std::min(static_cast<int>(StatBonusQuadratic[rule] * d * d + 99 * d - 164), 8927);
 }
 
-constexpr int MainHistoryAttackWeight[RULE_NB + 1] = {510, 512, 512, 512};
-constexpr int MainHistoryQuietWeight[RULE_NB + 1]  = {257, 256, 256, 256};
-constexpr int CounterMoveBonus[RULE_NB + 1]        = {21, 21, 21, 21};
+constexpr int MainHistoryAttackWeight[RULE_NB + 1] = {492, 531, 511, 520};
+constexpr int MainHistoryQuietWeight[RULE_NB + 1]  = {265, 270, 270, 268};
+constexpr int CounterMoveBonus[RULE_NB + 1]        = {38, 33, 31, 33};
 
 constexpr int historyTableIndex(Rule rule, Color sideToMove)
 {
@@ -64,8 +64,7 @@ MoveHistoryScoring makeMoveHistoryScoring(Rule                      rule,
 
 void HistoryTracker::addSearchedMove(Pos move, Pos currentBestMove)
 {
-    // A pass (VCN defender) has no cell to index the history tables with
-    if (move == currentBestMove || move == Pos::PASS)
+    if (move == currentBestMove)
         return;
 
     Color self = board.sideToMove(), oppo = ~self;
@@ -79,10 +78,6 @@ void HistoryTracker::addSearchedMove(Pos move, Pos currentBestMove)
 
 void HistoryTracker::updateBestmoveStats(Depth depth, Pos bestMove, Value bestValue)
 {
-    // A pass (VCN defender) has no cell to index the history tables with
-    if (bestMove == Pos::PASS)
-        return;
-
     Color    self = board.sideToMove(), oppo = ~self;
     bool     oppo5  = board.p4Count(oppo, A_FIVE);
     bool     oppo4  = oppo5 || board.p4Count(oppo, B_FLEX4);
@@ -114,7 +109,9 @@ void HistoryTracker::updateBestmoveStats(Depth depth, Pos bestMove, Value bestVa
 
 void HistoryTracker::updateTTMoveStats(Depth depth, Pos ttMove, Value ttValue, Value beta)
 {
-    // Validate ttMove first. A pass (VCN defender) has no cell to index the history tables with.
+    // Validate ttMove first. A TT probe can decode Pos::PASS from an aliased
+    // empty entry; isLegal accepts PASS as passable, but it addresses no
+    // board cell and has no history slot.
     if (ttMove == Pos::PASS || !board.isLegal(ttMove))
         return;
 

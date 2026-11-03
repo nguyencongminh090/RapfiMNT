@@ -24,7 +24,6 @@ namespace Tuning::detail {
 
 struct MoveScoreLossSettings
 {
-    Float gamma;
     Float logitFactor;
 };
 

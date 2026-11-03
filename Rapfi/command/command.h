@@ -29,8 +29,6 @@ namespace Command {
 namespace CommandLine {
     /// Path to the binary executable directory.
     extern std::filesystem::path binaryDirectory;
-    /// Absolute path to the running executable.
-    extern std::filesystem::path executablePath;
 
     /// Initialize the command line module with the startup arguments.
     void init(int argc, char *argv[]);
@@ -55,9 +53,6 @@ extern bool allowInternalConfig;
 ///    try to load from the internal config string. Internal config is stored in
 ///    the executable when the program is built with it.
 bool loadConfig();
-
-/// Returns the resolved external config path, or an empty path for the internal config.
-std::filesystem::path getConfigFullPath();
 
 /// getModelFullPath() trys to resolve the correct path for the model file.
 /// Model file is determined by this order:

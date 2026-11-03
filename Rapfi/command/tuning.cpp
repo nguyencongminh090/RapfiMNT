@@ -68,18 +68,6 @@ int parsePolicyTable(const std::string &table)
     throw std::invalid_argument("unknown compact policy table " + table);
 }
 
-LossType parseLossType(std::string lossType)
-{
-    if (lossType == "L1")
-        return LossType::L1;
-    else if (lossType == "L2")
-        return LossType::L2;
-    else if (lossType == "BCE")
-        return LossType::BCE;
-    else
-        throw std::invalid_argument("unknown loss type " + lossType);
-}
-
 const char *formatLearningRateSchedule(LearningRateSchedule schedule)
 {
     switch (schedule) {
@@ -142,18 +130,18 @@ void validateConfig(size_t epochs, const TuningConfig &cfg, bool tuneCompactPoli
         throw std::invalid_argument("memory-limit-mb must be 0 or at least 32");
     if (cfg.shardSizeMB < 1 || cfg.shardSizeMB > std::numeric_limits<size_t>::max() / MiB)
         throw std::invalid_argument("shard-size-mb must be at least 1 and fit size_t");
-    if (!std::isfinite(cfg.learningRate) || cfg.learningRate <= 0)
-        throw std::invalid_argument("learning-rate must be finite and greater than 0");
-    if (cfg.learningRateSchedule != LearningRateSchedule::Constant
-        && (!std::isfinite(cfg.finalLearningRate) || cfg.finalLearningRate <= 0
-            || cfg.finalLearningRate > cfg.learningRate))
-        throw std::invalid_argument(
-            "final-learning-rate must be finite, greater than 0, and not greater than "
-            "learning-rate for a decaying schedule");
-    if (!std::isfinite(cfg.weightDecay) || cfg.weightDecay < 0)
-        throw std::invalid_argument("weight-decay must be finite and not less than 0");
-    if (!std::isfinite(cfg.moveScoreLossGamma) || cfg.moveScoreLossGamma < 0)
-        throw std::invalid_argument("move-score-loss-gamma must be not less than 0");
+    if (cfg.tuneEval || cfg.tuneMoveScore) {
+        if (!std::isfinite(cfg.learningRate) || cfg.learningRate <= 0)
+            throw std::invalid_argument("learning-rate must be finite and greater than 0");
+        if (cfg.learningRateSchedule != LearningRateSchedule::Constant
+            && (!std::isfinite(cfg.finalLearningRate) || cfg.finalLearningRate <= 0
+                || cfg.finalLearningRate > cfg.learningRate))
+            throw std::invalid_argument(
+                "final-learning-rate must be finite, greater than 0, and not greater than "
+                "learning-rate for a decaying schedule");
+        if (!std::isfinite(cfg.weightDecay) || cfg.weightDecay < 0)
+            throw std::invalid_argument("weight-decay must be finite and not less than 0");
+    }
     if (!std::isfinite(cfg.multiPVPolicyTemperature) || cfg.multiPVPolicyTemperature < 0)
         throw std::invalid_argument(
             "multipv-policy-temperature must be finite and not less than 0");
@@ -163,8 +151,6 @@ void validateConfig(size_t epochs, const TuningConfig &cfg, bool tuneCompactPoli
         throw std::invalid_argument("multipv-policy-temperature does not fit float storage");
     if (cfg.multiPVPolicyTemperature > 0 && !cfg.tuneMoveScore)
         throw std::invalid_argument("multipv-policy-temperature requires --tune-move-score");
-    if (cfg.multiPVPolicyTemperature > 0 && cfg.moveScoreLossGamma != 0)
-        throw std::invalid_argument("multipv-policy-temperature requires move-score-loss-gamma=0");
     if (!std::isfinite(cfg.multiPVPolicyEvalScale) || cfg.multiPVPolicyEvalScale < 0)
         throw std::invalid_argument("multipv-policy-eval-scale must be finite and not less than 0");
     if (cfg.multiPVPolicyEvalScale > 0
@@ -204,7 +190,7 @@ void validateConfig(size_t epochs, const TuningConfig &cfg, bool tuneCompactPoli
         throw std::invalid_argument("board-size range must be inside the engine board limits");
     if (cfg.boardSizeMin > cfg.boardSizeMax)
         throw std::invalid_argument("max-boardsize must be greater than min-boardsize");
-    if (!cfg.usePreviousScalingFactor) {
+    if (cfg.tuneEval && !cfg.usePreviousScalingFactor) {
         if (cfg.nIterations < 1 || cfg.nStepsPerIteration < 1)
             throw std::invalid_argument(
                 "num-iteration and num-steps-per-iteration must be greater than 0");
@@ -309,8 +295,6 @@ struct CurriculumPhaseInput
     double                             weightDecay;
     LearningRateSchedule               learningRateSchedule;
     size_t                             recomputeInterval;
-    bool                               localLearningRateSchedule;
-    bool                               localRecomputeSchedule;
     bool                               projectMoveScoreAtEnd;
     bool                               coalesceMoveScoreAtEnd;
     BoardSizeWeighting                 boardSizeWeighting;
@@ -477,10 +461,6 @@ std::vector<CurriculumPhaseInput> parseCurriculum(const std::filesystem::path &m
             throw std::invalid_argument(
                 "tuning curriculum phase recompute_interval must be nonnegative and fit size_t");
         phase.recomputeInterval         = static_cast<size_t>(recomputeInterval);
-        phase.localLearningRateSchedule = table->contains("learning_rate")
-                                          || table->contains("learning_rate_schedule")
-                                          || table->contains("final_learning_rate");
-        phase.localRecomputeSchedule = table->contains("recompute_interval");
         phase.projectMoveScoreAtEnd =
             getOptionalPhaseValue<bool>(*table, "project_move_score_at_end").value_or(false);
         phase.coalesceMoveScoreAtEnd =
@@ -585,7 +565,7 @@ int Command::tuning(int argc, char *argv[])
          "Target size of each prepared shard in MiB",
          cxxopts::value<size_t>()->default_value(std::to_string(cfg.shardSizeMB)))  //
         ("l,learning-rate",
-         "Learning rate for gradient descent",
+         "Learning rate for value/base-policy Adam",
          cxxopts::value<double>()->default_value(std::to_string(cfg.learningRate)))  //
         ("learning-rate-schedule",
          "Learning-rate schedule (one of [constant, exponential])",
@@ -594,20 +574,14 @@ int Command::tuning(int argc, char *argv[])
          "Final learning rate for exponential decay",
          cxxopts::value<double>()->default_value(std::to_string(cfg.finalLearningRate)))  //
         ("w,weight-decay",
-         "Weight decay for gradient descent (0.0~1.0)",
+         "Weight decay for value/base-policy Adam (0.0~1.0)",
          cxxopts::value<double>()->default_value(std::to_string(cfg.weightDecay)))  //
-        ("L,loss",
-         "Loss type (one of [L1, L2, BCE])",
-         cxxopts::value<std::string>()->default_value("BCE"))  //
         ("r,rules-to-tune",
          "Params of which rules [freestyle, standard, renju] that need to be tuned",
          cxxopts::value<std::vector<std::string>>()->default_value("freestyle,standard,renju"))  //
         ("s,shuffle", "Shuffle training datasets")                                               //
         ("m,tune-move-score", "Enable tuning of move scores")                                    //
         ("no-tune-eval", "Disable tuning of evaluation")                                         //
-        ("move-score-loss-gamma",
-         "Gamma value (>= 0) of move score focal loss",
-         cxxopts::value<double>()->default_value(std::to_string(cfg.moveScoreLossGamma)))  //
         ("multipv-policy-temperature",
          "Softmax temperature over Multi-PV win rates (0 uses the best move only)",
          cxxopts::value<double>()->default_value(std::to_string(cfg.multiPVPolicyTemperature)))  //
@@ -750,11 +724,9 @@ int Command::tuning(int argc, char *argv[])
                 parseLearningRateSchedule(args["learning-rate-schedule"].as<std::string>());
             cfg.finalLearningRate = args["final-learning-rate"].as<double>();
             cfg.weightDecay      = args["weight-decay"].as<double>();
-            cfg.lossType                   = parseLossType(args["loss"].as<std::string>());
             cfg.shuffleTuneEntries         = args.count("shuffle");
             cfg.tuneMoveScore              = args.count("tune-move-score");
             cfg.tuneEval                   = !args.count("no-tune-eval");
-            cfg.moveScoreLossGamma         = args["move-score-loss-gamma"].as<double>();
             cfg.multiPVPolicyTemperature   = args["multipv-policy-temperature"].as<double>();
             cfg.multiPVPolicyEvalScale     = args["multipv-policy-eval-scale"].as<double>();
             cfg.moveScoreScale               = args["move-score-scale"].as<double>();
@@ -886,8 +858,6 @@ int Command::tuning(int argc, char *argv[])
                 phase.weightDecay               = input.weightDecay;
                 phase.learningRateSchedule      = input.learningRateSchedule;
                 phase.recomputeInterval         = input.recomputeInterval;
-                phase.localLearningRateSchedule = input.localLearningRateSchedule;
-                phase.localRecomputeSchedule    = input.localRecomputeSchedule;
                 phase.projectMoveScoreAtEnd     = input.projectMoveScoreAtEnd;
                 phase.coalesceMoveScoreAtEnd    = input.coalesceMoveScoreAtEnd;
                 phase.boardSizeWeighting        = input.boardSizeWeighting;
@@ -936,12 +906,12 @@ int Command::tuning(int argc, char *argv[])
             statFile << "Phase, PhaseEpoch, PhaseName, ";
             boardStatFile << "Phase, PhaseEpoch, PhaseName, ";
         }
-        statFile
-            << "Epoch, LearningRate, ValueLoss, PolicyLoss, ValueValLoss, "
+        statFile << "Epoch, LearningRate, ValueLoss, PolicyLoss, ValueValLoss, "
                "PolicyValLoss, Elapsed, Epochs/Sec, Timestamp\n";
         boardStatFile << "Epoch, BoardSize, Samples, ValueValLoss, PolicyValLoss, Timestamp\n";
-        // Run tuner
-        auto recordStatistic = [&](TuningStatistic stat) {
+        // Compact Adam has its own settings; generic optimizer statistics describe
+        // the floating value/base-policy parameters before quantization and export.
+        auto advanceCompactPolicy = [&](const TuningStatistic &stat) {
             if (!curriculumPhases.empty() && stat.currentPhase != compactPolicyPhase) {
                 compactPolicyPhase     = stat.currentPhase;
                 compactPolicyBaseReady = false;
@@ -961,6 +931,8 @@ int Command::tuning(int argc, char *argv[])
             }
             else
                 compactPolicyBaseReady = false;
+        };
+        auto recordStatistics = [&](const TuningStatistic &stat) {
             // Log statistics for current epoch
             totalElapsedSeconds += stat.elapsedSeconds;
             if (!curriculumPhases.empty())
@@ -992,6 +964,8 @@ int Command::tuning(int argc, char *argv[])
             }
             if (!boardStatFile)
                 throw std::runtime_error("failed to write per-board tuning statistics");
+        };
+        auto exportCheckpoint = [&](const TuningStatistic &stat) {
             // Export model periodically
             if (modelExportInterval && stat.currentEpoch > 0
                     && stat.currentEpoch % modelExportInterval == 0
@@ -1001,9 +975,9 @@ int Command::tuning(int argc, char *argv[])
                 if (epochStr.length() < EpochDigits)
                     epochStr = std::string(EpochDigits - epochStr.length(), '0') + epochStr;
 
-                // Save params and scaling factor to config
-                tuner->saveParams();
-                Evaluation::ScalingFactor = stat.scalingFactor;
+                // Install quantized tables and scale before serializing the current model
+                tuner->installParams();
+                Evaluation::setScalingFactor(stat.scalingFactor);
 
                 // Export model file
                 std::string                 modelFileName = trainName + "-e" + epochStr + ".bin";
@@ -1030,10 +1004,15 @@ int Command::tuning(int argc, char *argv[])
                 MESSAGEL("Model saved to " << modelFileName);
             }
         };
+        auto onEpochCompleted = [&](TuningStatistic stat) {
+            advanceCompactPolicy(stat);
+            recordStatistics(stat);
+            exportCheckpoint(stat);
+        };
         if (curriculumPhases.empty())
-            tuner->run(epochs, recordStatistic);
+            tuner->run(epochs, onEpochCompleted);
         else
-            tuner->runCurriculum(recordStatistic);
+            tuner->runCurriculum(onEpochCompleted);
 
         std::ofstream boardSampleFile(outpath / "board-samples.csv");
         if (!boardSampleFile)
