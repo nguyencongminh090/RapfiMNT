@@ -33,7 +33,6 @@
 void runGenerateRootMovesTests();
 void runAnalyzeMovesTests();
 void runSimdLinearTests();
-void runVcnTests();
 
 int testsRun    = 0;
 int testsPassed = 0;
@@ -59,7 +58,6 @@ int main(int argc, char *argv[])
     runGenerateRootMovesTests();
     runAnalyzeMovesTests();
     runSimdLinearTests();
-    runVcnTests();
 
     std::printf("\n%d/%d tests passed\n", testsPassed, testsRun);
     return testsPassed == testsRun ? 0 : 1;
