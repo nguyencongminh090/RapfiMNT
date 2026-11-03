@@ -633,6 +633,7 @@ endif()
 
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} PREFIX "Sources" FILES ${CORE_SOURCES} ${MODULE_SOURCES})
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} PREFIX "Headers" FILES ${HEADERS})
+
 #==========================================================
 # Unit tests (YXANALZ slice and future core-engine tests)
 #
@@ -657,6 +658,7 @@ if(BUILD_TESTS AND NOT EMSCRIPTEN)
         tests/generateRootMoves_tests.cpp
         tests/analyzeMoves_tests.cpp
         tests/simd_linear_tests.cpp
+        tests/vcn_tests.cpp
     )
 
     add_executable(rapfi_tests ${TEST_ENGINE_SOURCES} ${TEST_DRIVER_SOURCES} ${HEADERS})

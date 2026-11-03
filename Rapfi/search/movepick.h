@@ -75,6 +75,7 @@ private:
         POLICY         = 0b001,
         MAIN_HISTORY   = 0b010,
         COUNTER_MOVE   = 0b100,
+        VCN_ATTACK     = 0b1000,  ///< threat-strength tiers first (VCN attacker)
     };
 
     template <PickType T, typename Pred>
@@ -101,6 +102,9 @@ private:
     Rule               rule;
     Pos                ttMove;
     bool               allowPlainB4InVCF;
+    bool               generatePassMove;  ///< VCN defender: offer Pos::PASS before board moves
+    bool               fullBoardVCF;      ///< VCN VC4 attacker: QVCF fours from the whole board
+    bool               vcnAttackOrder;    ///< VCN attacker: threat-strength ordering in MAIN
     bool               hasPolicy;
     bool               useNormalizedPolicy;
     // BUG: stored but not yet applied - scoreAllMoves() calls applySoftmax() at the
@@ -132,6 +136,11 @@ struct MovePicker::ExtraArgs<MovePicker::MAIN>
     MoveHistoryScoring historyScoring;
     bool               useNormalizedPolicy  = false;
     float              normalizedPolicyTemp = 1.0f;
+    /// Offer Pos::PASS as an early move for the VCN defender (never against a five).
+    bool generatePassMove = false;
+    /// Order moves by the strength of their own threat first (VCN attacker): fours, then threes,
+    /// then twos, then the rest. Only reorders; the move set is unchanged.
+    bool vcnAttackOrder = false;
 };
 
 template <>
@@ -140,6 +149,12 @@ struct MovePicker::ExtraArgs<MovePicker::QVCF>
     Pos      ttMove;
     Depth    depth;  // negative depth in qvcf search
     Pattern4 previousSelfP4[2];
+    /// Enumerate plain E_BLOCK4 moves regardless of depth/previous patterns (VCN VC4 attacker).
+    bool forceAllowB4InVCF = false;
+    /// Generate every four (plain block fours included) over the whole candidate area instead of
+    /// only around the side's last stone (VCN VC4 attacker, where the VCF is a proof step rather
+    /// than a quiescence).
+    bool fullBoardVCF = false;
 };
 
 }  // namespace Search
