@@ -310,6 +310,7 @@ set(HEADERS
     search/hashtable.h
     search/history.h
     search/movepick.h
+    search/movesort.h
     search/opening.h
     search/searchcommon.h
     search/searchconfig.h

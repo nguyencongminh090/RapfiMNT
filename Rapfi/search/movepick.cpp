@@ -18,6 +18,8 @@
 
 #include "movepick.h"
 
+#include "movesort.h"
+
 #include "../eval/classicalpolicy.h"
 #include "../eval/evaluator.h"
 #include "../eval/scoretables.h"
@@ -29,6 +31,9 @@
 #include <optional>
 #include <array>
 #include <limits>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 
 namespace {
 
@@ -70,36 +75,6 @@ ScoredMove *generateDefendB4F3Moves(Rule rule, const Board &board, ScoredMove *m
     }
 }
 
-/// Partial sort the move list up to the score limit. It dynamiclly decides
-/// which sorting algorithm to use based on how many moves are in the list.
-template <typename Comparator>
-void fastPartialSort(ScoredMove *begin, ScoredMove *end, Score limit, Comparator comp)
-{
-    // heuristic values
-    constexpr size_t InsertionSortLimit = MAX_MOVES / 4;
-    constexpr size_t SortLimit          = MAX_MOVES * 2 / 3;
-
-    size_t nMoves = end - begin;
-    if (nMoves <= InsertionSortLimit) {
-        // Sorts moves in descending order up to and including a given limit.
-        // The order of moves smaller than the limit is left unspecified.
-        for (ScoredMove *sortedEnd = begin, *p = begin + 1; p < end; ++p)
-            if (p->score >= limit) {
-                ScoredMove tmp = *p, *q;
-                *p             = *++sortedEnd;
-                for (q = sortedEnd; q != begin && comp(tmp, *(q - 1)); --q)
-                    *q = *(q - 1);
-                *q = tmp;
-            }
-    }
-    else if (nMoves <= SortLimit) {
-        std::sort(begin, end, comp);
-    }
-    else {
-        std::partial_sort(begin, begin + SortLimit, end, comp);
-    }
-}
-
 /// Make the first current move to have policy = 1.0f and the rest to have policy = 0.0f.
 void markFirstMoveOneHot(ScoredMove *curMove, ScoredMove *endMove)
 {
@@ -111,6 +86,62 @@ void markFirstMoveOneHot(ScoredMove *curMove, ScoredMove *endMove)
 }  // namespace
 
 namespace Search {
+
+/// LSD radix sort under ScoreComparator (PERF-01). Each move is packed into a 64-bit key:
+/// [63:48] = 32767 - score (ascending key = descending score), [47:32] = pos ^ 0x8000 (ascending
+/// key = ascending signed pos), [31:0] = the rawScore/policy union bits, carried but not sorted
+/// on. Up to four stable 8-bit passes over bits 32..63; a pass whose digit is the same for every
+/// key is skipped. Unlike introsort it has almost no data-dependent branches.
+NO_INLINE void radixSortByScore(ScoredMove *begin, size_t n)
+{
+    static_assert(sizeof(ScoredMove) == 8, "radix key packs a whole ScoredMove into 64 bits");
+    static_assert(offsetof(ScoredMove, rawScore) == 4 && offsetof(ScoredMove, policy) == 4,
+                  "radix key assumes the rawScore/policy union sits at byte offset 4");
+    static_assert(MAX_MOVES <= UINT16_MAX, "histogram counters are 16-bit");
+    assert(n <= MAX_MOVES);
+    if (n <= 1)
+        return;
+
+    uint64_t keys[MAX_MOVES], tmp[MAX_MOVES];
+    uint16_t hist[4][256] = {};
+
+    for (size_t i = 0; i < n; i++) {
+        uint32_t unionBits;
+        std::memcpy(&unionBits, reinterpret_cast<const char *>(&begin[i]) + 4, 4);
+        uint32_t hi = (uint32_t(uint16_t(32767 - int(begin[i].score))) << 16)
+                      | uint32_t(uint16_t(int16_t(begin[i].pos)) ^ 0x8000u);
+        keys[i] = (uint64_t(hi) << 32) | unionBits;
+        hist[0][hi & 255]++;
+        hist[1][(hi >> 8) & 255]++;
+        hist[2][(hi >> 16) & 255]++;
+        hist[3][(hi >> 24) & 255]++;
+    }
+
+    uint64_t *src = keys, *dst = tmp;
+    for (int pass = 0; pass < 4; pass++) {
+        const int shift = 32 + 8 * pass;
+        if (hist[pass][(src[0] >> shift) & 255] == n)
+            continue;  // every key shares this digit: the pass would be the identity
+
+        uint16_t offset[256], sum = 0;
+        for (int d = 0; d < 256; d++) {
+            offset[d] = sum;
+            sum += hist[pass][d];
+        }
+        for (size_t i = 0; i < n; i++)
+            dst[offset[(src[i] >> shift) & 255]++] = src[i];
+        std::swap(src, dst);
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        const uint64_t k         = src[i];
+        const uint32_t unionBits = uint32_t(k);
+        ScoredMove    &m         = begin[i];
+        m.pos   = Pos(int16_t(uint16_t(((k >> 32) & 0xFFFF) ^ 0x8000u)));
+        m.score = Score(32767 - int((k >> 48) & 0xFFFF));
+        std::memcpy(reinterpret_cast<char *>(&m) + 4, &unionBits, 4);
+    }
+}
 
 /// MovePicker constructor at the root node.
 /// Generate all legal moves for current side to move.
