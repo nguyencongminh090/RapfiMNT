@@ -698,6 +698,7 @@ if(BUILD_TESTS AND NOT EMSCRIPTEN)
         tests/analyzeMoves_tests.cpp
         tests/simd_linear_tests.cpp
         tests/vcn_tests.cpp
+        tests/movesort_tests.cpp
     )
 
     add_executable(rapfi_tests ${TEST_ENGINE_SOURCES} ${TEST_DRIVER_SOURCES} ${HEADERS})
