@@ -35,6 +35,21 @@ You can download a pre-built package of the Rapfi engine and the Yixinboard GUI 
 
 
 
+## About this fork
+
+This repository is a derivative of upstream [Rapfi](https://github.com/dhbloo/rapfi) (engine sources synced from upstream v0.44.1) supporting **Freestyle, Standard and Renju** rules on a rectangular board. On top of upstream it adds:
+
++ **VCN attack-search mode** (`INFO VCTHREAD`, `YXVCN`, VC2..VC4 search modes).
++ **`YXANALZ`**: analyze an explicit, user-supplied list of root candidate moves. See [`Rapfi/docs/rules/YXANALZ-user-root-candidates.md`](Rapfi/docs/rules/YXANALZ-user-root-candidates.md).
++ **VNNI signed-input affine layer** for NNUE evaluation (EVAL-01).
++ **Move-ordering speedups**: LSD radix sort in the middle branch and a branchless AVX-512 insertion branch of `fastPartialSort` (PERF-01/PERF-02), about +17% nodes per second on the built-in benchmark.
++ **PGO build support** via the `PGO_MODE` CMake option and `Rapfi/scripts/pgo_build.sh`.
++ **Unit tests** (`BUILD_TESTS`) covering root-move generation, move analysis, SIMD linear layers, VCN and move sorting.
+
+This fork has no WALL, Portal, torus or Caro rules. Contribution rules, risk classes and task tracking are described in [`Rapfi/CLAUDE.md`](Rapfi/CLAUDE.md) and [`Rapfi/docs/`](Rapfi/docs/README.md).
+
+
+
 ## Project Structure
 
 This repository contains the following files and several related subprojects:
@@ -43,6 +58,8 @@ This repository contains the following files and several related subprojects:
 + [Copying.txt](https://github.com/dhbloo/rapfi/blob/master/Copying.txt), a text file containing the GNU General Public License version 3.
 + [AUTHORS](https://github.com/dhbloo/rapfi/blob/master/AUTHORS), a text file with the list of authors for the Rapfi project.
 + [Rapfi](https://github.com/dhbloo/rapfi/tree/master/Rapfi), a subdirectory containing the full source code of the Rapfi Gomoku/Renju engine, including a CMakeList.txt that can be used to compile Rapfi with CMake.
++ [Rapfi/docs](Rapfi/docs/README.md), process, design and task-tracking documentation of this fork; [Rapfi/TODO.md](Rapfi/TODO.md) lists the task status.
++ [bao-cao-toi-uu-kernel-rapfi.md](bao-cao-toi-uu-kernel-rapfi.md), a (Vietnamese) kernel optimization report.
 + [Gomocalc](https://github.com/dhbloo/gomoku-calculator/tree/master), a subproject containing the source code of the web application [Gomoku Calculator](https://gomocalc.com).
 + [Trainer](https://github.com/dhbloo/pytorch-nnue-trainer/tree/master), a subproject containing the source code for the NNUE training code.
 + [Networks](https://github.com/dhbloo/rapfi-networks/tree/main), a submodule containing the latest network weights and config file to be used with the Rapfi engine.
@@ -95,6 +112,29 @@ cmake --build .
 ```
 
 It is recommended to use the Clang compiler, which is tested to provide the best speed across different compilers. When compiling for Windows, consider using one of **LLVM/Clang for Windows** / **Clang-CL for Visual Studio** / **MinGW-w64-Clang**, which compiles the engine binary with significantly higher speed than the builtin MSVC compiler in Visual Studio.
+
+### Profile-guided optimization (PGO)
+
+For the fastest binary on GCC or Clang, run the full PGO cycle (instrumented build, training on `BENCH`, rebuild with the profile and LTO) for one configure preset:
+
+```bash
+cd Rapfi
+scripts/pgo_build.sh x64-clang-AVX512VNNI    # output: build/x64-clang-AVX512VNNI-pgo-use/pbrain-rapfi
+```
+
+The profile is tied to the exact sources and compiler, so re-run it after any source change. The underlying CMake options are `PGO_MODE` (`OFF`, `GENERATE`, `USE`) and `PGO_PROFILE`.
+
+### Run the unit tests and benchmark
+
+```bash
+cd Rapfi
+cmake --preset x64-clang-Native -DBUILD_TESTS=ON
+cmake --build build/x64-clang-Native --target rapfi_tests
+ctest --test-dir build/x64-clang-Native      # or run ./rapfi_tests directly
+echo BENCH | build/x64-clang-Native/pbrain-rapfi
+```
+
+`BENCH` prints node count, hash and speed; the node count and hash must stay unchanged by any change that is not meant to alter search behaviour.
 
 ### Build for WebAssembly
 
