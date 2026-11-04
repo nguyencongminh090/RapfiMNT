@@ -20,4 +20,4 @@ the hard rules; this folder holds the detail.
 
 ## Current items
 
-Active: none. Done: PERF-01, BUILD-01, VCN-02, VCN, EVAL-01, YXANALZ. The authoritative list is [`../TODO.md`](../TODO.md).
+Active: none. Done: PERF-02, PERF-01, BUILD-01, VCN-02, VCN, EVAL-01, YXANALZ. The authoritative list is [`../TODO.md`](../TODO.md).

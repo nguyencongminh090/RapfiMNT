@@ -10,6 +10,7 @@ to a detail file under `docs/instruction/`. Read the matching entry here before 
 
 ## Done
 
+- [PERF-02 — Branch misses in the short-list (insertion) branch of `fastPartialSort`](docs/instruction/PERF-02-insertion-branch-sort.md)
 - [PERF-01 — Branch-miss reduction in move-list ordering](docs/instruction/PERF-01-movepick-branch-miss.md)
 - [BUILD-01 — Profile-guided optimization (PGO) build](docs/instruction/BUILD-01-pgo-build.md)
 - [VCN-02 — VCN tree search: attack-oriented search quality and real-world correctness](docs/instruction/VCN-02-attack-search-quality.md)
