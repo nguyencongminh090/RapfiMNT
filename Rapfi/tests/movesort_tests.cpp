@@ -21,6 +21,10 @@
 // order they had before the change. The fastPartialSort reference is a frozen copy of the
 // pre-PERF-01 code, because its insertion and partial_sort branches have implementation-defined
 // orders that are part of the search behaviour.
+//
+// PERF-02 tests (docs/todo/PERF-02-insertion-branch-sort.md): on AVX-512 builds the insertion
+// branch under ScoreComparator runs insertionBranchByScore, which must equal the frozen loop byte
+// for byte, including the order of the below-limit tail and of duplicate pos (stability).
 
 #include "testutil.h"
 
@@ -373,6 +377,226 @@ void fastPartialSort_middleBranchAllEqualScores_orderedByPos()
         assert(list[i].pos < list[i + 1].pos);
 }
 
+enum class InsertionScheme { NarrowTies, FullInt16, ExtremesOnly, AllNegative, NoneNegative };
+
+/// Random list for the insertion branch. Unlike randomScoredList, pos may repeat when
+/// `duplicatePos` is set (real DEFENDFOUR/DEFENDB4F3 lists do that), with random union bits.
+std::vector<ScoredMove>
+randomInsertionList(PRNG &prng, size_t n, InsertionScheme scheme, bool duplicatePos)
+{
+    std::vector<ScoredMove> list;
+    for (size_t i = 0; i < n; i++) {
+        int score = 0;
+        switch (scheme) {
+        case InsertionScheme::NarrowTies: score = int(prng() % 9) - 4; break;
+        case InsertionScheme::FullInt16: score = int(int16_t(uint16_t(prng()))); break;
+        case InsertionScheme::ExtremesOnly: {
+            const int v[] = {-32768, -1, 0, 32767};
+            score         = v[prng() % 4];
+            break;
+        }
+        case InsertionScheme::AllNegative: score = -1 - int(prng() % 32768); break;
+        case InsertionScheme::NoneNegative: score = int(prng() % 32768); break;
+        }
+        const int pos = duplicatePos ? int(prng() % 6) - 3 : int(int16_t(uint16_t(prng())));
+        list.push_back(makeMove(pos, score, uint32_t(prng())));
+    }
+    return list;
+}
+
+std::vector<ScoredMove> frozenInsertion(std::vector<ScoredMove> list, Score limit)
+{
+    assert(list.size() <= InsertionSortLimit);
+    frozenFastPartialSort(list.data(),
+                          list.data() + list.size(),
+                          limit,
+                          ScoredMove::ScoreComparator {});
+    return list;
+}
+
+constexpr size_t InsertionSizes[] = {0, 1, 2, 3, 8, 9, 15, 16, 17, 64, 120, 121};
+constexpr InsertionScheme AllInsertionSchemes[] = {InsertionScheme::NarrowTies,
+                                                   InsertionScheme::FullInt16,
+                                                   InsertionScheme::ExtremesOnly,
+                                                   InsertionScheme::AllNegative,
+                                                   InsertionScheme::NoneNegative};
+
+void fastPartialSort_insertionBranchDuplicatePos_matchesFrozenReference()
+{
+    for (InsertionScheme scheme : AllInsertionSchemes)
+        for (size_t n : InsertionSizes)
+            for (uint64_t seed = 1; seed <= 8; seed++) {
+                // Arrange
+                PRNG                    prng(seed * 31337 + n * 17 + size_t(scheme));
+                std::vector<ScoredMove> list     = randomInsertionList(prng, n, scheme, true);
+                std::vector<ScoredMove> expected = frozenInsertion(list, 0);
+
+                // Act
+                Search::fastPartialSort(list.data(),
+                                        list.data() + n,
+                                        0,
+                                        ScoredMove::ScoreComparator {});
+
+                // Assert
+                assert(sameBytes(list, expected));
+            }
+}
+
+// ---------------------------------------------------------------------------
+// insertionBranchByScore (PERF-02, AVX-512 builds only)
+// ---------------------------------------------------------------------------
+
+#ifdef USE_AVX512
+
+void insertionBranchByScore_randomLists_matchFrozenReference()
+{
+    for (bool dup : {false, true})
+        for (InsertionScheme scheme : AllInsertionSchemes)
+            for (size_t n : InsertionSizes)
+                for (uint64_t seed = 1; seed <= 16; seed++) {
+                    // Arrange
+                    PRNG prng(seed * 6007 + n * 101 + size_t(scheme) * 7 + size_t(dup));
+                    std::vector<ScoredMove> list     = randomInsertionList(prng, n, scheme, dup);
+                    std::vector<ScoredMove> expected = frozenInsertion(list, 0);
+
+                    // Act
+                    Search::insertionBranchByScore(list.data(), n, 0);
+
+                    // Assert
+                    assert(sameBytes(list, expected));
+                }
+}
+
+void insertionBranchByScore_nonZeroLimit_matchesFrozenReference()
+{
+    for (int limit : {-32768, -5, -1, 1, 3, 100, 32767})
+        for (InsertionScheme scheme : AllInsertionSchemes)
+            for (size_t n : InsertionSizes)
+                for (uint64_t seed = 1; seed <= 4; seed++) {
+                    // Arrange
+                    PRNG prng(seed * 7001 + n * 13 + size_t(scheme) + size_t(limit & 0xFFFF));
+                    std::vector<ScoredMove> list = randomInsertionList(prng, n, scheme, seed & 1);
+                    std::vector<ScoredMove> expected = frozenInsertion(list, Score(limit));
+
+                    // Act
+                    Search::insertionBranchByScore(list.data(), n, Score(limit));
+
+                    // Assert
+                    assert(sameBytes(list, expected));
+                }
+}
+
+void insertionBranchByScore_duplicatePos_stableByArrival()
+{
+    // Arrange: three moves share pos 5 and score 2 but carry different union bits; arrival order
+    // A, B, C must survive. A negative move between them exercises the partition too.
+    const std::vector<ScoredMove> input = {
+        makeMove(5, 2, 0xA), makeMove(9, -3, 0x1), makeMove(5, 2, 0xB),
+        makeMove(1, 2, 0x2), makeMove(5, 2, 0xC),
+    };
+    const std::vector<ScoredMove> expected = {
+        makeMove(1, 2, 0x2), makeMove(5, 2, 0xA), makeMove(5, 2, 0xB),
+        makeMove(5, 2, 0xC), makeMove(9, -3, 0x1),
+    };
+    std::vector<ScoredMove> list = input;
+
+    // Act
+    Search::insertionBranchByScore(list.data(), list.size(), 0);
+
+    // Assert
+    assert(sameBytes(list, expected));
+    assert(sameBytes(frozenInsertion(input, 0), expected));
+}
+
+void insertionBranchByScore_negativeFirstMove_keptLastInPrefix()
+{
+    // Arrange: begin[0] is negative, yet the loop never tests it, so it stays in the sorted
+    // prefix and sorts behind the non-negative moves (but ahead of the untested tail).
+    const std::vector<ScoredMove> input = {
+        makeMove(0, -10, 1), makeMove(1, 5, 2), makeMove(2, -1, 3), makeMove(3, 7, 4),
+    };
+    const std::vector<ScoredMove> expected = {
+        makeMove(3, 7, 4), makeMove(1, 5, 2), makeMove(0, -10, 1), makeMove(2, -1, 3),
+    };
+    std::vector<ScoredMove> list = input;
+
+    // Act
+    Search::insertionBranchByScore(list.data(), list.size(), 0);
+
+    // Assert
+    assert(sameBytes(list, expected));
+    assert(sameBytes(frozenInsertion(input, 0), expected));
+}
+
+void insertionBranchByScore_negativeTail_isFifoQueueOrder()
+{
+    // Arrange: input  P0 N1 N2 Q3 N4 Q5 (P = prefix, N = negative, Q = qualifying).
+    // Queue of negatives: [N1] [N1 N2]; Q3 rotates N1 to the back: [N2 N1]; [N2 N1 N4];
+    // Q5 rotates N2: [N1 N4 N2]. The prefix {P0, Q3, Q5} is sorted by score.
+    const std::vector<ScoredMove> input = {
+        makeMove(10, 1, 0), makeMove(11, -1, 1), makeMove(12, -2, 2),
+        makeMove(13, 3, 3), makeMove(14, -4, 4), makeMove(15, 2, 5),
+    };
+    const std::vector<ScoredMove> expected = {
+        makeMove(13, 3, 3),  makeMove(15, 2, 5),  makeMove(10, 1, 0),
+        makeMove(11, -1, 1), makeMove(14, -4, 4), makeMove(12, -2, 2),
+    };
+    std::vector<ScoredMove> list = input;
+
+    // Act
+    Search::insertionBranchByScore(list.data(), list.size(), 0);
+
+    // Assert
+    assert(sameBytes(list, expected));
+    assert(sameBytes(frozenInsertion(input, 0), expected));
+}
+
+void insertionBranchByScore_unionBits_preservedPerMove()
+{
+    // Arrange
+    PRNG                    prng(77);
+    std::vector<ScoredMove> list = randomInsertionList(prng, 121, InsertionScheme::NarrowTies, false);
+    const uint32_t special[] = {0x7FC00000u, 0x7FA00001u, 0xFFC00000u, 0x7F800000u,
+                                0xFF800000u, 0x80000000u, 0x00000000u, 0xFFFFFFFFu};
+    for (size_t i = 0; i < std::size(special); i++)
+        setUnionBits(list[i * 7], special[i]);
+    std::vector<std::pair<int, uint32_t>> before;
+    for (const ScoredMove &m : list)
+        before.emplace_back(int(m.pos), unionBits(m));
+    std::sort(before.begin(), before.end());
+    const std::vector<ScoredMove> expected = frozenInsertion(list, 0);
+
+    // Act
+    Search::insertionBranchByScore(list.data(), list.size(), 0);
+
+    // Assert
+    std::vector<std::pair<int, uint32_t>> after;
+    for (const ScoredMove &m : list)
+        after.emplace_back(int(m.pos), unionBits(m));
+    std::sort(after.begin(), after.end());
+    assert(after == before);
+    assert(sameBytes(list, expected));
+}
+
+void insertionBranchByScore_emptyOrSingle_isNoop()
+{
+    // Arrange
+    ScoredMove sentinel = makeMove(123, 45, 0xDEADBEEFu);
+    ScoredMove one      = makeMove(-9, -32768, 0x7FC00000u);
+    ScoredMove oneCopy  = one;
+
+    // Act
+    Search::insertionBranchByScore(&sentinel, 0, 0);
+    Search::insertionBranchByScore(&one, 1, 0);
+
+    // Assert
+    ScoredMove sentinelCopy = makeMove(123, 45, 0xDEADBEEFu);
+    assert(std::memcmp(&sentinel, &sentinelCopy, sizeof(ScoredMove)) == 0);
+    assert(std::memcmp(&one, &oneCopy, sizeof(ScoredMove)) == 0);
+}
+
+#endif  // USE_AVX512
+
 // ---------------------------------------------------------------------------
 // MovePicker (MAIN): drained sequence unchanged vs goldens from the pre-PERF-01 picker
 // ---------------------------------------------------------------------------
@@ -501,4 +725,18 @@ void runMoveSortTests()
     RUN_TEST(radixSortByScore_unionBits_preservedPerMove);
     RUN_TEST(radixSortByScore_singleDigitKeys_skippedPassesStillSorted);
     RUN_TEST(radixSortByScore_randomLists_matchStdSortWithScoreComparator);
+
+    std::printf("\n== PERF-02 insertion branch ==\n");
+    RUN_TEST(fastPartialSort_insertionBranchDuplicatePos_matchesFrozenReference);
+#ifdef USE_AVX512
+    RUN_TEST(insertionBranchByScore_emptyOrSingle_isNoop);
+    RUN_TEST(insertionBranchByScore_negativeFirstMove_keptLastInPrefix);
+    RUN_TEST(insertionBranchByScore_negativeTail_isFifoQueueOrder);
+    RUN_TEST(insertionBranchByScore_duplicatePos_stableByArrival);
+    RUN_TEST(insertionBranchByScore_unionBits_preservedPerMove);
+    RUN_TEST(insertionBranchByScore_randomLists_matchFrozenReference);
+    RUN_TEST(insertionBranchByScore_nonZeroLimit_matchesFrozenReference);
+#else
+    std::printf("    (insertionBranchByScore cases skipped: not an AVX-512 build)\n");
+#endif
 }
