@@ -6,11 +6,11 @@ a matching `instruction.md` line when execution guidance exists. See
 
 ## Active
 
-_(none)_
-
+(none)
 
 ## Done
 
+- [PERF-01 — Branch-miss reduction in move-list ordering](docs/todo/PERF-01-movepick-branch-miss.md) — LSD radix sort replaces `std::sort` in the middle branch of `fastPartialSort` (121 < n <= 323, `ScoreComparator` only); tests in `tests/movesort_tests.cpp`. Class B. Done 2026-11-04 — bench bit-identical (17621937 / 8c1f72e5; yixin-net 4587838 / 4447fd06), median Nodes/s +17.3% gcc / +16.6% clang built-in, +5.9% yixin-net, +18.4% clang PGO vs PGO, branch misses -43..-59%.
 - [BUILD-01 — Profile-guided optimization (PGO) build](docs/todo/BUILD-01-pgo-build.md) — `PGO_MODE`/`PGO_PROFILE` CMake options + `scripts/pgo_build.sh <preset>` (gen -> BENCH -> merge -> use, LTO on). Class C. Done 2026-11-03 — bench bit-identical (17621937 / 8c1f72e5), median NPS +3.6% (975150 -> 1009968) on clang-AVX512VNNI.
 - [VCN-02 — VCN tree search: attack-oriented search quality and real-world correctness](docs/todo/VCN-02-attack-search-quality.md) — VC4 full-board fours (item 1), no double-three win (1b), pruning kept (4), threat ordering -32% nodes (6) done. Items 5 (horizon value) and 7 not planned (need SPSA); acceptance `h8j9f6i10` tracked by move G5, eval > 600 unmet. Class B. Closed 2026-11-03 with known limitations (see the doc).
 - [VCN — Victory by Continuous N-level attack search mode (VC2..VC4)](docs/todo/VCN-search-mode.md) — attacker must win while the defender may pass; new `INFO VCTHREAD 0..3` (Yixin GUI option) and one-shot `YXVCN <2..4>`; VC5 is internal only. Class B + C. Done 2026-10-06 — bench bit-identical (16733809 / 4621a98a), unit tests passing (see the doc).

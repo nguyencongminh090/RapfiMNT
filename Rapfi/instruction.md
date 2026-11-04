@@ -6,10 +6,11 @@ to a detail file under `docs/instruction/`. Read the matching entry here before 
 
 ## Active
 
-_(none)_
+(none)
 
 ## Done
 
+- [PERF-01 — Branch-miss reduction in move-list ordering](docs/instruction/PERF-01-movepick-branch-miss.md)
 - [BUILD-01 — Profile-guided optimization (PGO) build](docs/instruction/BUILD-01-pgo-build.md)
 - [VCN-02 — VCN tree search: attack-oriented search quality and real-world correctness](docs/instruction/VCN-02-attack-search-quality.md)
 - [VCN — Victory by Continuous N-level attack search mode (VC2..VC4; VC5 internal)](docs/instruction/VCN-search-mode.md)
