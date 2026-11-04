@@ -35,6 +35,10 @@
 #include <cstdint>
 #include <cstring>
 
+#ifdef USE_AVX512
+    #include <immintrin.h>
+#endif
+
 namespace {
 
 /// Move picking stages.
@@ -142,6 +146,60 @@ NO_INLINE void radixSortByScore(ScoredMove *begin, size_t n)
         std::memcpy(reinterpret_cast<char *>(&m) + 4, &unionBits, 4);
     }
 }
+
+#ifdef USE_AVX512
+/// PERF-02, see the contract in movesort.h. Proof and measurements:
+/// docs/audit/2026-11-04-perf02-insertion-branch-research.md.
+NO_INLINE void insertionBranchByScore(ScoredMove *a, size_t n, Score limit)
+{
+    static_assert(sizeof(ScoredMove) == 8, "a whole ScoredMove moves as one 64-bit word");
+    constexpr size_t Cap = MAX_MOVES / 4 + 8;  // InsertionSortLimit, padded to 8 keys
+    assert(n <= MAX_MOVES / 4);
+    if (n < 2)
+        return;
+
+    alignas(64) ScoredMove pre[Cap];  // prefix members in arrival order
+    alignas(64) uint64_t   key[Cap];
+
+    // 1. Partition. j + 1 is the queue front (first below-limit move); a qualifying a[p] takes
+    //    it, a below-limit a[p] stays. Both choices are a mask select, not a branch. pre[j + 1]
+    //    is written every step and kept only when a[p] qualifies (j advances).
+    pre[0]   = a[0];
+    size_t j = 0;
+    for (size_t p = 1; p < n; p++) {
+        uint64_t x, y;
+        std::memcpy(&x, &a[p], 8);
+        std::memcpy(&y, &a[j + 1], 8);
+        const uint64_t f    = uint64_t(a[p].score >= limit);
+        const uint64_t mask = 0 - f;
+        const uint64_t v    = (y & mask) | (x & ~mask);
+        std::memcpy(&a[p], &v, 8);
+        std::memcpy(&pre[j + 1], &x, 8);
+        j += f;
+    }
+    const size_t m = j + 1;
+
+    // 2. Stable sort of pre[0, m). Keys are distinct (arrival index in the low bits), and
+    //    ascending key order is ScoreComparator order with ties kept in arrival order.
+    for (size_t i = 0; i < m; i++) {
+        const uint32_t hi = (uint32_t(uint16_t(32767 - int(pre[i].score))) << 16)
+                            | uint32_t(uint16_t(int16_t(pre[i].pos)) ^ 0x8000u);
+        key[i] = (uint64_t(hi) << 32) | i;
+    }
+    const size_t m8 = (m + 7) & ~size_t(7);
+    for (size_t i = m; i < m8; i++)
+        key[i] = ~uint64_t(0);  // padding never compares below a real key
+
+    // rank_i = #{k : key_k < key_i}, eight keys per compare; ranks are a permutation of [0, m).
+    for (size_t i = 0; i < m; i++) {
+        const __m512i ki = _mm512_set1_epi64((long long)key[i]);
+        int           r  = 0;
+        for (size_t t = 0; t < m8; t += 8)
+            r += popcount(_mm512_cmplt_epu64_mask(_mm512_load_si512(key + t), ki));
+        a[r] = pre[i];
+    }
+}
+#endif
 
 /// MovePicker constructor at the root node.
 /// Generate all legal moves for current side to move.

@@ -34,6 +34,19 @@ namespace Search {
 /// is a no-op. Defined NO_INLINE in movepick.cpp so its stack arrays stay out of search frames.
 void radixSortByScore(ScoredMove *begin, size_t n);
 
+#ifdef USE_AVX512
+/// PERF-02: byte-identical replacement of fastPartialSort's insertion branch (n <=
+/// InsertionSortLimit) under ScoredMove::ScoreComparator. That loop is exactly
+///  1. a partition by `score >= limit` in which begin[0] always stays in the prefix and the
+///     below-limit moves form a FIFO queue (each qualifying move swaps the queue front into its
+///     own slot), then
+///  2. a *stable* sort of the prefix ({begin[0]} + qualifying moves, in arrival order).
+/// This does both without data-dependent branches: a masked-select partition, then an AVX-512
+/// rank sort on (score desc, pos asc, arrival index). Stability matters: real lists contain
+/// duplicate pos with different union bits. Defined NO_INLINE in movepick.cpp.
+void insertionBranchByScore(ScoredMove *begin, size_t n, Score limit);
+#endif
+
 /// Partial sort the move list up to the score limit. It dynamiclly decides
 /// which sorting algorithm to use based on how many moves are in the list.
 template <typename Comparator>
@@ -45,6 +58,12 @@ void fastPartialSort(ScoredMove *begin, ScoredMove *end, Score limit, Comparator
 
     size_t nMoves = end - begin;
     if (nMoves <= InsertionSortLimit) {
+#ifdef USE_AVX512
+        if constexpr (std::is_same_v<Comparator, ScoredMove::ScoreComparator>) {
+            insertionBranchByScore(begin, nMoves, limit);
+            return;
+        }
+#endif
         // Sorts moves in descending order up to and including a given limit.
         // The order of moves smaller than the limit is left unspecified.
         for (ScoredMove *sortedEnd = begin, *p = begin + 1; p < end; ++p)
