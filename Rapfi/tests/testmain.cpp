@@ -35,6 +35,7 @@ void runAnalyzeMovesTests();
 void runSimdLinearTests();
 void runVcnTests();
 void runMoveSortTests();
+void runRazorTests();
 
 int testsRun    = 0;
 int testsPassed = 0;
@@ -62,6 +63,7 @@ int main(int argc, char *argv[])
     runSimdLinearTests();
     runVcnTests();
     runMoveSortTests();
+    runRazorTests();
 
     std::printf("\n%d/%d tests passed\n", testsPassed, testsRun);
     return testsPassed == testsRun ? 0 : 1;

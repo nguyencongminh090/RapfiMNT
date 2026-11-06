@@ -1368,7 +1368,9 @@ Value search(Board &board, SearchStack *ss, Value alpha, Value beta, Depth depth
     (ss + 2)->killers[1] = Pos::NONE;
 
     if (oppo4) {
-        // Use static evaluation from previous ply if opponent makes a four/five attack
+        // Use static evaluation from previous ply if opponent makes a four/five attack.
+        // eval stays VALUE_NONE on purpose: this value is too noisy to prune on, so the steps
+        // below use depth and alpha only (see docs/todo/SEARCH-01-oppo4-explicit-threat-node.md).
         ss->staticEval = -(ss - 1)->staticEval;
 
         // Skip early pruning when we only have one possible move
@@ -1383,13 +1385,14 @@ Value search(Board &board, SearchStack *ss, Value alpha, Value beta, Depth depth
     // Step 7. Razoring with VCF (~68 elo)
     if (!PvNode
         && (alpha < VALUE_MATE_IN_MAX_PLY || !ttHit)  // We are not searching for a short win
-        && eval + razorMargin<Rule>(depth) < alpha) {
+        && (oppo4 ? razorThreatNode<Rule>(depth, alpha)
+                  : eval + razorMargin<Rule>(depth) < alpha)) {
         return vcfsearch<Rule, NonPV>(board, ss, alpha, alpha + 1);
     }
 
     // Step 8. Futility pruning: child node (~121 elo)
-    if (!PvNode && eval < VALUE_MATE_IN_MAX_PLY  // Do not return unproven wins
-        && beta > VALUE_MATED_IN_MAX_PLY         // Confirm non-losing move exists
+    if (!PvNode && !oppo4 && eval < VALUE_MATE_IN_MAX_PLY  // Do not return unproven wins
+        && beta > VALUE_MATED_IN_MAX_PLY                   // Confirm non-losing move exists
         && eval - futilityMargin<Rule>(depth - 1, cutNode && !ttHit, improvement > 0) >= beta
         && !((ss - 2)->moveP4[self] >= E_BLOCK4 && (ss - 4)->moveP4[self] >= E_BLOCK4))
         return eval;
@@ -1467,7 +1470,8 @@ moves_loop:
 
     // Fail-High reduction (~50 elo)
     // Indicate cutNode that will probably fail high if current eval is far above beta
-    bool likelyFailHigh = !PvNode && cutNode && eval >= beta + failHighMargin<Rule>(depth, oppo4);
+    bool likelyFailHigh =
+        !PvNode && cutNode && !oppo4 && eval >= beta + failHighMargin<Rule>(depth, oppo4);
 
 #ifdef POLICY_TRAINING
     const Value         policyTraceAlpha = alpha;

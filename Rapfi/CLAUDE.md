@@ -17,7 +17,7 @@ Code, identifiers, commit messages and docs stay in English; only the conversati
 
 - Configure with a preset from `CMakePresets.json` (e.g. `x64-clang-Native`), build with Ninja. Engine binary: `pbrain-rapfi`.
 - Unit tests: configure with `-DBUILD_TESTS=ON`; target `rapfi_tests` (sources in `tests/`:
-  `generateRootMoves`, `analyzeMoves`, `simd_linear`, `vcn`, `movesort`), run via `ctest` or `./rapfi_tests`.
+  `generateRootMoves`, `analyzeMoves`, `simd_linear`, `vcn`, `movesort`, `razor`), run via `ctest` or `./rapfi_tests`.
   `-UNDEBUG` is forced on this target so asserts are live; never do that to the `rapfi` target.
   A new test file must be added to `TEST_DRIVER_SOURCES` in `CMakeLists.txt`.
 - `FORCE_ASSERTION=ON` keeps asserts in the engine for debug runs; not for benchmarking.

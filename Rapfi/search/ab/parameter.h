@@ -117,6 +117,15 @@ constexpr Value razorMargin(Depth d)
                : MARGIN_INFINITE;
 }
 
+/// Razoring rule for a node facing a flex-four threat, which has no static eval to compare. Below
+/// the razoring depth the node is a VCF leaf unless alpha is a very short mated score. At or above
+/// that depth it drops only when alpha is above 2765, in practice a mate score.
+template <Rule R>
+constexpr bool razorThreatNode(Depth d, Value alpha)
+{
+    return VALUE_NONE + razorMargin<R>(d) < alpha;
+}
+
 /// Static futility pruning depth & margins
 template <Rule R>
 constexpr Value futilityMargin(Depth d, bool noTTCutNode, bool improving)
