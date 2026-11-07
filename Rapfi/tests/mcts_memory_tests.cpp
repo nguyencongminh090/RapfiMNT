@@ -18,15 +18,19 @@
 
 // SEARCH-02 tests (docs/todo/SEARCH-02-mcts-memory-growth.md): edge-count selection, expansion
 // delay predicate and Node::createEdgesFrom.
+// SEARCH-03 tests (docs/todo/SEARCH-03-mcts-default-memory-budget.md): default graph budget and
+// the closed-frontier threshold.
 
 #include "testutil.h"
 
+#include "../search/mcts/membudget.h"
 #include "../search/mcts/node.h"
 
 #include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <vector>
 
 using namespace Search::MCTS;
@@ -182,6 +186,87 @@ void createEdgesFrom_secondCall_keepsFirstArrayAndAddsNoFootprint()
     assert(counter.load() == edgeArrayFootprint(5));
 }
 
+// ---- SEARCH-03 ----
+
+void deriveDefaultGraphBudget_percentZero_returnsUnbounded()
+{
+    assert(deriveDefaultGraphBudget(1000000, 0, 0) == 0);
+    assert(deriveDefaultGraphBudget(1000000, 0, -5) == 0);
+}
+
+void deriveDefaultGraphBudget_unknownAvailable_returnsUnbounded()
+{
+    assert(deriveDefaultGraphBudget(0, 0, 40) == 0);
+}
+
+void deriveDefaultGraphBudget_fortyPercent_ofAvailablePlusGraph()
+{
+    // 1000 KiB available + 24 KiB held by the graph = 1024 KiB; 40% of 1048576 bytes.
+    assert(deriveDefaultGraphBudget(1000, 24 * 1024, 40) == 1048576 / 100 * 40 + 76 * 40 / 100);
+    // The graph's own bytes count even when nothing else is reported available.
+    assert(deriveDefaultGraphBudget(0, 1000, 50) == 500);
+}
+
+void deriveDefaultGraphBudget_percentAbove100_clampedTo100()
+{
+    assert(deriveDefaultGraphBudget(100, 0, 250) == 100 * 1024);
+}
+
+void deriveDefaultGraphBudget_hugeAvailable_doesNotOverflow()
+{
+    constexpr size_t Max = std::numeric_limits<size_t>::max();
+    size_t           b   = deriveDefaultGraphBudget(Max, Max, 100);
+    assert(b == Max);
+    size_t half = deriveDefaultGraphBudget(Max, 0, 50);
+    assert(half > Max / 4 && half < Max / 2 + 1);
+}
+
+void deriveDefaultGraphBudget_tinyResult_isAtLeastOneByte()
+{
+    // 1 byte of graph, 1% -> would round to 0, which means unbounded; must stay bounded.
+    assert(deriveDefaultGraphBudget(0, 1, 1) == 1);
+}
+
+void softGraphLimit_isEightyFivePercent()
+{
+    assert(softGraphLimit(1000) == 850);
+    assert(softGraphLimit(0) == 0);
+    assert(softGraphLimit(1) == 0);
+}
+
+void softGraphLimit_hugeLimit_doesNotOverflow()
+{
+    constexpr size_t Max = std::numeric_limits<size_t>::max();
+    size_t           s   = softGraphLimit(Max);
+    assert(s < Max && s > Max / 100 * 84);
+}
+
+void graphInsertionClosed_unbounded_neverCloses()
+{
+    assert(!graphInsertionClosed(false, 0, 0));
+    assert(!graphInsertionClosed(false, 1u << 30, 100));
+}
+
+void graphInsertionClosed_belowSoftLimit_open()
+{
+    assert(!graphInsertionClosed(true, 849, 1000));
+}
+
+void graphInsertionClosed_atSoftLimit_closed()
+{
+    assert(graphInsertionClosed(true, 850, 1000));
+}
+
+void graphInsertionClosed_aboveHardLimit_closed()
+{
+    assert(graphInsertionClosed(true, 1500, 1000));
+}
+
+void graphInsertionClosed_zeroLimitBounded_closed()
+{
+    assert(graphInsertionClosed(true, 0, 0));
+}
+
 }  // namespace
 
 void runMctsMemoryTests()
@@ -203,4 +288,18 @@ void runMctsMemoryTests()
     RUN_TEST(createEdgesFrom_massCut_countsFootprintOfKeptEdgesOnly);
     RUN_TEST(createEdgesFrom_emptyList_returnsTrueAndLeavesNodeLeaf);
     RUN_TEST(createEdgesFrom_secondCall_keepsFirstArrayAndAddsNoFootprint);
+    std::printf("\n== SEARCH-03 MCTS memory budget ==\n");
+    RUN_TEST(deriveDefaultGraphBudget_percentZero_returnsUnbounded);
+    RUN_TEST(deriveDefaultGraphBudget_unknownAvailable_returnsUnbounded);
+    RUN_TEST(deriveDefaultGraphBudget_fortyPercent_ofAvailablePlusGraph);
+    RUN_TEST(deriveDefaultGraphBudget_percentAbove100_clampedTo100);
+    RUN_TEST(deriveDefaultGraphBudget_hugeAvailable_doesNotOverflow);
+    RUN_TEST(deriveDefaultGraphBudget_tinyResult_isAtLeastOneByte);
+    RUN_TEST(softGraphLimit_isEightyFivePercent);
+    RUN_TEST(softGraphLimit_hugeLimit_doesNotOverflow);
+    RUN_TEST(graphInsertionClosed_unbounded_neverCloses);
+    RUN_TEST(graphInsertionClosed_belowSoftLimit_open);
+    RUN_TEST(graphInsertionClosed_atSoftLimit_closed);
+    RUN_TEST(graphInsertionClosed_aboveHardLimit_closed);
+    RUN_TEST(graphInsertionClosed_zeroLimitBounded_closed);
 }

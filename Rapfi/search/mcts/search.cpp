@@ -308,7 +308,7 @@ std::pair<Node *, bool> allocateOrFindNode(MCTSSearcher &searcher, HashKey hash)
 ///   The child node pointer is nullptr if the edge is unexplored (has zero visit).
 ///   At root, the edge pointer is nullptr if no edge is in the root move list.
 template <bool Root>
-std::pair<Edge *, Node *> selectChild(Node &node, const Board &board)
+std::pair<Edge *, Node *> selectChild(Node &node, const Board &board, bool graphClosed)
 {
     assert(!node.isLeaf());
     SearchThread *thisThread = board.thisThread();
@@ -376,7 +376,8 @@ std::pair<Edge *, Node *> selectChild(Node &node, const Board &board)
 
     // Compute selection value of the first unexplored child (which will have the highest
     // policy among the rest unexplored children)
-    if (edgeIndex < edges.numEdges) {
+    // A closed graph (SEARCH-03) offers no unexplored edge: the playout stays in explored nodes.
+    if (edgeIndex < edges.numEdges && !graphClosed) {
         float fpuUtility = fpuValue<Root>(node.getQ(), node.getEvalUtility(), exploredPolicySum);
 
         Edge    &childEdge          = edges[edgeIndex];
@@ -400,7 +401,8 @@ std::pair<Edge *, Node *> selectChild(Node &node, const Board &board)
     // At root, every edge may be excluded from the root move list (e.g. when
     // all generated moves are blocked), in which case no edge is selectable
     // and a null edge is returned. For non-root nodes the edge is non-null.
-    assert(Root || bestEdge);
+    // A closed graph (SEARCH-03) may leave a non-root node without any explored edge.
+    assert(Root || graphClosed || bestEdge);
     return {bestEdge, bestNode};
 }
 
@@ -534,9 +536,13 @@ uint32_t searchNode(Node &node, Board &board, int ply, uint32_t newVisits)
         return newVisits;
     }
 
+    // A closed graph (SEARCH-03) takes no new nodes or edge arrays. Sampled once per call.
+    const bool graphClosed = searcher.graphClosed();
+
     // Delay expansion of rarely visited leaves: credit the visit with the static value, the
-    // same way a terminal node is visited (SEARCH-02).
-    if (!Root && node.isLeaf() && !readyToExpand(parentVisits, SearchCfg.mctsExpandMinVisits)) {
+    // same way a terminal node is visited (SEARCH-02). A closed graph expands no leaf either.
+    if (!Root && node.isLeaf()
+        && (graphClosed || !readyToExpand(parentVisits, SearchCfg.mctsExpandMinVisits))) {
         node.incrementVisits(newVisits);
         return newVisits;
     }
@@ -557,7 +563,7 @@ uint32_t searchNode(Node &node, Board &board, int ply, uint32_t newVisits)
     uint32_t actualNewVisits = 0;
     while (!stopThisPlayout && newVisits > 0) {
         // Select the best edge to explore
-        auto [childEdge, childNode] = selectChild<Root>(node, board);
+        auto [childEdge, childNode] = selectChild<Root>(node, board, graphClosed);
 
         // When no root edge is in the root move list, no playout can make
         // any progress, so stop the search gracefully and let the bestmove
@@ -567,6 +573,16 @@ uint32_t searchNode(Node &node, Board &board, int ply, uint32_t newVisits)
                 thisThread->engine.stopThinking();
                 break;
             }
+        }
+        else if (!childEdge) {
+            // Closed graph and no explored child here (SEARCH-03): end the playout. Nothing
+            // was visited below this node yet, so credit the visit with its static value.
+            assert(graphClosed);
+            if (actualNewVisits == 0) {
+                node.incrementVisits(newVisits);
+                return newVisits;
+            }
+            break;
         }
 
         // Make the move to reach the child node
@@ -987,15 +1003,18 @@ void MCTSSearcher::setMemoryLimit(size_t memorySizeKB)
     size_t vcfTTMaxKB   = static_cast<size_t>(std::max(SearchCfg.mctsVCFTTMaxSizeKB, 1));
     size_t vcfTTDivisor = static_cast<size_t>(std::max(SearchCfg.mctsVCFTTBudgetDivisor, 1));
 
-    memoryLimitKB = memorySizeKB;
+    memoryLimitKB      = memorySizeKB;
+    memoryLimitApplied = true;
     size_t vcfTTSizeKB;
     if (memorySizeKB == 0) {
         // No budget set: graph unbounded (keyed off memoryLimitKB == 0),
         // VCF TT at its default maximum.
         vcfTTSizeKB      = vcfTTMaxKB;
         graphMemoryLimit = 0;
+        graphBounded     = false;  // searchMain derives a default budget from the free RAM
     }
     else {
+        graphBounded   = true;
         vcfTTSizeKB    = std::clamp<size_t>(memorySizeKB / vcfTTDivisor, 1, vcfTTMaxKB);
         vcfTTSizeKB    = std::min(vcfTTSizeKB, memorySizeKB);
         size_t graphKB = memorySizeKB - vcfTTSizeKB;
@@ -1058,6 +1077,20 @@ const RootMove *MCTSSearcher::searchMain(SearchThread &th)
         }
     }
 
+    // No explicit memory limit: bound the graph by a share of the RAM that is free now
+    // (SEARCH-03). Written here, before any worker thread starts.
+    if (memoryLimitKB == 0) {
+        // No limit was ever set: the VCF TT is still unsized, give it its default size.
+        if (!memoryLimitApplied)
+            setMemoryLimit(0);
+        graphMemoryLimit = deriveDefaultGraphBudget(availablePhysicalMemoryKB(),
+                                                    graphMemoryUsed.load(std::memory_order_relaxed),
+                                                    SearchCfg.mctsDefaultMemoryPercent);
+        graphBounded     = graphMemoryLimit > 0;
+        if (graphBounded)
+            MESSAGEL("MCTS default graph budget: " << (graphMemoryLimit >> 20) << " MB");
+    }
+
     // Initialize per-search scratch state
     scratch.numSelectableRootMoves = 0;
     scratch.lastOutputNodes        = 0;
@@ -1088,8 +1121,7 @@ void MCTSSearcher::search(SearchThread &th)
     std::vector<Node *> selectedPath;
     while (!th.engine.isTerminating()) {
         // Stop when the graph memory budget is exhausted
-        if (memoryLimitKB
-            && graphMemoryUsed.load(std::memory_order_relaxed) >= graphMemoryLimit)
+        if (graphBounded && graphMemoryUsed.load(std::memory_order_relaxed) >= graphMemoryLimit)
             break;
 
         uint32_t newNumPlayouts = SearchCfg.maxNumVisitsPerPlayout;
@@ -1169,8 +1201,7 @@ void MCTSSearcher::setupRootNode(SearchThread &th)
     // Recycling must run whenever the graph memory budget is exceeded -
     // clear(false) keeps the table and the counter, so a new/backward/
     // unchanged position must still be able to reclaim the budget below.
-    bool overBudget = memoryLimitKB
-                      && graphMemoryUsed.load(std::memory_order_relaxed) >= graphMemoryLimit;
+    bool overBudget = graphClosed();
 
     // If the root position has not changed, we do not need to update the root node
     if (graph.root && rootPosition == graph.previousPosition && !overBudget)
@@ -1190,9 +1221,7 @@ void MCTSSearcher::setupRootNode(SearchThread &th)
     // singular root), or whenever the graph memory budget is exceeded.
     // Re-sample the budget here: root setup above may have allocated the
     // new root and its edges, crossing the limit after the first check.
-    overBudget = overBudget
-                 || (memoryLimitKB
-                     && graphMemoryUsed.load(std::memory_order_relaxed) >= graphMemoryLimit);
+    overBudget = overBudget || graphClosed();
     if ((rootPosition.size() >= graph.previousPosition.size() && th.rootMoves.size() > 1)
         || overBudget)
         recycleOldNodes(th);

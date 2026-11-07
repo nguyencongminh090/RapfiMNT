@@ -23,6 +23,7 @@
 #include "../searchoutput.h"
 #include "../searchthread.h"
 #include "../timecontrol.h"
+#include "membudget.h"
 #include "node.h"
 #include "nodetable.h"
 
@@ -69,10 +70,17 @@ public:
     /// default maximum). Written only between searches, like TT resizing.
     size_t memoryLimitKB = 0;
 
-    /// Graph memory budget in bytes, derived from memoryLimitKB by
-    /// setMemoryLimit. May legitimately be zero (tiny budgets); "unbounded"
-    /// is signalled by memoryLimitKB == 0, never by this field.
+    /// Graph memory budget in bytes. Derived from memoryLimitKB by setMemoryLimit, or, when no
+    /// limit was set, from the available RAM at the start of each search (SEARCH-03).
+    /// May legitimately be zero (tiny budgets); "unbounded" is signalled by
+    /// graphBounded == false, never by this field.
     size_t graphMemoryLimit = 0;
+
+    /// Whether graphMemoryLimit applies. Written only between searches.
+    bool graphBounded = false;
+
+    /// Whether setMemoryLimit has sized the VCF TT at least once.
+    bool memoryLimitApplied = false;
 
     /// Estimated bytes of live graph memory (nodes + edge arrays +
     /// per-allocation overhead constants). Updated at node insertion, edge
@@ -82,6 +90,15 @@ public:
 
     MCTSSearcher();
     ~MCTSSearcher() = default;
+
+    /// Whether the graph has reached the soft limit and must stop adding nodes and edge
+    /// arrays (SEARCH-03). Always false for an unbounded graph.
+    bool graphClosed() const
+    {
+        return graphInsertionClosed(graphBounded,
+                                    graphMemoryUsed.load(std::memory_order_relaxed),
+                                    graphMemoryLimit);
+    }
 
     std::unique_ptr<SearchData> makeSearchData(SearchThread &th) override { return nullptr; }
 

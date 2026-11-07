@@ -242,7 +242,10 @@ void getOption()
         }
 
         // Resize TT if memory reserved is different for this rule.
-        if (Config::GeneralCfg.memoryReservedMB[prevRule] != Config::GeneralCfg.memoryReservedMB[options.rule.rule]) {
+        // An unset limit (0) stays unset; otherwise it would collapse to 1 KiB (SEARCH-03).
+        if (Search::Engine.searcher()->getMemoryLimit() != 0
+            && Config::GeneralCfg.memoryReservedMB[prevRule]
+                   != Config::GeneralCfg.memoryReservedMB[options.rule.rule]) {
             size_t maxMemSizeKB = Search::Engine.searcher()->getMemoryLimit()
                                   + Config::GeneralCfg.memoryReservedMB[prevRule] * 1024;
             setSearcherMemoryLimit(maxMemSizeKB,

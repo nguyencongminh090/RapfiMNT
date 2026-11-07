@@ -54,6 +54,9 @@ struct SearchConfig
     float mctsEdgePolicyMass = 1.0f;
     /// Lower bound of the number of edges kept by the policy-mass cut (SEARCH-02).
     int mctsMinEdges = 8;
+    /// With no explicit memory limit, the MCTS graph budget is this percent of the available
+    /// physical memory (plus what the graph already holds). 0 = unbounded (SEARCH-03).
+    int mctsDefaultMemoryPercent = 40;
     /// The maximum number of visits per playout in MCTS search.
     int maxNumVisitsPerPlayout = 100;
     /// How many nodes to print root moves in MCTS search. (Positive number to enable)

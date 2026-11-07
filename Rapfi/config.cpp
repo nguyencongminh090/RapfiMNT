@@ -376,6 +376,8 @@ void Config::readSearch(const cpptoml::table &t, PendingConfig &pending)
     cfg.mctsEdgePolicyMass =
         t.get_as<double>("mcts_edge_policy_mass").value_or(cfg.mctsEdgePolicyMass);
     cfg.mctsMinEdges = t.get_as<int>("mcts_min_edges").value_or(cfg.mctsMinEdges);
+    cfg.mctsDefaultMemoryPercent =
+        t.get_as<int>("mcts_default_memory_percent").value_or(cfg.mctsDefaultMemoryPercent);
     cfg.maxNumVisitsPerPlayout =
         t.get_as<int>("max_num_visits_per_playout").value_or(cfg.maxNumVisitsPerPlayout);
     cfg.nodesToPrintMCTSRootmoves =
