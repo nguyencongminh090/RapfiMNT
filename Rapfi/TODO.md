@@ -6,10 +6,14 @@ a matching `instruction.md` line when execution guidance exists. See
 
 ## Active
 
-(none)
+- [SEARCH-03 — MCTS default graph memory budget](docs/todo/SEARCH-03-mcts-default-memory-budget.md) — derive a default budget from RAM and keep searching without inserting nodes near the limit; today an unset budget is unbounded and fills RAM. Class B.
+- [SEARCH-04 — MCTS progressive widening](docs/todo/SEARCH-04-mcts-progressive-widening.md) — add edges as visits grow; needs safe reclamation of the replaced edge array. Class B.
+- [SEARCH-05 — Validate SEARCH-02 settings beyond freestyle / 2 s / 256 MB](docs/todo/SEARCH-05-mcts-memory-config-validation.md) — Standard and Renju, longer time, more threads, separate sweeps; decide whether to change defaults. Class B.
+- [PERF-03 — MCTS node table footprint](docs/todo/PERF-03-mcts-node-table-footprint.md) — measure real bytes per node; replace `std::set` shards. Class B/C.
 
 ## Done
 
+- [SEARCH-02 — MCTS graph memory growth (edge-array size, expansion delay)](docs/todo/SEARCH-02-mcts-memory-growth.md) — opt-in `mcts_edge_policy_mass` (policy-mass edge cut, non-root) and `mcts_expand_min_visits` (expansion delay); defaults keep old behaviour. Class B. Done 2026-11-07 — bench bit-identical (17621937 / 8c1f72e5), 102/102 unit tests (16 new); peak RSS 486 -> 105 MB at 2M nodes (`0.97` + `3`); self-play at 256 MB equal to base (105 - 103 - 22, 230 games), versus alpha-beta 43 - 50 - 7 (100 games).
 - [SEARCH-01 — Explicit handling of nodes facing a flex-four threat](docs/todo/SEARCH-01-oppo4-explicit-threat-node.md) — `razorThreatNode` states the razoring rule explicitly; futility and `likelyFailHigh` guarded by `!oppo4`; the sentinel-based behaviour is kept; tests in `tests/razor_tests.cpp`. Class B. Done 2026-11-06 — bench bit-identical on gcc, clang and clang PGO (17621937 / 8c1f72e5; yixin-net 4587838 / 4447fd06), 86/86 unit tests, cycles:u within -0.74..+0.52% (all overlap).
 - [PERF-02 — Branch misses in the short-list (insertion) branch of `fastPartialSort`](docs/todo/PERF-02-insertion-branch-sort.md) — on AVX-512 builds, `ScoreComparator` lists with n <= 121 go through `insertionBranchByScore` (branchless partition with `begin[0]` pinned + AVX-512 stable rank sort), byte-identical to the old loop; tests in `tests/movesort_tests.cpp`. Class B. Done 2026-11-04 — bench bit-identical (17621937 / 8c1f72e5; yixin-net 4587838 / 4447fd06), cycles:u -2.5% gcc / -4.5% clang / -4.6% clang PGO built-in, -0.3..-1.1% yixin-net (inside spread), branch misses -6..-14%.
 - [PERF-01 — Branch-miss reduction in move-list ordering](docs/todo/PERF-01-movepick-branch-miss.md) — LSD radix sort replaces `std::sort` in the middle branch of `fastPartialSort` (121 < n <= 323, `ScoreComparator` only); tests in `tests/movesort_tests.cpp`. Class B. Done 2026-11-04 — bench bit-identical (17621937 / 8c1f72e5; yixin-net 4587838 / 4447fd06), median Nodes/s +17.3% gcc / +16.6% clang built-in, +5.9% yixin-net, +18.4% clang PGO vs PGO, branch misses -43..-59%.

@@ -46,6 +46,14 @@ struct SearchConfig
 
     /// Expand node (evaluating policy) when first evaluate a node (evaluating value).
     bool expandWhenFirstEvaluate = false;
+    /// A leaf is expanded only after this many visits (1 = on its second visit, as before).
+    /// Delays the edge-array allocation of rarely revisited nodes (SEARCH-02).
+    int mctsExpandMinVisits = 1;
+    /// Non-root nodes keep the leading edges until their cumulative policy reaches this
+    /// mass; 1 keeps every edge (SEARCH-02).
+    float mctsEdgePolicyMass = 1.0f;
+    /// Lower bound of the number of edges kept by the policy-mass cut (SEARCH-02).
+    int mctsMinEdges = 8;
     /// The maximum number of visits per playout in MCTS search.
     int maxNumVisitsPerPlayout = 100;
     /// How many nodes to print root moves in MCTS search. (Positive number to enable)

@@ -121,6 +121,31 @@ struct alignas(alignof(Edge)) EdgeArray
 static_assert(alignof(EdgeArray) == alignof(Edge), "Sanity check on EdgeArray's alignment");
 static_assert(sizeof(Edge) % sizeof(EdgeArray) == 0, "Sanity check on Edge's size");
 
+/// Limits on how many of the generated moves become edges of a node (SEARCH-02).
+/// The default keeps every move.
+struct EdgeLimits
+{
+    /// Keep the leading edges until their cumulative policy reaches this mass.
+    /// A value >= 1 disables the cut.
+    float massKeep = 1.0f;
+    /// Never keep fewer than this many edges (at least 1 when there is any move).
+    uint32_t minEdges = 8;
+};
+
+/// Number of leading moves to keep as edges. Policies must be sorted in descending order.
+/// @param policy Normalised policies of the generated moves.
+/// @param numMoves Number of generated moves.
+/// @param massKeep Cumulative policy mass to reach; >= 1 keeps every move.
+/// @param minEdges Lower bound of the result (clamped to [1, numMoves]).
+uint32_t selectEdgeCount(const float *policy, uint32_t numMoves, float massKeep, uint32_t minEdges);
+
+/// Whether a leaf that has been visited `visits` times may be expanded.
+/// A non-positive minVisits means no delay.
+inline bool readyToExpand(uint32_t visits, int minVisits)
+{
+    return minVisits <= 1 || visits >= static_cast<uint32_t>(minVisits);
+}
+
 /// Represents the value bound of a node.
 struct ValueBound
 {
@@ -192,7 +217,18 @@ public:
     ///   concurrent expansion adds nothing).
     /// @return Whether this node has no valid edges. If true,
     ///   this node is a terminal node that has been mated.
-    bool createEdges(MovePicker &movePicker, std::atomic<size_t> *allocCounter = nullptr);
+    bool createEdges(MovePicker &movePicker,
+                     std::atomic<size_t> *allocCounter = nullptr,
+                     const EdgeLimits    &limits       = {});
+
+    /// Initializes the edges from an already generated move list sorted by descending policy.
+    /// The kept prefix is chosen by selectEdgeCount() and renormalised to sum to 1 when
+    /// anything was cut. Same return value and allocCounter contract as createEdges().
+    bool createEdgesFrom(const Pos          *moves,
+                         const float        *policy,
+                         uint32_t            numMoves,
+                         const EdgeLimits   &limits,
+                         std::atomic<size_t> *allocCounter = nullptr);
 
     /// Returns the graph hash key of this node.
     HashKey getHash() const { return hash; }

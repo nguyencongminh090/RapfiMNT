@@ -700,6 +700,7 @@ if(BUILD_TESTS AND NOT EMSCRIPTEN)
         tests/vcn_tests.cpp
         tests/movesort_tests.cpp
         tests/razor_tests.cpp
+        tests/mcts_memory_tests.cpp
     )
 
     add_executable(rapfi_tests ${TEST_ENGINE_SOURCES} ${TEST_DRIVER_SOURCES} ${HEADERS})

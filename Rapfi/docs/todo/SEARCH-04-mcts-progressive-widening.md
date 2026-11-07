@@ -1,0 +1,28 @@
+# SEARCH-04 — MCTS progressive widening
+
+**Status:** open (recorded 2026-11-07, not started).
+**Class:** B.
+
+## Problem
+
+SEARCH-02 cuts edges once, at creation (`mcts_edge_policy_mass`). A move cut at that point can never
+come back, which is a risk for tactical moves with low prior. Adding edges later means replacing a
+published `EdgeArray`, while other threads may be reading the old one.
+
+## Scope
+
+- Widen a node's edge set as its visit count grows (for example add the next policy-ranked moves at
+  visit thresholds).
+- A safe reclamation scheme for the replaced array: epoch-based reclamation or hazard pointers.
+  Rejected for now: chaining a tail array (breaks the "visited edges form a prefix" assumption in
+  `selectChild` and `Node::updateStats`).
+
+## Test list
+
+To be written before code: single-thread widening order, concurrent widening plus reads (stress, TSan
+if available), memory accounting after replacement.
+
+## Measure
+
+Self-play against SEARCH-02 settings at equal time; peak RSS. Expected gain is strength at a given
+memory, since SEARCH-02 alone is only equal to the base.

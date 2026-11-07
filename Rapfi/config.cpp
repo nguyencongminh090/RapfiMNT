@@ -371,6 +371,11 @@ void Config::readSearch(const cpptoml::table &t, PendingConfig &pending)
     // Parameters for MCTS search
     cfg.expandWhenFirstEvaluate =
         t.get_as<bool>("expand_when_first_evaluate").value_or(cfg.expandWhenFirstEvaluate);
+    cfg.mctsExpandMinVisits =
+        t.get_as<int>("mcts_expand_min_visits").value_or(cfg.mctsExpandMinVisits);
+    cfg.mctsEdgePolicyMass =
+        t.get_as<double>("mcts_edge_policy_mass").value_or(cfg.mctsEdgePolicyMass);
+    cfg.mctsMinEdges = t.get_as<int>("mcts_min_edges").value_or(cfg.mctsMinEdges);
     cfg.maxNumVisitsPerPlayout =
         t.get_as<int>("max_num_visits_per_playout").value_or(cfg.maxNumVisitsPerPlayout);
     cfg.nodesToPrintMCTSRootmoves =

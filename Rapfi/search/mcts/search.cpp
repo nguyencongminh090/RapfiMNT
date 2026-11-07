@@ -433,7 +433,9 @@ bool expandNode(Node &node, const SearchOptions &options, const Board &board, in
                           PolicyTemperature,
                       });
 
-        bool noValidMove = node.createEdges(mp, &searcher.graphMemoryUsed);
+        EdgeLimits limits {SearchCfg.mctsEdgePolicyMass,
+                           static_cast<uint32_t>(std::max(SearchCfg.mctsMinEdges, 1))};
+        bool       noValidMove = node.createEdges(mp, &searcher.graphMemoryUsed, limits);
         if (noValidMove) {
             Value terminalValue = board.p4Count(~board.sideToMove(), A_FIVE)
                                       ? mated_in(board.ply() + 2)
@@ -528,6 +530,13 @@ uint32_t searchNode(Node &node, Board &board, int ply, uint32_t newVisits)
 
     // Return directly if this node is a terminal node and not at root
     if (!Root && node.isTerminal()) {
+        node.incrementVisits(newVisits);
+        return newVisits;
+    }
+
+    // Delay expansion of rarely visited leaves: credit the visit with the static value, the
+    // same way a terminal node is visited (SEARCH-02).
+    if (!Root && node.isLeaf() && !readyToExpand(parentVisits, SearchCfg.mctsExpandMinVisits)) {
         node.incrementVisits(newVisits);
         return newVisits;
     }

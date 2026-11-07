@@ -21,6 +21,7 @@
 #include "../../eval/scoretables.h"
 #include "nodetable.h"
 
+#include <algorithm>
 #include <type_traits>
 
 namespace Search::MCTS {
@@ -127,7 +128,27 @@ void Node::setNonTerminal(float utility, float drawRate)
     n.store(1, std::memory_order_release);
 }
 
-bool Node::createEdges(MovePicker &movePicker, std::atomic<size_t> *allocCounter)
+uint32_t selectEdgeCount(const float *policy, uint32_t numMoves, float massKeep, uint32_t minEdges)
+{
+    if (numMoves == 0)
+        return 0;
+
+    uint32_t floorEdges = std::clamp<uint32_t>(minEdges, 1, numMoves);
+    if (massKeep >= 1.0f)
+        return numMoves;
+
+    float mass = 0.0f;
+    for (uint32_t i = 0; i < numMoves; i++) {
+        mass += policy[i];
+        if (mass >= massKeep)
+            return std::max(i + 1, floorEdges);
+    }
+    return numMoves;
+}
+
+bool Node::createEdges(MovePicker &movePicker,
+                       std::atomic<size_t> *allocCounter,
+                       const EdgeLimits    &limits)
 {
     Pos      moveList[MAX_MOVES];
     float    policyList[MAX_MOVES];
@@ -141,9 +162,30 @@ bool Node::createEdges(MovePicker &movePicker, std::atomic<size_t> *allocCounter
         numEdges++;
     }
 
+    return createEdgesFrom(moveList, policyList, numEdges, limits, allocCounter);
+}
+
+bool Node::createEdgesFrom(const Pos          *moveList,
+                           const float        *policyList,
+                           uint32_t            numMoves,
+                           const EdgeLimits   &limits,
+                           std::atomic<size_t> *allocCounter)
+{
     // If no valid edges, then this node is a (mated) terminal node
-    if (numEdges == 0)
+    if (numMoves == 0)
         return true;
+
+    uint32_t numEdges = selectEdgeCount(policyList, numMoves, limits.massKeep, limits.minEdges);
+
+    // Renormalise only when moves were cut, so the default path stays bit-identical
+    float scale = 1.0f;
+    if (numEdges < numMoves) {
+        float kept = 0.0f;
+        for (uint32_t i = 0; i < numEdges; i++)
+            kept += policyList[i];
+        if (kept > 0.0f)
+            scale = 1.0f / kept;
+    }
 
     size_t     numAllocs = (sizeof(EdgeArray) + numEdges * sizeof(Edge)) / sizeof(EdgeArrayAlloc);
     EdgeArray *tempEdges = reinterpret_cast<EdgeArray *>(new EdgeArrayAlloc[numAllocs]);
@@ -151,7 +193,7 @@ bool Node::createEdges(MovePicker &movePicker, std::atomic<size_t> *allocCounter
     // Copy the move and policy array to the allocated edge array
     tempEdges->numEdges = numEdges;
     for (uint32_t i = 0; i < numEdges; i++)
-        new (&tempEdges->edges[i]) Edge(moveList[i], policyList[i]);
+        new (&tempEdges->edges[i]) Edge(moveList[i], std::min(policyList[i] * scale, 1.0f));
 
     EdgeArray *expected = nullptr;
     bool       suc = edges.compare_exchange_strong(expected, tempEdges, std::memory_order_release);
