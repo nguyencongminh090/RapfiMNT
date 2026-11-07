@@ -50,8 +50,9 @@ struct SearchConfig
     /// Delays the edge-array allocation of rarely revisited nodes (SEARCH-02).
     int mctsExpandMinVisits = 1;
     /// Non-root nodes keep the leading edges until their cumulative policy reaches this
-    /// mass; 1 keeps every edge (SEARCH-02).
-    float mctsEdgePolicyMass = 1.0f;
+    /// mass; 1 keeps every edge (SEARCH-02). 0.99 is the default: it ties 1.0 where memory is
+    /// not binding and wins where it is (SEARCH-05).
+    float mctsEdgePolicyMass = 0.99f;
     /// Lower bound of the number of edges kept by the policy-mass cut (SEARCH-02).
     int mctsMinEdges = 8;
     /// With no explicit memory limit, the MCTS graph budget is this percent of the available

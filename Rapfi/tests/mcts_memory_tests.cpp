@@ -20,11 +20,13 @@
 // delay predicate and Node::createEdgesFrom.
 // SEARCH-03 tests (docs/todo/SEARCH-03-mcts-default-memory-budget.md): default graph budget and
 // the closed-frontier threshold.
+// SEARCH-05 test (docs/todo/SEARCH-05-mcts-memory-config-validation.md): default edge policy mass.
 
 #include "testutil.h"
 
 #include "../search/mcts/membudget.h"
 #include "../search/mcts/node.h"
+#include "../search/searchconfig.h"
 
 #include <atomic>
 #include <cassert>
@@ -267,6 +269,14 @@ void graphInsertionClosed_zeroLimitBounded_closed()
     assert(graphInsertionClosed(true, 0, 0));
 }
 
+void searchConfig_defaultEdgePolicyMass_isZeroPointNinetyNine()
+{
+    Search::SearchConfig cfg;
+    assert(cfg.mctsEdgePolicyMass == 0.99f);
+    // The other SEARCH-02 knob keeps its old behaviour (measured worse in SEARCH-05).
+    assert(cfg.mctsExpandMinVisits == 1);
+}
+
 }  // namespace
 
 void runMctsMemoryTests()
@@ -302,4 +312,6 @@ void runMctsMemoryTests()
     RUN_TEST(graphInsertionClosed_atSoftLimit_closed);
     RUN_TEST(graphInsertionClosed_aboveHardLimit_closed);
     RUN_TEST(graphInsertionClosed_zeroLimitBounded_closed);
+    std::printf("\n== SEARCH-05 MCTS default edge policy mass ==\n");
+    RUN_TEST(searchConfig_defaultEdgePolicyMass_isZeroPointNinetyNine);
 }

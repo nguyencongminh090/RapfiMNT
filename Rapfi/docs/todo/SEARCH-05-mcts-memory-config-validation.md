@@ -1,6 +1,6 @@
 # SEARCH-05 — Validate SEARCH-02 settings beyond freestyle / 2 s / 256 MB
 
-**Status:** in progress (started 2026-11-07).
+**Status:** done 2026-11-08 (default changed to `mcts_edge_policy_mass = 0.99`).
 **Class:** B (measurement; may change defaults).
 
 ## Why
@@ -92,5 +92,14 @@ Neither stopped by SPRT. Consistent with the SEARCH-02 result (43-50-7 for the p
   everywhere tested" rule. Not covered: freestyle in this task, memory above 1 GB, long time with
   many threads, and tie legs R / M have about ±30 Elo error.
 - MCTS with `pm99` stays slightly below alpha-beta within error.
-- **Defaults are unchanged.** Whether to make `mcts_edge_policy_mass = 0.99` the default (needs a
-  bench re-record and a bench note update) is a pending user decision.
+- Decision (user, 2026-11-08): make `mcts_edge_policy_mass = 0.99` the default.
+
+## Change and verification — 2026-11-08
+
+- `search/searchconfig.h`: `mctsEdgePolicyMass` default `1.0f` -> `0.99f`. `mcts_expand_min_visits`
+  stays 1. Users keep the old behaviour with `mcts_edge_policy_mass = 1.0`.
+- Test written first and seen failing, then passing: `searchConfig_defaultEdgePolicyMass_isZeroPointNinetyNine`
+  in `tests/mcts_memory_tests.cpp` (asserts live in `rapfi_tests`). 116/116 tests pass.
+- Bench `echo BENCH | ./pbrain-rapfi` (Release): Nodes `17621937`, Hash `8c1f72e5`, unchanged,
+  because the built-in config uses alpha-beta, not MCTS; the MCTS effect is covered by the
+  self-play results above.
