@@ -8,7 +8,7 @@ a matching `instruction.md` line when execution guidance exists. See
 
 - [SEARCH-04 — MCTS progressive widening](docs/todo/SEARCH-04-mcts-progressive-widening.md) — add edges as visits grow; needs safe reclamation of the replaced edge array. Class B.
 - [SEARCH-09 — MCTS mate bound unsound under the policy-mass edge cut](docs/todo/SEARCH-09-mcts-bound-under-edge-cut.md) — a node whose kept edges all lose is marked proven lost though a cut move may save it; the parent's false proven win overrides the best move. Not yet reproduced. Class B. Blocks VCN-03 option B.
-- [VCN-03 — VCN search mode under the MCTS searcher](docs/todo/VCN-03-mcts-vcn.md) — research report (2026-11-08): MCTS ignores `vcnMode` today (silent ordinary search). Option B (native MCTS-VCN) chosen 2026-11-08, slices 0 guard → SEARCH-09 → key → pass → VC4/VC5 → e2e; full board / maxMoves = draw, as AB. Class B + C. Not started.
+- [VCN-03 — VCN search mode under the MCTS searcher](docs/todo/VCN-03-mcts-vcn.md) — research report (2026-11-08): MCTS ignores `vcnMode` today (silent ordinary search). Option B (native MCTS-VCN) chosen 2026-11-08, slices 0 guard → SEARCH-09 → key → pass → VC4/VC5 → e2e; full board / maxMoves = draw, as AB. Class B + C. In progress: slice 0 (guard: YXVCN refused, VCTHREAD / SEARCH_TYPE warn under MCTS) done 2026-11-08, bench unchanged, 140/140 tests.
 - [PERF-03 — MCTS node table footprint](docs/todo/PERF-03-mcts-node-table-footprint.md) — measure real bytes per node; replace `std::set` shards. Class B/C.
 
 ## Done

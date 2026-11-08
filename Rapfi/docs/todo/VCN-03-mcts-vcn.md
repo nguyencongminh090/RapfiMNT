@@ -1,7 +1,7 @@
 # VCN-03 — VCN search mode under the MCTS searcher (research report)
 
-**Status:** option B chosen (2026-11-08, user); not started. Depends on
-[SEARCH-09](SEARCH-09-mcts-bound-under-edge-cut.md). Decisions in §8.
+**Status:** option B chosen (2026-11-08, user). Slice 0 (guard) done 2026-11-08, see §9; slices
+1–5 not started. Depends on [SEARCH-09](SEARCH-09-mcts-bound-under-edge-cut.md). Decisions in §8.
 
 **Class (if implemented):** B (search behaviour) + C (command surface). The MCTS node key change
 (§3.1) follows the same reasoning as the AB TT key in [VCN](VCN-search-mode.md): a VCN-only XOR,
@@ -195,8 +195,13 @@ bug regardless of what is chosen below.
 Written per CLAUDE.md rules 2-3; names follow `<function>_<scenario>_<expectedBehavior>`.
 
 Slice 0 — guard (A0)
-- `yxvcn_mctsSearcher_errorsAndDoesNotSearchAsVcn`
-- `infoVcthread_mctsSearcher_warns`
+- `yxvcn_mctsSearcher_errorsAndDoesNotSearchAsVcn` — refuse: `ERRORL`, no search, persistent
+  level untouched (an ordinary result to an explicit VCN query is the §4.3 bug again)
+- `infoVcthread_mctsSearcher_warns` — warn, keep the level (it takes effect again under AB)
+- `infoSearchType_mctsWithVcnLevelSet_warns` (added 2026-11-08: closes the VCTHREAD-then-
+  `SEARCH_TYPE mcts` order, where neither guard above fires). `think()` itself does not refuse:
+  a GUI `TURN` with no move would hang, so a persistent level under MCTS stays an ordinary search
+  after the warning.
 
 Slice 1 — sound bounds (§4.1, applies with VCN off too)
 - `updateStats_allKeptChildrenLostButEdgesCut_noProvenLoss`
@@ -243,3 +248,23 @@ so also an MCTS fixed-node golden output with VCN off); AB vs MCTS on the VCN-02
    `evaluateNode_vcnBoardFull_returnsDrawLikeAb`; the §3.3 table row reads "draw, as AB".
    Note: VC5 "attacker without five loses" is checked **before** the draw, as in AB
    (`search/ab/search.cpp:1285`).
+
+## 9. Progress
+
+### Slice 0 — guard (A0), done 2026-11-08 (class C)
+
+- `command/gomocup.cpp`: `searcherSupportsVcn()` (alpha-beta only; slice 2+ removes this one
+  check). `YXVCN` under MCTS: `ERRORL` and return before `vcnMode.n` is touched (no search, the
+  `INFO VCTHREAD` level is untouched). `INFO VCTHREAD` with a level > 0 under MCTS, and
+  `INFO SEARCH_TYPE mcts` while a level is set: `ERRORL` warning, level kept (it applies again
+  after a switch back to alpha-beta). `think()` is unchanged: a `TURN` under MCTS with a
+  persistent level is still an ordinary MCTS search, now announced by the warning.
+- Tests (`tests/vcn_tests.cpp`, asserts live, red before the code — the YXVCN test failed on the
+  missing MCTS message): `yxvcn_mctsSearcher_errorsAndDoesNotSearchAsVcn`,
+  `infoVcthread_mctsSearcher_warns`, `infoVcthread_alphabetaSearcher_noMctsWarning` (guard does
+  not fire under AB), `infoSearchType_mctsWithVcnLevelSet_warns`. `rapfi_tests` 140/140 pass.
+- Bench (gcc 15.2.0, Release, AVX512+VNNI, built-in config): Nodes `17621937`, Hash `8c1f72e5`,
+  unchanged (protocol-only change).
+- Known gap: a config reload (`reloadConfigEachMove`) or a config file that selects MCTS does
+  not go through the `SEARCH_TYPE` handler, so it does not warn; the search is still ordinary
+  MCTS, as before this slice.

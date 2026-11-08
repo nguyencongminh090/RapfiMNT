@@ -27,6 +27,7 @@
 #include "../search/hashtable.h"
 #include "../search/movepick.h"
 #include "../search/opening.h"
+#include "../search/ab/searcher.h"
 #include "../search/searcher.h"
 #include "../search/searchthread.h"
 #include "../tuning/tunemap.h"
@@ -63,6 +64,21 @@ bool                          GUIMode   = false;
 std::atomic_bool              thinking  = false;
 std::atomic_bool              exiting   = false;
 std::optional<CandidateRange> candRange = std::nullopt;
+
+namespace {
+
+/// VCN mode (INFO VCTHREAD / YXVCN) is implemented by the alpha-beta searcher only (VCN-03).
+/// The MCTS searcher ignores SearchOptions::vcnMode and would run an ordinary search.
+bool searcherSupportsVcn()
+{
+    return dynamic_cast<Search::AB::ABSearcher *>(Search::Engine.searcher()) != nullptr;
+}
+
+constexpr const char *VcnUnsupportedMessage =
+    "VCN mode is not supported by the MCTS searcher; searches stay ordinary MCTS searches. "
+    "Use SEARCH_TYPE alphabeta for VCN.";
+
+}  // namespace
 
 void sendActionAndUpdateBoard(ActionType action, Pos bestMove)
 {
@@ -284,6 +300,8 @@ void getOption()
             break;
         default: ERRORL("Unknown vcthread value: " << val << ", must be 0..3."); break;
         }
+        if (options.vcnMode.enabled() && !searcherSupportsVcn())
+            ERRORL(VcnUnsupportedMessage);
     }
     else if (token == "START_DEPTH") {
         std::cin >> options.startDepth;
@@ -416,6 +434,8 @@ void getOption()
         std::cin >> str;
         Search::Engine.setupSearcher(Search::createSearcher(str));
         Search::Engine.clear(true);
+        if (options.vcnMode.enabled() && !searcherSupportsVcn())
+            ERRORL(VcnUnsupportedMessage);
     }
     else {
         MESSAGEL("Unknown Info Parameter: " << token);
@@ -766,6 +786,11 @@ void searchVCN()
     std::cin >> level;
     if (level < 2 || level > 4) {
         ERRORL("YXVCN level must be 2..4.");
+        return;
+    }
+    if (!searcherSupportsVcn()) {
+        // Refuse: an ordinary MCTS result would read as a VCN answer (VCN-03 §4.3).
+        ERRORL("YXVCN is not supported by the MCTS searcher; use SEARCH_TYPE alphabeta.");
         return;
     }
 
