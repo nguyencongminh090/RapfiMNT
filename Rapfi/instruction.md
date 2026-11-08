@@ -10,6 +10,7 @@ to a detail file under `docs/instruction/`. Read the matching entry here before 
 
 ## Done
 
+- [SEARCH-08 — MCTS 64-bit visit counters without growing `Edge`](docs/instruction/SEARCH-08-mcts-64bit-visits.md) — done 2026-11-08 (see todo results)
 - [PERF-02 — Branch misses in the short-list (insertion) branch of `fastPartialSort`](docs/instruction/PERF-02-insertion-branch-sort.md)
 - [PERF-01 — Branch-miss reduction in move-list ordering](docs/instruction/PERF-01-movepick-branch-miss.md)
 - [BUILD-01 — Profile-guided optimization (PGO) build](docs/instruction/BUILD-01-pgo-build.md)
