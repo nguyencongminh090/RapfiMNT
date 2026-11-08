@@ -1115,6 +1115,14 @@ const RootMove *MCTSSearcher::searchMain(SearchThread &th)
     return &th.rootMoves[0];
 }
 
+namespace {
+
+/// Node and edge visit counters are uint32_t. Stop searching once the root reaches this many
+/// visits, leaving headroom for in-flight playouts, so no counter can wrap around 2^32.
+constexpr uint32_t MaxRootVisits = 3u << 30;
+
+}  // namespace
+
 void MCTSSearcher::search(SearchThread &th)
 {
     SearchOptions &options = th.options();
@@ -1126,6 +1134,10 @@ void MCTSSearcher::search(SearchThread &th)
     while (!th.engine.isTerminating()) {
         // Stop when the graph memory budget is exhausted
         if (graphBounded && graphMemoryUsed.load(std::memory_order_relaxed) >= graphMemoryLimit)
+            break;
+
+        // Stop before the 32-bit visit counters overflow
+        if (graph.root->getVisits() >= MaxRootVisits)
             break;
 
         uint32_t newNumPlayouts = SearchCfg.maxNumVisitsPerPlayout;
