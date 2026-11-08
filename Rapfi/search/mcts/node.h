@@ -35,67 +35,100 @@ class NodeTable;
 
 /// An edge in the MCTS graph.
 /// It contains the move, policy and num visits of this edge.
+/// Layout (SEARCH-08): two 64-bit words, 16 bytes in total.
+///   visitWord: bits 0..47 = edge visits, bits 48..63 = quantized policy.
+///   childWord: bits 0..47 = child node pointer, bits 48..63 = move (Pos as int16).
+/// Visits never carry into the policy bits: the search stops at SearchVisitGuard (2^46).
 class Edge
 {
 public:
-    Edge(Pos move, float p) : move(move), edgeVisits(0), child(nullptr) { setP(p); }
+    Edge(Pos move, float p)
+        : visitWord(uint64_t(quantizePolicy(p)) << VisitBits)
+        , childWord(uint64_t(static_cast<uint16_t>(static_cast<int>(move))) << PointerBits)
+    {}
 
     /// Get the move of this edge.
-    Pos getMove() const { return move; }
-
-    /// Converts a float32 policy in [0, 1] to a quantized 16bit policy.
-    /// @see
-    /// https://github.com/LeelaChessZero/lc0/blob/51f93b7c49720ee100d24aac54193a88ba98219a/src/mcts/node.cc#L130-L167
-    void setP(float p)
+    /// The move bits are written once by the constructor, before the edge array is published.
+    Pos getMove() const
     {
-        assert(0.0f <= p && p <= 1.0f);
-        constexpr int32_t roundings = (1 << 11) - (3 << 28);
-        int32_t           bits;  // TODO: change to std::bit_cast in C++20
-        std::memcpy(&bits, &p, sizeof(float));
-        bits += roundings;
-        policy = (bits < 0) ? 0 : static_cast<uint16_t>(bits >> 12);
+        uint64_t word = childWord.load(std::memory_order_relaxed);
+        return Pos(static_cast<int16_t>(static_cast<uint16_t>(word >> PointerBits)));
     }
 
     /// Get the normalized policy of this edge.
     float getP() const
     {
-        uint32_t bits = (static_cast<uint32_t>(policy) << 12) | (3 << 28);
+        uint16_t policy = static_cast<uint16_t>(visitWord.load(std::memory_order_relaxed) >> VisitBits);
+        uint32_t bits   = (static_cast<uint32_t>(policy) << 12) | (3 << 28);
         float    p;  // TODO: change to std::bit_cast in C++20
         std::memcpy(&p, &bits, sizeof(uint32_t));
         return p;
     }
 
     /// Get the number of edge visits of this edge.
-    uint32_t getVisits() const { return edgeVisits.load(std::memory_order_acquire); }
+    uint64_t getVisits() const { return visitWord.load(std::memory_order_acquire) & VisitMask; }
 
     /// Increment the number of edge visits by delta atomically.
     /// @param delta The number of edge visits to change.
-    /// @return The number of edge visits after change.
-    uint32_t addVisits(uint32_t delta)
+    /// @return The number of edge visits before the change.
+    uint64_t addVisits(uint64_t delta)
     {
-        return edgeVisits.fetch_add(delta, std::memory_order_acq_rel);
+        return visitWord.fetch_add(delta, std::memory_order_acq_rel) & VisitMask;
     }
 
     /// Get the child node of this edge.
     /// @note when `getVisits() > 0`, the child node should be guaranteed to be non-null.
-    Node *getChild() const { return child.load(std::memory_order_acquire); }
+    Node *getChild() const
+    {
+        uint64_t word = childWord.load(std::memory_order_acquire);
+        return reinterpret_cast<Node *>(static_cast<uintptr_t>(word & PointerMask));
+    }
 
-    /// Set the child node of this edge.
-    void setChild(Node *node) { child.store(node, std::memory_order_release); }
+    /// Set the child node of this edge, keeping the move bits.
+    /// Concurrent callers store the same pointer (one node per hash in the node table).
+    void setChild(Node *node)
+    {
+        uint64_t ptr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(node));
+        if (ptr & ~PointerMask)
+            pointerTooWide(node);
+        uint64_t moveBits = childWord.load(std::memory_order_relaxed) & ~PointerMask;
+        childWord.store(moveBits | ptr, std::memory_order_release);
+    }
+
+    /// Number of low bits of the visit word that hold the visit count.
+    static constexpr int      VisitBits = 48;
+    static constexpr uint64_t VisitMask = (uint64_t(1) << VisitBits) - 1;
+    /// Number of low bits of the child word that hold the child pointer.
+    static constexpr int      PointerBits = 48;
+    static constexpr uint64_t PointerMask = (uint64_t(1) << PointerBits) - 1;
 
 private:
-    /// Move of this edge in respect to the current side to move.
-    Pos move;
+    /// Converts a float32 policy in [0, 1] to a quantized 16bit policy.
+    /// Constructor-only: after the edge array is published, other threads fetch_add the word
+    /// that holds the policy bits.
+    /// @see
+    /// https://github.com/LeelaChessZero/lc0/blob/51f93b7c49720ee100d24aac54193a88ba98219a/src/mcts/node.cc#L130-L167
+    static uint16_t quantizePolicy(float p)
+    {
+        assert(0.0f <= p && p <= 1.0f);
+        constexpr int32_t roundings = (1 << 11) - (3 << 28);
+        int32_t           bits;  // TODO: change to std::bit_cast in C++20
+        std::memcpy(&bits, &p, sizeof(float));
+        bits += roundings;
+        return (bits < 0) ? 0 : static_cast<uint16_t>(bits >> 12);
+    }
 
-    /// quantized and compressed 16bit policy value
-    uint16_t policy;
+    /// Logs and aborts: the node pointer does not fit in 48 bits (see the SEARCH-08 audit).
+    [[noreturn]] static void pointerTooWide(const Node *node);
 
-    /// Number of finished visits of this edge.
-    std::atomic<uint32_t> edgeVisits;
+    /// Edge visits (bits 0..47) and quantized policy (bits 48..63).
+    std::atomic<uint64_t> visitWord;
 
-    /// Pointer to the child node.
-    std::atomic<Node *> child;
+    /// Child node pointer (bits 0..47) and move (bits 48..63).
+    std::atomic<uint64_t> childWord;
 };
+
+static_assert(sizeof(Edge) == 16, "Edge must stay 16 bytes (edge-array memory budget, SEARCH-08)");
 
 /// Represents an allocated array of edges.
 struct alignas(alignof(Edge)) EdgeArray

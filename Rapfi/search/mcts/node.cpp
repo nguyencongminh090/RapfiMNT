@@ -18,10 +18,12 @@
 
 #include "node.h"
 
+#include "../../core/iohelper.h"
 #include "../../eval/scoretables.h"
 #include "nodetable.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <type_traits>
 
 namespace Search::MCTS {
@@ -34,6 +36,13 @@ namespace {
 using EdgeArrayAlloc = std::aligned_storage_t<sizeof(EdgeArray), alignof(EdgeArray)>;
 
 }  // namespace
+
+void Edge::pointerTooWide(const Node *node)
+{
+    ERRORL("MCTS: node pointer " << static_cast<const void *>(node)
+                                 << " does not fit in 48 bits; packed Edge cannot store it.");
+    std::abort();
+}
 
 Node::Node(HashKey hash, uint32_t age)
     : hash(hash)
