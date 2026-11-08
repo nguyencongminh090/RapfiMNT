@@ -16,6 +16,11 @@ Code, identifiers, commit messages and docs stay in English; only the conversati
 ## Build and test
 
 - Configure with a preset from `CMakePresets.json` (e.g. `x64-clang-Native`), build with Ninja. Engine binary: `pbrain-rapfi`.
+- **Release builds always use preset `x64-clang-AVX512VNNI` with PGO**: run
+  `scripts/pgo_build.sh x64-clang-AVX512VNNI` (instrument, train on `BENCH`, rebuild with the
+  profile + LTO). Output: `build/x64-clang-AVX512VNNI-pgo-use/pbrain-rapfi`. The profile is tied to
+  the exact sources and compiler, so re-run after any source change. Never hand-build a release in
+  `build/` with the default compiler. Plain `ninja` in that directory is only for quick compile checks.
 - Unit tests: configure with `-DBUILD_TESTS=ON`; target `rapfi_tests` (sources in `tests/`:
   `generateRootMoves`, `analyzeMoves`, `simd_linear`, `vcn`, `movesort`, `razor`), run via `ctest` or `./rapfi_tests`.
   `-UNDEBUG` is forced on this target so asserts are live; never do that to the `rapfi` target.

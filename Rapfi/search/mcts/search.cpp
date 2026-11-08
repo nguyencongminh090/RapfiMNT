@@ -1055,6 +1055,10 @@ void MCTSSearcher::clear(SearchEngine &pool, bool clearAllMemory)
     pool.waitForIdle();
     graphMemoryUsed.store(0, std::memory_order_relaxed);
 
+    // The shared VCF TT is also search state: clear it so YXHASHCLEAR and
+    // YXSHOWHASHUSAGE (which reports TT) agree. Threads are idle here.
+    TT.clear();
+
     // Reset node table num shards if needed
     if (nodeTable->getNumShards() != SearchCfg.numNodeTableShardsPowerOfTwo)
         nodeTable = std::make_unique<NodeTable>(SearchCfg.numNodeTableShardsPowerOfTwo);
