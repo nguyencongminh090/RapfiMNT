@@ -141,9 +141,9 @@ uint32_t selectEdgeCount(const float *policy, uint32_t numMoves, float massKeep,
 
 /// Whether a leaf that has been visited `visits` times may be expanded.
 /// A non-positive minVisits means no delay.
-inline bool readyToExpand(uint32_t visits, int minVisits)
+inline bool readyToExpand(uint64_t visits, int minVisits)
 {
-    return minVisits <= 1 || visits >= static_cast<uint32_t>(minVisits);
+    return minVisits <= 1 || visits >= static_cast<uint64_t>(minVisits);
 }
 
 /// Represents the value bound of a node.
@@ -253,7 +253,7 @@ public:
     float getD() const { return d.load(std::memory_order_relaxed); }
 
     /// Returns the total visits of this node.
-    uint32_t getVisits() const { return n.load(std::memory_order_acquire); }
+    uint64_t getVisits() const { return visitWord.load(std::memory_order_acquire) & VisitMask; }
 
     /// Returns the total virtual visits of this node.
     uint32_t getVirtualVisits() const { return nVirtual.load(std::memory_order_acquire); }
@@ -271,7 +271,10 @@ public:
     ValueBound getBound() const { return bound.load(std::memory_order_relaxed); }
 
     /// Returns if this node is terminal.
-    bool isTerminal() const { return terminalValue.load(std::memory_order_relaxed) != VALUE_NONE; }
+    bool isTerminal() const
+    {
+        return wordTerminalValue(visitWord.load(std::memory_order_relaxed)) != VALUE_NONE;
+    }
 
     /// Update the average utility and the average draw rate from childrens.
     /// @param board The corresponding board of this node.
@@ -288,25 +291,48 @@ public:
     void finishVisit(uint32_t newVisits, uint32_t actualNewVisits)
     {
         if (actualNewVisits)
-            n.fetch_add(actualNewVisits, std::memory_order_acq_rel);
+            visitWord.fetch_add(actualNewVisits, std::memory_order_acq_rel);
         nVirtual.fetch_add(-newVisits, std::memory_order_release);
     }
 
     /// Directly increment the total visits of this node by delta.
     /// Usually used for visiting a terminal node.
-    void incrementVisits(uint32_t delta) { n.fetch_add(delta, std::memory_order_acq_rel); }
+    void incrementVisits(uint64_t delta)
+    {
+        visitWord.fetch_add(delta, std::memory_order_acq_rel);
+    }
+
+    /// Number of low bits of the visit word that hold the visit count (SEARCH-08).
+    static constexpr int      VisitBits = 48;
+    static constexpr uint64_t VisitMask = (uint64_t(1) << VisitBits) - 1;
 
 private:
+    /// The terminal-value tag (bits 48..63) of a visit word.
+    static uint64_t terminalTag(Value value)
+    {
+        return uint64_t(static_cast<uint16_t>(static_cast<Eval>(value))) << VisitBits;
+    }
+    /// The terminal value stored in a visit word (VALUE_NONE for a non-terminal node).
+    static Value wordTerminalValue(uint64_t word)
+    {
+        return static_cast<Value>(static_cast<Eval>(static_cast<uint16_t>(word >> VisitBits)));
+    }
+
     /// The graph hash of this node.
     const HashKey hash;
 
     /// The edge array of this node, edges are sorted by normalized policy.
     std::atomic<EdgeArray *> edges;
 
-    /// Total visits under this node's subgraph.
+    /// Bits 0..47: total visits under this node's subgraph.
     /// For leaf node, this indicates if the node's value has been evaluated.
     /// For non-leaf node, this is the sum of all children's edge visits plus 1.
-    std::atomic<uint32_t> n;
+    /// Bits 48..63: for terminal node, the theoretical value (from current side to move),
+    /// including the game ply to mate/mated; VALUE_NONE (as int16) for a non-terminal node.
+    /// After the node has been published, the tag transitions at most once from VALUE_NONE to a
+    /// terminal value (see tryMarkTerminal()). Sharing one word keeps sizeof(Node) at 56 bytes
+    /// (SEARCH-08). Visits never carry into the tag: the search stops at SearchVisitGuard (2^46).
+    std::atomic<uint64_t> visitWord;
 
     /// Total started but not finished visits under this node's subgraph,
     /// mainly for computing virtual loss when multi-threading is used.
@@ -339,14 +365,10 @@ private:
     /// and bound) derived from the given terminal value. Does not touch the
     /// visit count or terminalValue itself.
     void writeTerminalStats(Value value);
-
-    /// For terminal node, this stores the theoretical value (from current
-    /// side to move), including the game ply to mate/mated. If this node is
-    /// not a terminal node, this value is VALUE_NONE. After the node has
-    /// been published, it transitions at most once from VALUE_NONE to a
-    /// terminal value (see tryMarkTerminal()).
-    std::atomic<Eval> terminalValue;
 };
+
+static_assert(sizeof(void *) != 8 || sizeof(Node) == 56,
+              "Node must stay 56 bytes on 64-bit targets (std::set node size class, SEARCH-08)");
 
 /// Estimated heap footprint in bytes of one node stored in the node table.
 inline size_t nodeFootprint()

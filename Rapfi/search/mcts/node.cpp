@@ -38,14 +38,13 @@ using EdgeArrayAlloc = std::aligned_storage_t<sizeof(EdgeArray), alignof(EdgeArr
 Node::Node(HashKey hash, uint32_t age)
     : hash(hash)
     , edges(nullptr)
-    , n(0)
+    , visitWord(terminalTag(VALUE_NONE))
     , nVirtual(0)
     , q(1.0f)  // Default as a losing node for the parent's side of view
     , qSqr(1.0f)
     , d(0.0f)
     , age(age)
     , bound()
-    , terminalValue(static_cast<Eval>(VALUE_NONE))
 {}
 
 Node::~Node()
@@ -86,9 +85,8 @@ void Node::setTerminal(Value value)
     // This publication path is reserved for the single evaluating thread:
     // other threads discard their visits until the release store below.
     assert(getVisits() == 0);
-    terminalValue.store(static_cast<Eval>(value), std::memory_order_relaxed);
     writeTerminalStats(value);
-    n.store(1, std::memory_order_release);
+    visitWord.store(terminalTag(value) | 1, std::memory_order_release);
 }
 
 bool Node::tryMarkTerminal(Value value)
@@ -103,11 +101,15 @@ bool Node::tryMarkTerminal(Value value)
     // by concurrent playouts are preserved (a reader may transiently observe
     // a terminal node whose mean stats still hold the evaluated values; the
     // parent's next updateStats() recomputes from the terminal stats).
-    Eval expected = static_cast<Eval>(VALUE_NONE);
-    if (!terminalValue.compare_exchange_strong(expected,
-                                               static_cast<Eval>(value),
-                                               std::memory_order_relaxed))
-        return false;
+    // The tag shares its word with the visit count, so a concurrent fetch_add can make the CAS
+    // fail; retry until the tag is seen as already set or the claim succeeds.
+    uint64_t word = visitWord.load(std::memory_order_relaxed);
+    do {
+        if (wordTerminalValue(word) != VALUE_NONE)
+            return false;
+    } while (!visitWord.compare_exchange_weak(word,
+                                              (word & VisitMask) | terminalTag(value),
+                                              std::memory_order_relaxed));
 
     writeTerminalStats(value);
     return true;
@@ -120,12 +122,10 @@ void Node::setNonTerminal(float utility, float drawRate)
 
     this->utility  = utility;
     this->drawRate = drawRate;
-    terminalValue.store(static_cast<Eval>(VALUE_NONE), std::memory_order_relaxed);
-
     q.store(utility, std::memory_order_relaxed);
     qSqr.store(utility * utility, std::memory_order_relaxed);
     d.store(drawRate, std::memory_order_relaxed);
-    n.store(1, std::memory_order_release);
+    visitWord.store(terminalTag(VALUE_NONE) | 1, std::memory_order_release);
 }
 
 uint32_t selectEdgeCount(const float *policy, uint32_t numMoves, float massKeep, uint32_t minEdges)
@@ -208,7 +208,7 @@ bool Node::createEdgesFrom(const Pos          *moveList,
 
 float Node::getQVar(float priorVar, float priorWeight) const
 {
-    uint32_t visits = n.load(std::memory_order_relaxed);
+    uint64_t visits = visitWord.load(std::memory_order_relaxed) & VisitMask;
     if (visits < 2)
         return priorVar;
 
@@ -236,14 +236,14 @@ void Node::updateStats()
     if (!edgeArray)
         return;
 
-    uint32_t   nSum     = 1;
+    uint64_t   nSum     = 1;
     float      qSum     = utility;
     float      qSqrSum  = utility * utility;
     float      dSum     = drawRate;
     ValueBound maxBound = ValueBound {-VALUE_INFINITE};
     for (uint32_t i = 0; i < edgeArray->numEdges; i++) {
         const Edge &edge   = (*edgeArray)[i];
-        uint32_t    childN = edge.getVisits();
+        uint64_t    childN = edge.getVisits();
 
         // No need to read from child node if it has zero edge visits
         if (childN == 0) {

@@ -236,7 +236,7 @@ Value vcfdefend(Board &board, SearchStack *ss, int ply, Value alpha, Value beta,
 namespace {
 
 /// Compute the Cpuct exploration factor for the given parent node visits.
-inline float cpuctExplorationFactor(uint32_t parentVisits)
+inline float cpuctExplorationFactor(uint64_t parentVisits)
 {
     float cpuct = CpuctExploration;
     if (CpuctExplorationLog != 0)
@@ -263,7 +263,7 @@ inline float puctSelectionValue(float    childUtility,
                                 float    childDraw,
                                 float    parentDraw,
                                 float    childPolicy,
-                                uint32_t childVisits,
+                                uint64_t childVisits,
                                 uint32_t childVirtualVisits,
                                 float    cpuctExploration)
 {
@@ -314,7 +314,7 @@ std::pair<Edge *, Node *> selectChild(Node &node, const Board &board, bool graph
     assert(!node.isLeaf());
     SearchThread *thisThread = board.thisThread();
 
-    uint32_t parentVisits     = node.getVisits();
+    uint64_t parentVisits     = node.getVisits();
     float    parentDraw       = node.getD();
     float    cpuctExploration = cpuctExplorationFactor(parentVisits);
 
@@ -357,7 +357,7 @@ std::pair<Edge *, Node *> selectChild(Node &node, const Board &board, bool graph
         exploredPolicySum += childPolicy;
 
         // Compute selection value and update the best selection value
-        uint32_t childVisits        = childEdge.getVisits();
+        uint64_t childVisits        = childEdge.getVisits();
         uint32_t childVirtualVisits = childNode->getVirtualVisits();
         float    childUtility       = -childNode->getQ();
         float    childDraw          = childNode->getD();
@@ -383,7 +383,7 @@ std::pair<Edge *, Node *> selectChild(Node &node, const Board &board, bool graph
 
         Edge    &childEdge          = edges[edgeIndex];
         float    childPolicy        = childEdge.getP();
-        uint32_t childVisits        = 0;  // Unexplored edge must has zero edge visit
+        uint64_t childVisits        = 0;  // Unexplored edge must has zero edge visit
         uint32_t childVirtualVisits = 0;  // Unexplored edge must has zero virtual visit
         float    selectionValue     = puctSelectionValue(fpuUtility,
                                                   parentDraw,
@@ -521,7 +521,7 @@ uint32_t searchNode(Node &node, Board &board, int ply, uint32_t newVisits)
     MCTSSearcher  &searcher   = static_cast<MCTSSearcher &>(*thisThread->engine.searcher());
 
     // Discard visits in this node if it is unevaluated
-    uint32_t parentVisits = node.getVisits();
+    uint64_t parentVisits = node.getVisits();
     if (parentVisits == 0)
         return 0;
 
@@ -529,7 +529,9 @@ uint32_t searchNode(Node &node, Board &board, int ply, uint32_t newVisits)
         thisThread->selDepth = 0;
 
     // Cap new visits so that we dont do too much at one time
-    newVisits = std::min(newVisits, uint32_t(parentVisits * MaxNewVisitsProp) + 1);
+    // The float-to-integer conversion only happens below newVisits, so it never overflows.
+    if (float visitsCap = parentVisits * MaxNewVisitsProp; visitsCap < float(newVisits))
+        newVisits = std::min(newVisits, uint32_t(visitsCap) + 1);
 
     // Return directly if this node is a terminal node and not at root
     if (!Root && node.isTerminal()) {
@@ -618,8 +620,8 @@ uint32_t searchNode(Node &node, Board &board, int ply, uint32_t newVisits)
             // visited more times than the parent node. Only continue the playout if the
             // child node has been visited less times than the edge visits, or the absolute
             // child node visits is less than the given threshold.
-            uint32_t childEdgeVisits = childEdge->getVisits();
-            uint32_t childNodeVisits = childNode->getVisits();
+            uint64_t childEdgeVisits = childEdge->getVisits();
+            uint64_t childNodeVisits = childNode->getVisits();
             if (childEdgeVisits >= childNodeVisits
                 || childNodeVisits < MinTranspositionSkipVisits) {
                 node.beginVisit(newVisits);
@@ -691,7 +693,7 @@ std::tuple<int, float, ValueBound> computeSelectionValues(const Node            
         // child pointer is published before its first visit completes), so
         // zero node visits is a legal transient state here; the edge-visit
         // guard below keeps such children out of the visit weighting.
-        uint32_t childVisits = childEdge.getVisits();
+        uint64_t childVisits = childEdge.getVisits();
         // Skip zero visits children
         if (childVisits > 0) {
             // Discount the child visits by 1 and add small weight on raw policy
@@ -741,7 +743,7 @@ int applyLCBSelection(const Node                  &node,
         float utilityMean = -childNode->getQ();
 
         // Only compute LCB for children with enough visits
-        uint32_t childVisits = childNode->getVisits();
+        uint64_t childVisits = childNode->getVisits();
         if (childVisits < 2) {
             lcbValues.push_back(utilityMean - 1e5f);
             lcbRadius.push_back(1e4f);
