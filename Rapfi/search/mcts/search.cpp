@@ -26,6 +26,7 @@
 #include "../searchconfig.h"
 #include "parameter.h"
 #include "searcher.h"
+#include "searchtesting.h"
 
 #include <algorithm>
 #include <limits>
@@ -988,6 +989,28 @@ void recursiveApply(Node &node, std::function<void(Node &)> *f, PRNG *prng, uint
 }
 
 }  // namespace
+
+float Search::MCTS::Testing::cpuctExplorationFactor(uint64_t parentVisits)
+{
+    return ::cpuctExplorationFactor(parentVisits);
+}
+
+float Search::MCTS::Testing::puctSelectionValue(float    childUtility,
+                                                float    childDraw,
+                                                float    parentDraw,
+                                                float    childPolicy,
+                                                uint64_t childVisits,
+                                                uint32_t childVirtualVisits,
+                                                float    cpuctExploration)
+{
+    return ::puctSelectionValue(childUtility,
+                                childDraw,
+                                parentDraw,
+                                childPolicy,
+                                childVisits,
+                                childVirtualVisits,
+                                cpuctExploration);
+}
 
 MCTSSearcher::MCTSSearcher() : Searcher(false)
 {

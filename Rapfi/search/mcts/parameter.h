@@ -41,6 +41,11 @@ constexpr float FpuUtilityBlendPow  = 0.75f;
 
 constexpr uint32_t MinTranspositionSkipVisits = 11;
 
+/// Root visit count at which the MCTS search stops (SEARCH-08). Visit counters keep 48 bits in a
+/// packed word whose top 16 bits hold the policy (Edge) or the terminal value (Node), so this
+/// guard stays far below 2^48 (about 136 days at 6M visits/s).
+constexpr uint64_t SearchVisitGuard = uint64_t(1) << 46;
+
 constexpr bool  UseLCBForBestmoveSelection = true;
 constexpr float LCBStdevs                  = 6.28f;
 constexpr float LCBMinVisitProp            = 0.1f;

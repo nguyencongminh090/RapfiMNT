@@ -327,6 +327,7 @@ set(HEADERS
     search/mcts/node.h
     search/mcts/nodetable.h
     search/mcts/searcher.h
+    search/mcts/searchtesting.h
     search/mcts/parameter.h
 
     config.h
@@ -701,6 +702,7 @@ if(BUILD_TESTS AND NOT EMSCRIPTEN)
         tests/movesort_tests.cpp
         tests/razor_tests.cpp
         tests/mcts_memory_tests.cpp
+        tests/mcts_visits_tests.cpp
     )
 
     add_executable(rapfi_tests ${TEST_ENGINE_SOURCES} ${TEST_DRIVER_SOURCES} ${HEADERS})
