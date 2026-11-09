@@ -1,6 +1,6 @@
 # CMD-01 — Engine stalls without sending a best move under a pipe harness
 
-**Status:** in progress (recorded 2026-11-09; resumed 2026-11-09 with reduced scope, see below). Seen during PERF-04 phase 2 verification.
+**Status:** done 2026-11-09 (reduced scope approved by the user, see below; results at the end). Seen during PERF-04 phase 2 verification.
 **Progress (paused 2026-11-09):** branch `cmd-01-stall` (from `fe37c22`), still active, no code
 changed. Done: read the evidence. No reproduction has been run yet (0 stress runs, so no stall
 count and no power-state record of our own; the PERF-04 run recorded PL1 24 W). The RelWithDebInfo
@@ -26,8 +26,7 @@ per board and saves gdb `thread apply all bt`, `/proc/<pid>/fd` and the output t
 line was received and the next `BOARD` got no reply (look for `ERROR Unknown command: DONE`-style
 lines). Then write the test list and fix the ordering at the protocol layer.
 
-**Class:** C provisional. Reclassify once the root cause is known: a race in the search threads or
-in the search's start/stop signalling makes it B.
+**Class:** C (confirmed 2026-11-09: protocol layer, no search signalling change).
 
 ## Problem
 
@@ -148,3 +147,50 @@ already false it returns at once and the test thread's `runProtocol()` waits on 
 - `rapfi_tests` pass with asserts live. Run TSan on the stress reproduction if the fix touches
   thread signalling.
 - Bench `17621937 / 8c1f72e5` unchanged (the fix should not move search output).
+
+## Results (2026-11-09)
+
+Commits on `cmd-01-stall`: `5fee9c0` (test), `6bd2f8f` (fix), `56edd73` (CMD-02 follow-up docs).
+Artefacts: `build/cmd01/` (`base/pbrain-base-feed573` = HEAD code before the fix, RelWithDebInfo
+gcc 15.2 AVX512/VNNI; `fixed/pbrain-fixed` same config with the fix; `stress.py`,
+`run_matrix.sh`, results in `m1/` and `ts/`).
+
+**Failing test first.** On HEAD source (fix not applied): `test_runProtocol_commandWhileThinking_isDropped`
+passes (existing contract); `test_think_moveFlushedToClient_thinkingAlreadyCleared` aborts at
+`assert(!sink.thinkingAtFirstMove())` (`build/cmd01/test_head_failfirst.log`);
+`test_runProtocol_boardSentRightAfterMove_isProcessed` (run alone, order swapped temporarily)
+aborts at `assert(l.find("Unknown command") == npos)`, i.e. the reply `BOARD` was dropped and its
+position lines became unknown commands (`test_head_failfirst_t2.log`). With the fix: all three
+pass; full suite **241/241** (`test_fixed.log`); `rapfi_tests --check-asserts-live` aborts on the
+sentinel assert, so asserts are live.
+
+**Short targeted stress** (`run_matrix.sh m1 90 6 4 2000 5`): per config 6 concurrent engines,
+4 `yes` CPU hogs, 90 s per engine, `MAX_NODE 2000`, Standard 15x15, per-board timeout 5 s, client
+sends the next `BOARD ... DONE` as soon as it reads the move line. PL1 24 W / PL2 51 W during all
+runs (`/sys/class/powercap/intel-rapl:0`, throttled state). Every base stall had `ERROR Unknown
+command` lines in the output tail (the drop fingerprint).
+
+| Searcher, threads | Base boards / stalls | Fixed boards / stalls |
+|---|---|---|
+| AB 1T | 2095 / 102 | 40159 / 0 |
+| AB 8T | 809 / 104 | 33159 / 0 |
+| MCTS 1T | 2747 / 85 | 8591 / 0 |
+| MCTS 8T | 4228 / 78 | 6757 / 0 |
+
+Base stall counts are capped by the run length (each stall costs the 5 s timeout plus an engine
+restart); the base binary stalls within the first few boards of nearly every engine start.
+
+**TSan** (`build/cmd01/tsan`, gcc `-fsanitize=thread`, RelWithDebInfo, fixed source): same stress,
+2 engines per config (AB/MCTS x 1T/8T, 8 at once) plus 2 CPU hogs, 90 s, per-board timeout 60 s,
+PL1 24 W: 0 stalls (361 boards). No report touches `command/gomocup.cpp`, `thinking`,
+`protocolMutex` or the callback. 1T engines: 0 reports. 8T engines: reports only in the
+shared transposition table (`search/hashtable.cpp` `probe`/`store`/`TTEntry::key`, the racy
+lock-free TT by design, outside this change); every reported access frame `#0` is in
+`hashtable.cpp`.
+
+**Bench** (`build/cmd01/rel`, gcc 15.2 Release AVX512/VNNI, fixed source, built-in config):
+Nodes `17621937`, Hash `8c1f72e5`, unchanged.
+
+**Not done (reduced scope):** no multi-hour stress and no gdb backtraces of stalled processes
+(replaced by the deterministic test and the stall fingerprint, see the deviation above). No
+fix-log entry: this is the first fix and it is at the producing layer.
