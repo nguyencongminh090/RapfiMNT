@@ -1468,11 +1468,17 @@ constexpr uint64_t ProtocolNodes = 20000;
 
 /// The NORMAL message mode for one test (the mode a GUI gets: setGUIMode turns BRIEF into NORMAL).
 /// MCTS prints its root-move lines in NORMAL / UCILIKE only; the built-in default is BRIEF.
-struct ScopedNormalMessages
+/// A message mode (BRIEF / NORMAL / UCILIKE) for one test; the previous mode is restored on exit.
+struct ScopedMessageMode
 {
     MsgMode saved = Config::GeneralCfg.messageMode;
-    ScopedNormalMessages() { Config::GeneralCfg.messageMode = MsgMode::NORMAL; }
-    ~ScopedNormalMessages() { Config::GeneralCfg.messageMode = saved; }
+    explicit ScopedMessageMode(MsgMode mode) { Config::GeneralCfg.messageMode = mode; }
+    ~ScopedMessageMode() { Config::GeneralCfg.messageMode = saved; }
+};
+
+struct ScopedNormalMessages : ScopedMessageMode
+{
+    ScopedNormalMessages() : ScopedMessageMode(MsgMode::NORMAL) {}
 };
 
 void yxvcn_mctsSearcher_runsVcnSearchAndRestoresLevel()
@@ -1759,6 +1765,157 @@ void mctsSearch_rootOpponentFive_assertBuild_completesWithBlockMove()
 }
 
 // ----------------------------------------------------------------------------------------------
+// SEARCH-13: the MCTS singular-root stop must not end a VCN search at a forced root
+
+/// VCN-03 slice 5 Part C position P4 (tests/vcn_measure.sh): white has a four on x = 12, black's
+/// only legal move is the block at (12,9), which is not itself a four. Black to move.
+std::vector<Pos> forcedBlockWithoutFourMoves()
+{
+    return alternateMoves({Pos(3, 7), Pos(4, 7), Pos(5, 7), Pos(12, 14), Pos(0, 0)},
+                          {Pos(12, 10), Pos(12, 11), Pos(12, 12), Pos(12, 13), Pos(14, 0)});
+}
+
+void mctsVcn_vc3_forcedRootMoveWithNodeBudget_searchesPastSingularLimit()
+{
+    // Arrange: a forced root (one root move), VC3, a fixed budget far above the singular-root
+    // stop (numNodesAfterSingularRoot = 100, checked after each playout batch of up to 100 visits).
+    MctsEngineFixture fx;
+    auto              board = plainBoard(FREESTYLE, forcedBlockWithoutFourMoves());
+    assert(board->p4Count(WHITE, A_FIVE));
+    const uint64_t maxNodes = 20000;
+    SearchOptions  opts     = searchOptions(*board, maxNodes, VCNLevel::VC3);
+    assert(opts.vcnMode.enabled());
+
+    // Act
+    runMctsSearch(*board, opts);
+
+    // Assert: the root really is forced, and the search was not cut off by the singular-root stop
+    assert(Search::Engine.main()->rootMoves.size() == 1);
+    uint64_t nodes = Search::Engine.nodesSearched();
+    std::printf("  forced-root VC3 nodes searched: %llu\n", (unsigned long long)nodes);
+    std::fflush(stdout);
+    assert(nodes > uint64_t(SearchCfg.numNodesAfterSingularRoot + SearchCfg.maxNumVisitsPerPlayout));
+}
+
+void mctsSearch_vcnOff_singularRoot_stopsAfterNumNodesAfterSingularRoot()
+{
+    // Arrange: the same forced root with VCN off; the budget is far above the stop
+    MctsEngineFixture fx;
+    ScopedSearchCfg   cfg;
+    auto              board = plainBoard(FREESTYLE, forcedBlockWithoutFourMoves());
+    SearchOptions     opts  = searchOptions(*board, 20000, VCNLevel::None);
+    assert(!opts.vcnMode.enabled());
+
+    // Act
+    runMctsSearch(*board, opts);
+
+    // Assert: forced root, stopped right after the singular-root node count (current behaviour)
+    assert(Search::Engine.main()->rootMoves.size() == 1);
+    uint64_t nodes = Search::Engine.nodesSearched();
+    assert(nodes >= uint64_t(SearchCfg.numNodesAfterSingularRoot));
+    assert(nodes <= uint64_t(SearchCfg.numNodesAfterSingularRoot + SearchCfg.maxNumVisitsPerPlayout));
+}
+
+// ----------------------------------------------------------------------------------------------
+// SEARCH-14: MCTS prints one end-of-search result line in BRIEF (AB's words, no Depth)
+
+/// One fixed-node MCTS search on the quiet position (VCN off); returns everything it printed.
+std::string runMctsSearchCaptured(uint64_t maxNodes)
+{
+    auto          board = plainBoard(FREESTYLE, quietMoves());
+    SearchOptions opts  = searchOptions(*board, maxNodes, VCNLevel::None);
+    ScopedCoutCapture cap;
+    Search::Engine.startThinking(*board, opts);
+    Search::Engine.waitForIdle();
+    return cap.str();
+}
+
+std::vector<std::string> splitLines(const std::string &text)
+{
+    std::vector<std::string> lines;
+    std::istringstream       iss(text);
+    for (std::string line; std::getline(iss, line);)
+        lines.push_back(line);
+    return lines;
+}
+
+size_t countLinesStartingWith(const std::vector<std::string> &lines, const std::string &prefix)
+{
+    return size_t(std::count_if(lines.begin(), lines.end(), [&](const std::string &l) {
+        return l.compare(0, prefix.size(), prefix) == 0;
+    }));
+}
+
+void mctsSearch_briefMode_printsResultLineLikeAb()
+{
+    // Arrange: BRIEF, the built-in default mode
+    ScopedMessageMode messages(MsgMode::BRIEF);
+    MctsEngineFixture fx;
+
+    // Act
+    std::string out   = runMctsSearchCaptured(2000);
+    auto        lines = splitLines(out);
+
+    // Assert: one "Speed … | Eval … | Node … | Time …" line (no Depth: MCTS has no iteration
+    // depth) and one "Bestline" line that starts with the best move
+    assert(!Search::Engine.main()->rootMoves.empty());
+    const auto &rm = Search::Engine.main()->rootMoves[0];
+    assert(countLinesStartingWith(lines, "MESSAGE Speed ") == 1);
+    for (const auto &l : lines) {
+        if (l.compare(0, 14, "MESSAGE Speed ") != 0)
+            continue;
+        assert(l.find(" | Eval " + std::to_string(int(rm.value)) + " | Node ") != std::string::npos);
+        assert(l.find(" | Time ") != std::string::npos);
+        assert(l.find("Depth") == std::string::npos);
+    }
+    assert(countLinesStartingWith(lines, "MESSAGE Bestline ") == 1);
+    assert(out.find("MESSAGE Bestline " + movesText({rm.pv[0]})) != std::string::npos);
+    assert(out.find("MESSAGE Bestline " + movesText(rm.pv) + "\n") != std::string::npos);
+    // the result lines are the last output of the search, after the final root-move update
+    assert(lines.size() >= 2 && lines[lines.size() - 2].compare(0, 14, "MESSAGE Speed ") == 0);
+}
+
+void mctsSearch_normalMode_outputUnchanged()
+{
+    // Arrange: NORMAL, the mode a GUI gets
+    ScopedMessageMode messages(MsgMode::NORMAL);
+    MctsEngineFixture fx;
+
+    // Act
+    auto lines = splitLines(runMctsSearchCaptured(2000));
+
+    // Assert: no BRIEF result lines; the root-move lines and the final "Speed … | Visit" stay
+    assert(countLinesStartingWith(lines, "MESSAGE Bestline ") == 0);
+    for (const auto &l : lines)
+        assert(!(l.compare(0, 14, "MESSAGE Speed ") == 0 && l.find(" | Eval ") != std::string::npos));
+    assert(countLinesStartingWith(lines, "MESSAGE (1) ") >= 1);
+    assert(countLinesStartingWith(lines, "MESSAGE Speed ") >= 1);
+    bool hasVisit = false;
+    for (const auto &l : lines)
+        hasVisit |= l.compare(0, 14, "MESSAGE Speed ") == 0 && l.find(" | Visit ") != std::string::npos;
+    assert(hasVisit);
+}
+
+void abSearch_briefMode_outputUnchanged()
+{
+    // Arrange: alpha-beta (the default searcher), BRIEF, a fixed-depth YXVCN query
+    ScopedMessageMode messages(MsgMode::BRIEF);
+    resetProtocolForMcts(quietMoves(), 0);
+
+    // Act
+    auto lines = splitLines(runYxvcnCaptured(3));
+
+    // Assert: one "Speed … | Depth …" line and one "Bestline" line, as before SEARCH-14
+    assert(countLinesStartingWith(lines, "MESSAGE Speed ") == 1);
+    for (const auto &l : lines)
+        if (l.compare(0, 14, "MESSAGE Speed ") == 0) {
+            assert(l.find(" | Depth ") != std::string::npos);
+            assert(l.find(" | Eval ") != std::string::npos);
+        }
+    assert(countLinesStartingWith(lines, "MESSAGE Bestline ") == 1);
+}
+
+// ----------------------------------------------------------------------------------------------
 
 bool isolateMode()
 {
@@ -1876,4 +2033,13 @@ void runMctsVcnTests()
     RUN_PURE_TEST(movePickerRoot_ownFlexFour_normalizedPolicy_hasPolicyScore);
     RUN_ENGINE_TEST(movePickerRoot_opponentFlexFour_normalizedPolicy_hasPolicyScore);
     RUN_ENGINE_TEST(mctsSearch_rootOpponentFive_assertBuild_completesWithBlockMove);
+
+    // SEARCH-13: singular-root stop under VCN
+    RUN_ENGINE_TEST(mctsVcn_vc3_forcedRootMoveWithNodeBudget_searchesPastSingularLimit);
+    RUN_ENGINE_TEST(mctsSearch_vcnOff_singularRoot_stopsAfterNumNodesAfterSingularRoot);
+
+    // SEARCH-14: MCTS result line in BRIEF
+    RUN_ENGINE_TEST(mctsSearch_briefMode_printsResultLineLikeAb);
+    RUN_ENGINE_TEST(mctsSearch_normalMode_outputUnchanged);
+    RUN_ENGINE_TEST(abSearch_briefMode_outputUnchanged);
 }
