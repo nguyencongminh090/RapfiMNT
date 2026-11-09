@@ -1,7 +1,11 @@
 # PERF-03 — MCTS node table footprint
 
 **Status:** phase 1 done 2026-11-09; user chose option (b) 2026-11-09; phase 2 implemented on
-branch `perf-03-node-table`; verification (TSan/ASan, RSS, cycles/visit, PGO) pending.
+branch `perf-03-node-table`; verified and reviewed 2026-11-09 (APPROVE WITH NITS, see the last
+section); awaiting user merge. Still open at merge: moving the `TODO.md` / `instruction.md` lines
+to `## Done` (user), and the PGO release rebuild (`scripts/pgo_build.sh x64-clang-AVX512VNNI`) on
+the merged sources. Not done: a self-play of the budget-limited behaviour change (+10 % nodes at
+closure); hard rule 9 lists self-play, the instruction's definition of done does not; user decides.
 Recorded 2026-11-07.
 **Class:** B or C, depending on the final structure (representation change inside `NodeTable`).
 
@@ -352,3 +356,118 @@ alone does not build `rapfi_tests`; the `perf:` commit makes it build.
   nodes) until `clear`. After a large recycle the real heap stays above `graphMemoryUsed` until
   new inserts refill the free list. The `std::set` table had the same effect through malloc's
   free lists.
+
+## Phase 2 verification and review (2026-11-09)
+
+Reviewed: `git diff 7ff2847..perf-03-node-table` (f9a5bd0 test, f99cb28 perf, 981724e docs).
+Raw verification report: `Rapfi/build/perf03/phase2/verify_raw.md` (files next to it, not in the
+repo). Spot-checked by the reviewer against the raw files: 228/228 in `v1_tests.txt`, 91 / 0 / 0
+TSan warnings in `v2_tsan_mcts.out.stderr` / `v2_tsan_mcts_supp.out.stderr` / `v2_tsan_loop50.txt`,
+BENCH line in `v3_bench_gcc.txt`, the eight peak-RSS lines in `v5_rss_{A,B}_*.txt`, the golden md5
+(`f3e620af`, same for `v4_golden_{gcc_1,gcc_2,pgo_1}.extract` and phase 1 `golden_gcc_1.extract`),
+and the `maxProbe=79` line in `v8_big.out.stderr`. All match.
+
+### Verification summary
+
+| Check | Result | Build |
+|---|---|---|
+| `rapfi_tests`, asserts live | 228/228 (208 before + 20 new) | gcc 15.2.0 Release |
+| TSan, whole suite | 228/228, 0 warnings | gcc 15.2.0, `-fsanitize=thread`, FORCE_ASSERTION |
+| TSan, NodeTable suite x50 (both race tests 50/50) | 1000/1000, 0 warnings | same |
+| TSan, real 8T MCTS with recycle and `YXHASHCLEAR` | 0 reports in NodeTable / `node.h` / `allocateOrFindNode`; 91 reports, all in the VCF TT (`hashtable.cpp`, not in the diff), clean with those suppressed | same |
+| ASan + UBSan, whole suite and real 8T MCTS with recycle and clear, leak check on | clean with `-fno-sanitize=enum`; with the enum check, one unrelated hit in `search/ab/search.cpp:1071` (`computeLmrReduction`, not in the diff) | gcc 15.2.0 |
+| BENCH | Nodes `17621937`, Hash `8c1f72e5` (gcc Release, PGO A and B) | gcc, clang 21.1.8 PGO |
+| Golden, 2M nodes 1T unbounded | byte-identical: gcc x2, PGO, and A | gcc, PGO |
+| Recycle game line A vs B (added by the reviewer) | 1T, `MAX_NODE 500000`, unbounded memory, positions n = 4..16, then `YXHASHCLEAR` and n = 10, 11, 12 (14 recycle passes, up to 161953 nodes recycled per pass): the final output of all 16 searches (every multipv line, exact `INFO NODES`, bestmove; time fields removed) and the `Reachable / Recycled` counts of every recycle are **byte-identical** between A and B, so each recycle removed the same node set. Files: `build/perf03/phase2/review_ab/{A,B}.y` (from `{A,B}.out` with `ext2.py`) | gcc Release, `pbrain-{A,B}-gcc` |
+| Peak RSS, 2M nodes 1T, 4 interleaved runs each | median A 184024 KiB, B 173170 KiB: -10854 KiB (-5.9 %) = 21.7 B per table node (KiB, 511683 nodes), matching 96 - 75 = 21 B | gcc 15.2.0 Release |
+| Cycles per visit, 7 interleaved pairs | B/A 0.950 at 1T (7/7 pairs lower), 0.962 at 8T (5/7 lower); instructions -0.3 %. Wall NPS not usable (PL1 24 W throttling) | clang 21.1.8 PGO + LTO |
+| Budget-limited closure (40 / 90 / 200 MB) | +10.1 .. +10.6 % nodes at first `graphClosed()`, as predicted by 104 -> 75 B/node | gcc, instrumented copies |
+| Probe length on real keys | mean 1.4 - 1.9; max 79 (4M visits, global load 0.41), 74 in the game | gcc, instrumented copy |
+| Accounting over a 13-move game | `graphMemoryUsed` == live nodes x 75 + edge footprints exactly at every step; slab pool stays at its peak (6560 slabs) after recycles, up to +11.4 MB above `graphMemoryUsed` at the end | gcc, instrumented copy |
+
+Note: ASan cannot see a use-after-recycle. Recycled node storage stays inside a live slab, so a
+stale `Node *` into a recycled node reads a valid-looking (possibly reused) node, not freed
+memory. The recycle A/B identity above is the evidence for that path, not check 2f.
+
+### Review verdict: APPROVE WITH NITS
+
+No blocking issue. Per review focus:
+
+1. **Pointer stability.** Nodes are built in place in `Slab::storage` and never moved: `rehash` and
+   `rebuildAfterErase` move only slot words; slabs are freed only in `releaseAll` (`clearShard`,
+   `~ShardData`), which runs only from `MCTSSearcher::clear` (root reset, threads idle) and on table
+   destruction. Free-list reuse only hands out storage of nodes that `recycleOldNodes` judged
+   unreachable (age != `globalNodeAge`), the same contract as the `std::set` erase. The recreation
+   of the table in `clear()` happens after every shard is cleared and threads are idle.
+2. **Concurrency.** `tryEmplaceNode` re-runs `lookup` under the unique lock before inserting, so the
+   emplace race stays exact (one winner, the loser gets the winner's pointer, `graphMemoryUsed`
+   added once in `allocateOrFindNode`). Readers hold the shared lock across the whole probe, so a
+   rehash never runs under them; publication of the slot and of the constructed node goes through
+   the mutex (no relaxed slot stores, no lock-free path). `eraseNodesIf` / `clearShard` /
+   `forEachNode` are called only through `processAllShards`, which holds the unique lock.
+3. **48-bit pointer + tag.** The slot is never 0 for a live entry (non-null pointer), so tag 0 is not
+   ambiguous with empty. The abort guard checks the end of each slab, which covers every node
+   address. Shard index = bits 0..9, home slot = bits 10.., tag = bits 48..63: disjoint while a
+   shard has fewer than 2^38 slots. Same 48-bit assumption as `Edge` (`node.h:104`), so no new
+   platform assumption (LA57 / arm64 52-bit VA need an explicit mmap hint; Android heap tagging
+   would hit the 48-bit guard in both places).
+4. **Probing / growth.** Growth when `4 (n + 1) > 3 cap` keeps load <= 3/4, so at least a quarter of
+   the slots is empty and probing terminates. Rebuild after erase sizes to the smallest power of
+   two >= 16 with load <= 3/4 (correct; see nit on churn).
+5. **Accounting.** Add once per inserted node, subtract in the predicate before `~Node` frees the
+   edge array, store 0 on clear: symmetric (exact identity in check 8). The constant 19 (75 B) is
+   the measured `mallinfo2` value at the reference shard size and is confirmed by the RSS delta.
+   **Retained slab pool (non-blocking):** freed node storage can only be reused by nodes, so the
+   real heap is bounded by `graphMemoryUsed` plus the retained free node storage, i.e. about the
+   sum over shards of (historic peak nodes - live nodes) x 56 B plus at most 31 nodes of slab slack
+   per shard. It is not strictly bounded by the budget: after a node-heavy search that closes, an
+   edge-heavy search could overshoot by up to about the earlier node share (about 1/3 of the budget
+   by check 7). Non-blocking because `graphMemoryUsed` was never a hard process cap (the 36 MB
+   baseline is excluded and the old accounting over-counted by about 4 %), consecutive searches
+   have similar node/edge splits (6560 slabs flat over 12 recycles), and the `std::set` table also
+   kept freed memory in the process. The default-budget path is conservative: retained slabs are
+   in neither `MemAvailable` nor `graphMemoryUsed`, so `deriveDefaultGraphBudget` gets smaller.
+   Follow-up below.
+6. **Probe tail 79.** Non-blocking. Seeded `mt19937_64` keys give the same tail (96 at load 0.67),
+   so the zobrist bits used by `homeIndex` are well mixed; the tail comes from linear probing in
+   shards just below the 3/4 doubling point. The walk is sequential cache lines and the mean is
+   1.4 - 1.9; cycles per visit went down.
+7. **Tests.** The pointer-stability tests would catch a move (held pointer must equal `findNode`
+   after several rehashes / slab additions); the same-hash race test fails if the `lookup`
+   re-check is removed (two threads miss, both insert, `numInserted == 2`; argued, not run as a
+   mutation); readers run concurrently with rehashes in the 4-shard race tests under TSan. Naming,
+   AAA, seeded keys, one table per test: per `docs/process/unit-tests.md`. The engine tests use
+   the global `Search::Engine` with a fixture that restores it.
+8. **Don't touch.** `Node` / `Edge` layout unchanged (only the `static_assert` comment), no change
+   to the edge-array path, `RetiredEdgeArrays`, defaults, AB, pattern or eval.
+9. **`clear()` shard-count compare.** Confirmed: `search.cpp:1364` compares `getNumShards()` (1024)
+   with `numNodeTableShardsPowerOfTwo` (10), so `clear(true)` always recreates the table (the
+   parallel `clearShard` pass before it is then redundant, but harmless). Pre-existing: the same
+   line is at `7ff2847:search.cpp:1362`. Out of scope.
+
+Nits (non-blocking):
+
+- f9a5bd0 is labelled `test:` but also carries the engine hook refactor (`nodetable.h` +32,
+  `search.cpp` recycle/clear rewritten), and `rapfi_tests` does not build at that commit (the
+  engine target does). A separate failing-first test commit has precedent (233893b, SEARCH-08);
+  rewording or squashing at merge is the user's call.
+- `rebuildAfterErase` sizes to the minimum capacity for load <= 3/4, so a shard rebuilt at exactly
+  3/4 doubles on its next insert. One extra rehash per shard per recycle; sizing to load <= 3/8
+  would avoid it.
+- `forEachNode` is `const` but passes a mutable `Node &`.
+- `rehash` dereferences every node to recompute the home slot (one cache miss per node per rehash).
+  Fine at about 500 nodes per shard.
+- `verify_raw.md` check 5 gives -21.2 B per node treating KiB as 1000 B; with KiB it is 21.7 B.
+
+Out-of-scope follow-ups to propose as new TODO items (not created here):
+
+- Retained slab pool: free fully empty slabs after recycle (needs a per-slab live count) or count
+  free-list bytes in `graphMemoryUsed`, so the budget bounds the real heap after a large recycle.
+- ASan manual poisoning of freed node storage (`ASAN_POISON_MEMORY_REGION` in `freeNodeStorage`,
+  unpoison on reuse), so sanitizer runs see use-after-recycle.
+- `EdgeArrayAllocOverhead` 16 -> 8 (edge footprint is 8 B per array above the real chunk; phase 1).
+- `MCTSSearcher::clear` compares the shard count with its log2 (`search.cpp:1364`, pre-existing).
+- UBSan `-fsanitize=enum` hit at `search/ab/search.cpp:1071` (`computeLmrReduction`, value 60002
+  loaded as `Value`).
+- TSan reports in the VCF TT (`search/hashtable.cpp`, lock-free by design): confirm benign or
+  annotate, so MCTS TSan runs need no suppression file.
