@@ -249,6 +249,23 @@ void SearchPrinter::printSearchEnds(SearchThread      &th,
     }
 }
 
+void SearchPrinter::printMCTSSearchEnds(SearchThread &th, const TimeControl &tc)
+{
+    // BRIEF only: NORMAL / UCILIKE already show the root moves with printRootMoves. Silent in
+    // ponder, like all MCTS output.
+    if (Config::GeneralCfg.messageMode != MsgMode::BRIEF || th.rootMoves.empty()
+        || th.engine.ctx.inPonder.load(std::memory_order_relaxed))
+        return;
+
+    uint64_t nodes = th.engine.nodesSearched();
+    uint64_t speed = nodes * 1000 / std::max(tc.elapsed(), (Time)1);
+
+    // MCTS has no iteration depth, so there is no Depth field; no previousPv fallback either
+    MESSAGEL("Speed " << speedText(speed) << " | Eval " << th.rootMoves[0].value << " | Node "
+                      << nodesText(nodes) << " | Time " << timeText(tc.elapsed()));
+    MESSAGEL("Bestline " << MovesText {th.rootMoves[0].pv});
+}
+
 void SearchPrinter::printBestmoveWithoutSearch(SearchThread     &th,
                                                Pos               bestMove,
                                                Value             moveValue,
