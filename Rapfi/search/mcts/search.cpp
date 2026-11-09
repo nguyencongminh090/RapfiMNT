@@ -1559,6 +1559,10 @@ void MCTSSearcher::setupRootNode(SearchThread &th)
 
 void MCTSSearcher::recycleOldNodes(SearchThread &th)
 {
+    // Retired edge arrays still hold child pointers; they must be gone before a recycle can free
+    // the slabs of their children (PERF-04). searchMain frees them after every search.
+    assert(retiredEdgeArrays.count() == 0);
+
     // Increment global node age
     graph.globalNodeAge += 1;
 

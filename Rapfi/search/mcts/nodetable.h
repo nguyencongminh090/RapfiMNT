@@ -22,15 +22,31 @@
 #include "node.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <shared_mutex>
 #include <utility>
+#include <vector>
+
+// Under AddressSanitizer, dead node storage is poisoned (test aid, PERF-04): a read of a recycled
+// node through a stale pointer is reported even while its slab is still owned by the table.
+#if defined(__SANITIZE_ADDRESS__)
+    #define RAPFI_NODETABLE_ASAN 1
+#elif defined(__has_feature)
+    #if __has_feature(address_sanitizer)
+        #define RAPFI_NODETABLE_ASAN 1
+    #endif
+#endif
+#ifdef RAPFI_NODETABLE_ASAN
+    #include <sanitizer/asan_interface.h>
+#endif
 
 namespace Search::MCTS {
 
@@ -42,7 +58,10 @@ namespace Search::MCTS {
 /// Nodes are built in place in fixed-size slabs and never move while they are in the table:
 /// growing or rebuilding a shard moves only the slot words. Freed nodes go on a per-shard LIFO
 /// free list. Erasing rebuilds the shard's slot array from the survivors, so there are no
-/// tombstones.
+/// tombstones, and then frees every slab of the shard that holds no live node (PERF-04), so every
+/// slab holds at least one live node at all times. Slabs that keep a survivor stay, with their
+/// free slots on the free list: the table heap is bounded by the slot arrays plus one slab per
+/// live node, not by the live nodes alone.
 ///
 /// Locking is unchanged from the std::set table: one std::shared_mutex per shard, shared for
 /// findNode, unique for tryEmplaceNode. The hooks eraseNodesIf, clearShard and forEachNode
@@ -175,7 +194,8 @@ public:
 
     /// Erase every node of the shard for which pred(node) returns true.
     /// pred sees the node intact (edges included) before it is destroyed. The surviving nodes
-    /// keep their addresses; the shard's slot array is rebuilt from them.
+    /// keep their addresses; the shard's slot array is rebuilt from them, and slabs left
+    /// without a live node are freed (any pointer to an erased node then dangles).
     /// @return The number of erased nodes.
     /// @note The caller must hold the shard's unique lock.
     template <typename Pred>
@@ -317,10 +337,13 @@ private:
         delete[] oldSlots;
     }
 
-    /// After an erase: size the slot array for the survivors (load at most 3/4) and reinsert
-    /// them, which removes the holes the erase left in the probe sequences.
+    /// After an erase: free the slabs left without a live node, then size the slot array for the
+    /// survivors (load at most 3/4) and reinsert them, which removes the holes the erase left in
+    /// the probe sequences.
     void rebuildAfterErase(ShardData &d) const
     {
+        releaseEmptySlabs(d);
+
         if (d.numNodes == 0) {
             delete[] d.slots;
             d.slots    = nullptr;
@@ -341,6 +364,7 @@ private:
             void *mem = d.freeList;
             std::memcpy(&d.freeList, mem, sizeof(void *));
             d.numFree--;
+            unpoisonNodeStorage(mem);
             return mem;
         }
 
@@ -369,6 +393,145 @@ private:
         std::memcpy(mem, &d.freeList, sizeof(void *));
         d.freeList = mem;
         d.numFree++;
+        poisonNodeStorage(mem);
+    }
+
+    /// Poison a dead node's storage except its first word, which holds the free-list link.
+    static void poisonNodeStorage([[maybe_unused]] void *mem)
+    {
+#ifdef RAPFI_NODETABLE_ASAN
+        ASAN_POISON_MEMORY_REGION(static_cast<char *>(mem) + sizeof(void *),
+                                  sizeof(Node) - sizeof(void *));
+#endif
+    }
+
+    static void unpoisonNodeStorage([[maybe_unused]] void *mem)
+    {
+#ifdef RAPFI_NODETABLE_ASAN
+        ASAN_UNPOISON_MEMORY_REGION(mem, sizeof(Node));
+#endif
+    }
+
+    static void deleteSlab(Slab *slab)
+    {
+#ifdef RAPFI_NODETABLE_ASAN
+        ASAN_UNPOISON_MEMORY_REGION(slab, sizeof(Slab));
+#endif
+        delete slab;
+    }
+
+    /// Free every slab and reset the pool to its empty state (no slab, no free node).
+    static void releaseAllSlabs(ShardData &d)
+    {
+        for (Slab *slab = d.slabs; slab;) {
+            Slab *next = slab->next;
+            deleteSlab(slab);
+            slab = next;
+        }
+        d.slabs    = nullptr;
+        d.numSlabs = 0;
+        d.slabUsed = SlabNodes;
+        d.freeList = nullptr;
+        d.numFree  = 0;
+    }
+
+    /// After an erase (PERF-04): free every slab that holds no live node, the bump slab
+    /// included, and unlink the free-list entries that point into those slabs. Survivors do not
+    /// move, kept slabs keep their list order, and the kept free-list entries keep their order.
+    /// Runs under the shard's unique lock, between searches.
+    static void releaseEmptySlabs(ShardData &d)
+    {
+        if (d.numNodes == 0) {
+            releaseAllSlabs(d);
+            return;
+        }
+
+        // An empty slab owns SlabNodes free or never-used slots. With fewer of them in the
+        // shard, no slab can be empty.
+        const size_t bumpUnused = d.slabs ? SlabNodes - d.slabUsed : 0;
+        if (d.numFree + bumpUnused < SlabNodes)
+            return;
+
+        // Node -> slab: sort the slab addresses, then binary-search each node address.
+        std::vector<Slab *> sorted;
+        sorted.reserve(d.numSlabs);
+        for (Slab *slab = d.slabs; slab; slab = slab->next)
+            sorted.push_back(slab);
+        std::sort(sorted.begin(), sorted.end(), std::less<Slab *>());
+        auto slabIndexOf = [&sorted](const void *p) -> size_t {
+            auto it = std::upper_bound(sorted.begin(),
+                                       sorted.end(),
+                                       p,
+                                       [](const void *addr, const Slab *slab) {
+                                           return std::less<const void *>()(addr, slab);
+                                       });
+            assert(it != sorted.begin());
+            size_t index = size_t(it - sorted.begin()) - 1;
+            assert(static_cast<const unsigned char *>(p) >= sorted[index]->storage
+                   && static_cast<const unsigned char *>(p)
+                          < sorted[index]->storage + sizeof(sorted[index]->storage));
+            return index;
+        };
+
+        std::vector<uint32_t> live(sorted.size(), 0);
+        for (size_t i = 0; i < d.capacity; i++)
+            if (uint64_t slot = d.slots[i])
+                live[slabIndexOf(slotNode(slot))]++;
+
+        const size_t numEmpty = size_t(std::count(live.begin(), live.end(), 0u));
+#ifdef NDEBUG
+        if (numEmpty == 0)
+            return;
+#endif
+
+        // Unlink the free-list entries of empty slabs before any slab is freed: the links run
+        // through the storage of every slab.
+#ifndef NDEBUG
+        std::vector<uint32_t> numFreeOf(sorted.size(), 0);
+#endif
+        void *prev = nullptr;
+        for (void *mem = d.freeList; mem;) {
+            void *next;
+            std::memcpy(&next, mem, sizeof(void *));
+            size_t index = slabIndexOf(mem);
+#ifndef NDEBUG
+            numFreeOf[index]++;
+#endif
+            if (live[index] == 0) {
+                if (prev)
+                    std::memcpy(prev, &next, sizeof(void *));
+                else
+                    d.freeList = next;
+                d.numFree--;
+            }
+            else
+                prev = mem;
+            mem = next;
+        }
+
+#ifndef NDEBUG
+        // Every handed-out slot is either live or on the free list.
+        for (size_t index = 0; index < sorted.size(); index++) {
+            size_t handedOut = sorted[index] == d.slabs ? d.slabUsed : SlabNodes;
+            assert(live[index] + numFreeOf[index] == handedOut);
+        }
+        if (numEmpty == 0)
+            return;
+#endif
+
+        // Free the empty slabs. If the bump slab goes, the new head slab is fully handed out.
+        const bool headReleased = live[slabIndexOf(d.slabs->storage)] == 0;
+        for (Slab **link = &d.slabs; Slab *slab = *link;) {
+            if (live[slabIndexOf(slab->storage)] == 0) {
+                *link = slab->next;
+                deleteSlab(slab);
+                d.numSlabs--;
+            }
+            else
+                link = &slab->next;
+        }
+        if (headReleased)
+            d.slabUsed = SlabNodes;
     }
 
     /// Destroy every live node, then free the slot array and every slab.
@@ -379,20 +542,10 @@ private:
                 slotNode(slot)->~Node();
         delete[] d.slots;
 
-        for (Slab *slab = d.slabs; slab;) {
-            Slab *next = slab->next;
-            delete slab;
-            slab = next;
-        }
-
         d.slots    = nullptr;
         d.capacity = 0;
         d.numNodes = 0;
-        d.slabs    = nullptr;
-        d.numSlabs = 0;
-        d.slabUsed = SlabNodes;
-        d.freeList = nullptr;
-        d.numFree  = 0;
+        releaseAllSlabs(d);
     }
 };
 
