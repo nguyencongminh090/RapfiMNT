@@ -376,6 +376,11 @@ void Config::readSearch(const cpptoml::table &t, PendingConfig &pending)
     cfg.mctsEdgePolicyMass =
         t.get_as<double>("mcts_edge_policy_mass").value_or(cfg.mctsEdgePolicyMass);
     cfg.mctsMinEdges = t.get_as<int>("mcts_min_edges").value_or(cfg.mctsMinEdges);
+    cfg.mctsVcnPassPrior =
+        t.get_as<double>("mcts_vcn_pass_prior").value_or(cfg.mctsVcnPassPrior);
+    if (!(cfg.mctsVcnPassPrior > 0.0f))  // negative or NaN
+        cfg.mctsVcnPassPrior = 0.0f;
+    cfg.mctsVcnPassPrior = std::min(cfg.mctsVcnPassPrior, std::nextafter(1.0f, 0.0f));
     cfg.mctsDefaultMemoryPercent =
         t.get_as<int>("mcts_default_memory_percent").value_or(cfg.mctsDefaultMemoryPercent);
     cfg.maxNumVisitsPerPlayout =

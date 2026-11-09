@@ -20,6 +20,13 @@
 
 #include <cstdint>
 
+class Board;
+struct Pos;
+
+namespace Search {
+struct SearchOptions;
+}
+
 /// Thin test-only wrappers over helpers that live in search.cpp's anonymous namespace
 /// (SEARCH-08 tests). They forward unchanged and add no behaviour.
 namespace Search::MCTS::Testing {
@@ -35,5 +42,13 @@ float puctSelectionValue(float    childUtility,
                          uint64_t childVisits,
                          uint32_t childVirtualVisits,
                          float    cpuctExploration);
+
+/// Forwards to generateNodeMoves() in search.cpp: the move list (and normalised policies) a
+/// non-root node gets from expandNode<false> and widenNode, before the edge cut (VCN-03 slice 3).
+/// The board must be bound to a search thread with an evaluator. Returns the number of moves.
+uint32_t generateNodeMoves(const Board         &board,
+                           const SearchOptions &options,
+                           Pos                 *moveList,
+                           float               *policyList);
 
 }  // namespace Search::MCTS::Testing

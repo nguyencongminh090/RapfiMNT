@@ -407,6 +407,91 @@ std::pair<Edge *, Node *> selectChild(Node &node, const Board &board, bool graph
     return {bestEdge, bestNode};
 }
 
+/// Puts the VCN defender's pass at its prior: P(pass) = SearchCfg.mctsVcnPassPrior, every board
+/// move's policy is scaled by (1 - prior), and the list is stably re-sorted by descending policy.
+/// The whole list is sorted, not only the pass placed: the picker sorts only its moves with a
+/// non-negative score, so the tail of its list is in no particular order (VCN-03 slice 3). The
+/// pass goes in after the board moves, so on a tie (prior 0) it sorts behind them.
+void applyVcnPassPrior(Pos *moveList, float *policyList, uint32_t numMoves, uint32_t passIndex)
+{
+    struct Entry
+    {
+        Pos   move;
+        float policy;
+    };
+    const float prior      = SearchCfg.mctsVcnPassPrior;
+    const float boardScale = 1.0f - prior;
+    Entry       entries[MAX_MOVES];
+    uint32_t    n = 0;
+    for (uint32_t i = 0; i < numMoves; i++)
+        if (i != passIndex)
+            entries[n++] = {moveList[i], policyList[i] * boardScale};
+    entries[n++] = {Pos::PASS, prior};
+    assert(n == numMoves);
+
+    std::stable_sort(entries, entries + n, [](const Entry &a, const Entry &b) {
+        return a.policy > b.policy;
+    });
+    for (uint32_t i = 0; i < n; i++) {
+        moveList[i]   = entries[i].move;
+        policyList[i] = entries[i].policy;
+    }
+}
+
+/// Generates the moves of a non-root node with their normalised policies, before the edge cut.
+/// Shared by expandNode<false> and widenNode, so a widen regenerates every kept edge (SEARCH-10).
+/// In VCN mode the defender may pass, under AB's rule: VCN on, the defender to move, and no
+/// attacker five (the picker itself never passes against a five or right after a pass). The pass
+/// gets its configured prior and the list is re-sorted (applyVcnPassPrior). With VCN off, and at
+/// VCN attacker nodes, the list is the picker's, exactly as before.
+/// @return The number of moves written to moveList / policyList.
+uint32_t
+generateNodeMoves(const Board &board, const SearchOptions &options, Pos *moveList, float *policyList)
+{
+    const bool vcnDefenderPass = options.vcnMode.enabled()
+                                 && board.sideToMove() != options.vcnMode.attacker
+                                 && !board.p4Count(options.vcnMode.attacker, A_FIVE);
+
+    MovePicker mp(options.rule,
+                  board,
+                  MovePicker::ExtraArgs<MovePicker::MAIN> {
+                      Pos::NONE,
+                      {},
+                      true,
+                      PolicyTemperature,
+                      vcnDefenderPass,
+                  });
+
+    uint32_t numMoves = 0;
+    if (!vcnDefenderPass) {
+        while (Pos move = mp()) {
+            assert(mp.hasPolicyScore());
+            assert(mp.hasNormalizedPolicy());
+            moveList[numMoves]   = move;
+            policyList[numMoves] = mp.curMoveNormalizePolicy();
+            numMoves++;
+        }
+        return numMoves;
+    }
+
+    // The pass comes before any board move is scored, so it has no policy score of its own.
+    uint32_t passIndex = MAX_MOVES;
+    while (Pos move = mp()) {
+        if (move == Pos::PASS)
+            passIndex = numMoves;
+        else {
+            assert(mp.hasPolicyScore());
+            assert(mp.hasNormalizedPolicy());
+        }
+        moveList[numMoves]   = move;
+        policyList[numMoves] = move == Pos::PASS ? 0.0f : mp.curMoveNormalizePolicy();
+        numMoves++;
+    }
+    if (passIndex != MAX_MOVES)
+        applyVcnPassPrior(moveList, policyList, numMoves, passIndex);
+    return numMoves;
+}
+
 /// expand: generate edges and evaluate the policy of this node
 /// @return Whether this node has no valid move, which means this node is a terminal node.
 template <bool Root = false>
@@ -427,18 +512,14 @@ bool expandNode(Node &node, const SearchOptions &options, const Board &board, in
         return false;
     }
     else {
-        MovePicker mp(options.rule,
-                      board,
-                      MovePicker::ExtraArgs<MovePicker::MAIN> {
-                          Pos::NONE,
-                          {},
-                          true,
-                          PolicyTemperature,
-                      });
+        Pos      moveList[MAX_MOVES];
+        float    policyList[MAX_MOVES];
+        uint32_t numMoves = generateNodeMoves(board, options, moveList, policyList);
 
         EdgeLimits limits {SearchCfg.mctsEdgePolicyMass,
                            static_cast<uint32_t>(std::max(SearchCfg.mctsMinEdges, 1))};
-        bool       noValidMove = node.createEdges(mp, &searcher.graphMemoryUsed, limits);
+        bool       noValidMove =
+            node.createEdgesFrom(moveList, policyList, numMoves, limits, &searcher.graphMemoryUsed);
         if (noValidMove) {
             Value terminalValue = board.p4Count(~board.sideToMove(), A_FIVE)
                                       ? mated_in(board.ply() + 2)
@@ -518,25 +599,10 @@ void widenNode(Node &node, const SearchOptions &options, const Board &board)
     if (!oldEdges || !oldEdges->edgesCut() || searcher.graphClosed())
         return;
 
-    // The same move generation as expandNode<false>, without the cut
-    MovePicker mp(options.rule,
-                  board,
-                  MovePicker::ExtraArgs<MovePicker::MAIN> {
-                      Pos::NONE,
-                      {},
-                      true,
-                      PolicyTemperature,
-                  });
+    // The same move generation as expandNode<false> (the VCN pass included), without the cut
     Pos      moveList[MAX_MOVES];
     float    policyList[MAX_MOVES];
-    uint32_t numMoves = 0;
-    while (Pos move = mp()) {
-        assert(mp.hasPolicyScore());
-        assert(mp.hasNormalizedPolicy());
-        moveList[numMoves]   = move;
-        policyList[numMoves] = mp.curMoveNormalizePolicy();
-        numMoves++;
-    }
+    uint32_t numMoves = generateNodeMoves(board, options, moveList, policyList);
 
 #ifndef NDEBUG
     // The board is at this node's position, so every kept move must be regenerated.
@@ -1471,4 +1537,12 @@ void MCTSSearcher::updateRootMovesData(SearchThread &th)
                      [](const RootMove &m1, const RootMove &m2) {
                          return m1.selectionValue > m2.selectionValue;
                      });
+}
+
+uint32_t Search::MCTS::Testing::generateNodeMoves(const Board         &board,
+                                                  const SearchOptions &options,
+                                                  Pos                 *moveList,
+                                                  float               *policyList)
+{
+    return ::generateNodeMoves(board, options, moveList, policyList);
 }

@@ -55,6 +55,9 @@ struct SearchConfig
     float mctsEdgePolicyMass = 0.99f;
     /// Lower bound of the number of edges kept by the policy-mass cut (SEARCH-02).
     int mctsMinEdges = 8;
+    /// Prior of the VCN defender's pass edge in MCTS; the board moves share the rest (1 - prior).
+    /// Clamped to [0, 1). Not measured yet (VCN-03 slice 3; slice 5 measures it).
+    float mctsVcnPassPrior = 0.25f;
     /// With no explicit memory limit, the MCTS graph budget is this percent of the available
     /// physical memory (plus what the graph already holds). 0 = unbounded (SEARCH-03).
     int mctsDefaultMemoryPercent = 40;
