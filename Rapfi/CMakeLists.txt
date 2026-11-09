@@ -320,6 +320,7 @@ set(HEADERS
     search/searchthread.h
     search/skill.h
     search/timecontrol.h
+    search/vcn.h
     search/ab/history.h
     search/ab/parameter.h
     search/ab/searcher.h
@@ -705,6 +706,7 @@ if(BUILD_TESTS AND NOT EMSCRIPTEN)
         tests/mcts_visits_tests.cpp
         tests/mcts_bound_tests.cpp
         tests/mcts_widen_tests.cpp
+        tests/mcts_vcn_tests.cpp
     )
 
     add_executable(rapfi_tests ${TEST_ENGINE_SOURCES} ${TEST_DRIVER_SOURCES} ${HEADERS})

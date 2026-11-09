@@ -562,11 +562,10 @@ void widenNode(Node &node, const SearchOptions &options, const Board &board)
 template <bool Root = false>
 uint32_t searchNode(Node &node, Board &board, int ply, uint32_t newVisits)
 {
-    assert(node.getHash() == board.zobristKey());
-
     SearchThread  *thisThread = board.thisThread();
     SearchOptions &options    = thisThread->options();
     MCTSSearcher  &searcher   = static_cast<MCTSSearcher &>(*thisThread->engine.searcher());
+    assert(node.getHash() == mctsNodeKey(board, options, searcher.scratch.rootDefenderPasses));
 
     // Discard visits in this node if it is unevaluated
     uint64_t parentVisits = node.getVisits();
@@ -646,7 +645,7 @@ uint32_t searchNode(Node &node, Board &board, int ply, uint32_t newVisits)
         // Reaching a leaf node, expand it
         bool allocatedNode = false;
         if (!childNode) {
-            HashKey hash = board.zobristKey();
+            HashKey hash = mctsNodeKey(board, options, searcher.scratch.rootDefenderPasses);
             std::tie(childNode, allocatedNode) = allocateOrFindNode(searcher, hash);
 
             // Remember this child node in the edge
@@ -1190,6 +1189,9 @@ const RootMove *MCTSSearcher::searchMain(SearchThread &th)
     scratch.numSelectableRootMoves = 0;
     scratch.lastOutputNodes        = 0;
     scratch.lastOutputTime         = now();
+    // Base of the per-node VCN level (VCN-03 slice 2). Set before setupRootNode, which keys the
+    // root through mctsNodeKey, and before the workers start (same happens-before as graph.root).
+    scratch.rootDefenderPasses = board.passMoveCountOfSide(~th.options().vcnMode.attacker);
 
     // Starts worker threads, then starts main thread.
     // Root setup happens-before the workers read graph.root: runOnAllThreads
@@ -1308,14 +1310,19 @@ void MCTSSearcher::setupRootNode(SearchThread &th)
     // unchanged position must still be able to reclaim the budget below.
     bool overBudget = graphClosed();
 
-    // If the root position has not changed, we do not need to update the root node
-    if (graph.root && rootPosition == graph.previousPosition && !overBudget)
-        return;
-
     SearchOptions &opts = th.options();
 
+    // The root key also carries the VCN mode (off / level / attacker), VCN-03 slice 2: the same
+    // moves searched in another mode must not reuse the previous root.
+    const HashKey rootKey = mctsNodeKey(*th.board, opts, scratch.rootDefenderPasses);
+
+    // If the root position has not changed, we do not need to update the root node
+    if (graph.root && rootPosition == graph.previousPosition && rootKey == graph.previousRootKey
+        && !overBudget)
+        return;
+
     // Initialize the root node to expanded state
-    std::tie(graph.root, std::ignore) = allocateOrFindNode(*this, th.board->zobristKey());
+    std::tie(graph.root, std::ignore) = allocateOrFindNode(*this, rootKey);
     if (graph.root->getVisits() == 0)
         evaluateNode<true>(*graph.root, opts, *th.board, 0);
     if (graph.root->isLeaf())
@@ -1331,8 +1338,9 @@ void MCTSSearcher::setupRootNode(SearchThread &th)
         || overBudget)
         recycleOldNodes(th);
 
-    // Update previous Position
+    // Update previous Position and root key
     graph.previousPosition = std::move(rootPosition);
+    graph.previousRootKey  = rootKey;
 }
 
 void MCTSSearcher::recycleOldNodes(SearchThread &th)

@@ -20,16 +20,47 @@
 
 #include "../../core/pos.h"
 #include "../../core/types.h"
+#include "../../game/board.h"
+#include "../searchcommon.h"
 #include "../searchoutput.h"
 #include "../searchthread.h"
 #include "../timecontrol.h"
+#include "../vcn.h"
 #include "membudget.h"
 #include "node.h"
 #include "nodetable.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cassert>
 
 namespace Search::MCTS {
+
+/// VCN level of the node at `board` (VCN-03 slice 2). Every defender pass since the search root
+/// raises the level by one, capped at VC5, so the level is a function of the board and needs no
+/// Node field: level = min(VC5, rootLevel + passes(defender) - rootDefenderPasses).
+/// Only meaningful when VCN mode is enabled.
+inline VCNLevel mctsNodeVcnLevel(const Board         &board,
+                                 const SearchOptions &options,
+                                 int                  rootDefenderPasses)
+{
+    assert(options.vcnMode.enabled());
+    const int newPasses = board.passMoveCountOfSide(~options.vcnMode.attacker) - rootDefenderPasses;
+    assert(newPasses >= 0);
+    const int level = static_cast<int>(options.vcnMode.n) + newPasses;
+    return static_cast<VCNLevel>(std::min(level, static_cast<int>(VCNLevel::VC5)));
+}
+
+/// Key of the MCTS graph node at `board`: the zobrist key, XORed with the VCN level/attacker hash
+/// in VCN mode so VCN nodes never mix with ordinary nodes, other levels or the other attacker.
+/// Equal to board.zobristKey() when VCN is off.
+inline HashKey mctsNodeKey(const Board &board, const SearchOptions &options, int rootDefenderPasses)
+{
+    if (!options.vcnMode.enabled())
+        return board.zobristKey();
+    return board.zobristKey()
+           ^ Vcn::hashXor(options, mctsNodeVcnLevel(board, options, rootDefenderPasses));
+}
 
 class MCTSSearcher : public Searcher
 {
@@ -50,6 +81,9 @@ public:
         Node *root = nullptr;
         /// The searched position of last root node
         std::vector<Pos> previousPosition;
+        /// The node key of the last root node (VCN-03 slice 2): the same moves searched in
+        /// another VCN mode (off, level, attacker) give another root key and a new root.
+        HashKey previousRootKey = 0;
         /// The global node age to synchronize the node table
         uint32_t globalNodeAge = 0;
     } graph;
@@ -63,6 +97,9 @@ public:
         uint64_t lastOutputNodes;
         /// The last time that we have printed search outputs
         Time lastOutputTime;
+        /// Passes made by the VCN defender on the root board (VCN-03 slice 2), the base of the
+        /// per-node level in mctsNodeKey(). Written in searchMain before the workers start.
+        int rootDefenderPasses;
     } scratch;
 
     /// Total requested MCTS search-memory budget in KiB, as passed to

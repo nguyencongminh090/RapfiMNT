@@ -31,6 +31,7 @@
 #include "../searchconfig.h"
 #include "../searchthread.h"
 #include "../skill.h"
+#include "../vcn.h"
 #include "parameter.h"
 #include "searcher.h"
 #include "searchstack.h"
@@ -239,41 +240,6 @@ template <Rule Rule, NodeType NT>
 Value vcfsearch(Board &board, SearchStack *ss, Value alpha, Value beta, Depth depth = 0.0f);
 template <Rule Rule, NodeType NT>
 Value vcfdefend(Board &board, SearchStack *ss, Value alpha, Value beta, Depth depth = 0.0f);
-
-/// VCN (Victory by Continuous N-level attack) helpers.
-namespace Vcn {
-
-/// Move the attacker one level up (after a defender pass), capped at VC5.
-inline VCNLevel levelIncrement(VCNLevel level)
-{
-    return level < VCNLevel::VC5 ? static_cast<VCNLevel>(static_cast<int>(level) + 1)
-                                 : VCNLevel::VC5;
-}
-
-/// Level of the node reached by playing `move` from a node of level `level`. Only a pass played
-/// by the defender raises the level (the attacker never passes).
-inline VCNLevel childLevel(VCNLevel level, bool selfIsAttacker, Pos move)
-{
-    return !selfIsAttacker && move == Pos::PASS ? levelIncrement(level) : level;
-}
-
-/// At VC5 the attacker must already have a five on the board, otherwise they lose at once.
-inline bool vc5AttackerLoses(const Board &board, Color attacker)
-{
-    return board.p4Count(attacker, A_FIVE) == 0;
-}
-
-/// Hash XORed into TT keys so VCN results never mix with ordinary results or with other levels
-/// (the same board position can be searched at different levels). Zero when VCN is off.
-inline HashKey hashXor(const SearchOptions &opts, VCNLevel level)
-{
-    if (!opts.vcnMode.enabled())
-        return 0;
-    return Hash::LCHash(static_cast<uint64_t>(static_cast<int>(level))
-                        ^ ((static_cast<uint64_t>(opts.vcnMode.attacker) + 1) << 32));
-}
-
-}  // namespace Vcn
 
 }  // namespace
 
