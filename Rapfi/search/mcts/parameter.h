@@ -55,9 +55,11 @@ constexpr float LCBMinVisitProp            = 0.1f;
 constexpr float PolicyTemperature     = 0.90f;
 constexpr float RootPolicyTemperature = 1.05f;
 
-/// Estimated per-node overhead of a NodeTable entry beyond sizeof(Node):
-/// red-black-tree node bookkeeping (~32 B) plus allocator header (~16 B).
-constexpr size_t NodeTableEntryOverhead = 48;
+/// Per-node heap overhead of the NodeTable beyond sizeof(Node), measured for the PERF-03 table
+/// (8-byte tagged slots at load factor 3/8..3/4, plus slab slack and slab headers): the heap
+/// grows by 74.9 B per node at 511683 nodes in 1024 shards (mallinfo2, glibc 2.43), so 75 - 56.
+/// It moves between about 70 and 81 B with the load factor and the shard size (PERF-03 todo).
+constexpr size_t NodeTableEntryOverhead = 19;
 
 /// Estimated allocator header overhead of one EdgeArray heap allocation.
 constexpr size_t EdgeArrayAllocOverhead = 16;

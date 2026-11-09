@@ -464,8 +464,9 @@ private:
     void writeTerminalStats(Value value);
 };
 
+// 56 bytes is the slab stride of the node table (PERF-03); nodeFootprint() is measured with it.
 static_assert(sizeof(void *) != 8 || sizeof(Node) == 56,
-              "Node must stay 56 bytes on 64-bit targets (std::set node size class, SEARCH-08)");
+              "Node must stay 56 bytes on 64-bit targets (node table slab stride, SEARCH-08)");
 
 /// Estimated heap footprint in bytes of one node stored in the node table.
 inline size_t nodeFootprint()

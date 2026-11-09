@@ -21,39 +21,100 @@
 #include "../../core/types.h"
 #include "node.h"
 
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
-#include <set>
+#include <new>
 #include <shared_mutex>
+#include <utility>
 
 namespace Search::MCTS {
 
+/// Sharded hash table of MCTS nodes (PERF-03).
+///
+/// Each shard is an open-addressing table of 8-byte slots plus a slab pool that owns the nodes.
+/// A slot holds a Node pointer in its low 48 bits and the upper 16 bits of the node's hash as a
+/// tag; 0 is the empty slot. Linear probing, power-of-two capacity, load factor at most 3/4.
+/// Nodes are built in place in fixed-size slabs and never move while they are in the table:
+/// growing or rebuilding a shard moves only the slot words. Freed nodes go on a per-shard LIFO
+/// free list. Erasing rebuilds the shard's slot array from the survivors, so there are no
+/// tombstones.
+///
+/// Locking is unchanged from the std::set table: one std::shared_mutex per shard, shared for
+/// findNode, unique for tryEmplaceNode. The hooks eraseNodesIf, clearShard and forEachNode
+/// expect the caller to hold the shard's lock (processAllShards does).
 class NodeTable
 {
 public:
-    struct NodeCompare
+    /// Number of nodes per slab.
+    static constexpr size_t SlabNodes = 32;
+    /// Slot capacity of a shard on its first insert.
+    static constexpr size_t InitialSlots = 16;
+
+private:
+    static constexpr int      PointerBits = 48;
+    static constexpr uint64_t PointerMask = (uint64_t(1) << PointerBits) - 1;
+
+    struct Slab
     {
-        using is_transparent = void;
-        bool operator()(HashKey lhs, const Node &rhs) const { return lhs < rhs.getHash(); }
-        bool operator()(const Node &lhs, HashKey rhs) const { return lhs.getHash() < rhs; }
-        bool operator()(const Node &lhs, const Node &rhs) const
-        {
-            return lhs.getHash() < rhs.getHash();
-        }
+        Slab *next;
+        alignas(Node) unsigned char storage[SlabNodes * sizeof(Node)];
     };
-    using Table = std::set<Node, NodeCompare>;
+
+    /// Per-shard storage. Only NodeTable reads or writes it.
+    class ShardData
+    {
+    public:
+        ShardData() = default;
+        ShardData(const ShardData &)            = delete;
+        ShardData &operator=(const ShardData &) = delete;
+        ~ShardData() { NodeTable::releaseAll(*this); }
+
+    private:
+        friend class NodeTable;
+
+        uint64_t *slots    = nullptr;  ///< capacity slot words, or null when capacity is 0
+        size_t    capacity = 0;        ///< 0 or a power of two
+        size_t    numNodes = 0;        ///< live nodes
+        Slab     *slabs    = nullptr;  ///< singly linked, newest first
+        size_t    numSlabs = 0;
+        size_t    slabUsed = SlabNodes;  ///< bump index into the newest slab
+        void     *freeList = nullptr;    ///< LIFO list threaded through dead node storage
+        size_t    numFree  = 0;
+    };
+
+public:
+    /// Bytes of one slab allocation (requested size, without the allocator's header).
+    static constexpr size_t SlabBytes = sizeof(Slab);
 
     struct Shard
     {
         size_t             index;
-        Table             &table;
+        ShardData         &data;
         std::shared_mutex &mutex;
     };
 
+    /// Statistics of one shard, for tests and measurement.
+    struct ShardStats
+    {
+        size_t numNodes;          ///< live nodes
+        size_t slotCapacity;      ///< slot array length (0 before the first insert)
+        size_t numSlabs;          ///< slabs owned by the shard
+        size_t slabNodeCapacity;  ///< numSlabs * SlabNodes
+        size_t numFreeNodes;      ///< node storage on the free list
+        size_t maxProbeLength;    ///< longest probe of a live node (1 = home slot)
+        double meanProbeLength;   ///< mean probe of the live nodes (0 when empty)
+    };
+
     NodeTable(size_t numShardsPowerOfTwo)
-        : numShards(1 << numShardsPowerOfTwo)
+        : numShards(size_t(1) << numShardsPowerOfTwo)
         , mask(numShards - 1)
-        , tables(std::make_unique<Table[]>(numShards))
+        , shardBits(numShardsPowerOfTwo)
+        , shards(std::make_unique<ShardData[]>(numShards))
         , mutexes(std::make_unique<std::shared_mutex[]>(numShards))
     {}
 
@@ -64,7 +125,7 @@ public:
     /// @note This function is thread-safe.
     Shard getShardByShardIndex(size_t index) const
     {
-        return Shard {index, tables[index], mutexes[index]};
+        return Shard {index, shards[index], mutexes[index]};
     }
 
     /// Get the shard that contains the node with the given hash key.
@@ -82,13 +143,7 @@ public:
     {
         Shard            shard = getShardByHash(hash);
         std::shared_lock lock(shard.mutex);
-        Table::iterator  it = shard.table.find(hash);
-        if (it == shard.table.end())
-            return nullptr;
-
-        // Normally elements in std::set are immutable, but we only use a node's hash
-        // to compare nodes, so we can safely cast away constness here.
-        return std::addressof(const_cast<Node &>(*it));
+        return lookup(shard.data, hash);
     }
 
     /// Try emplace a new node into the table.
@@ -102,50 +157,243 @@ public:
     {
         Shard            shard = getShardByHash(hash);
         std::unique_lock lock(shard.mutex);
+        ShardData       &d = shard.data;
 
-        // Try to emplace the node after acquiring the writer lock
-        auto [it, inserted] = shard.table.emplace(hash, std::forward<Args>(args)...);
-        // We also return whether the node is actually created by us
-        return {std::addressof(const_cast<Node &>(*it)), inserted};
+        // Another thread may have inserted the node after our findNode missed.
+        if (Node *existing = lookup(d, hash))
+            return {existing, false};
+
+        // Grow before computing the insert position, so the position is in the final array.
+        if (4 * (d.numNodes + 1) > 3 * d.capacity)
+            rehash(d, d.capacity ? 2 * d.capacity : InitialSlots);
+
+        Node *node = new (allocateNodeStorage(d)) Node(hash, std::forward<Args>(args)...);
+        insertSlot(d, hash, node);
+        d.numNodes++;
+        return {node, true};
     }
 
     /// Erase every node of the shard for which pred(node) returns true.
-    /// pred sees the node intact (edges included) before it is destroyed.
+    /// pred sees the node intact (edges included) before it is destroyed. The surviving nodes
+    /// keep their addresses; the shard's slot array is rebuilt from them.
     /// @return The number of erased nodes.
     /// @note The caller must hold the shard's unique lock.
     template <typename Pred>
     size_t eraseNodesIf(const Shard &shard, Pred &&pred)
     {
-        size_t numErased = 0;
-        for (auto it = shard.table.begin(); it != shard.table.end();) {
-            if (pred(const_cast<Node &>(*it))) {
-                it = shard.table.erase(it);
+        ShardData &d         = shard.data;
+        size_t     numErased = 0;
+        for (size_t i = 0; i < d.capacity; i++) {
+            uint64_t slot = d.slots[i];
+            if (!slot)
+                continue;
+            Node *node = slotNode(slot);
+            if (pred(*node)) {
+                d.slots[i] = 0;
+                freeNodeStorage(d, node);
                 numErased++;
             }
-            else
-                it++;
+        }
+
+        if (numErased) {
+            d.numNodes -= numErased;
+            rebuildAfterErase(d);
         }
         return numErased;
     }
 
-    /// Destroy every node of the shard and release its storage.
+    /// Destroy every node of the shard and release its slot array and slabs.
     /// @note The caller must hold the shard's unique lock.
-    void clearShard(const Shard &shard) { shard.table.clear(); }
+    void clearShard(const Shard &shard) { releaseAll(shard.data); }
 
     /// Call f(node) on every node of the shard.
     /// @note The caller must hold the shard's lock.
     template <typename F>
     void forEachNode(const Shard &shard, F &&f) const
     {
-        for (const Node &node : shard.table)
-            f(const_cast<Node &>(node));
+        const ShardData &d = shard.data;
+        for (size_t i = 0; i < d.capacity; i++)
+            if (uint64_t slot = d.slots[i])
+                f(*slotNode(slot));
+    }
+
+    /// Statistics of one shard.
+    /// @note The caller must hold the shard's lock.
+    ShardStats getShardStats(const Shard &shard) const
+    {
+        const ShardData &d = shard.data;
+        ShardStats       s {};
+        s.numNodes         = d.numNodes;
+        s.slotCapacity     = d.capacity;
+        s.numSlabs         = d.numSlabs;
+        s.slabNodeCapacity = d.numSlabs * SlabNodes;
+        s.numFreeNodes     = d.numFree;
+
+        size_t totalProbe = 0;
+        for (size_t i = 0; i < d.capacity; i++) {
+            if (uint64_t slot = d.slots[i]) {
+                size_t home  = homeIndex(slotNode(slot)->getHash(), d.capacity);
+                size_t probe = ((i - home) & (d.capacity - 1)) + 1;
+                totalProbe += probe;
+                s.maxProbeLength = std::max(s.maxProbeLength, probe);
+            }
+        }
+        if (d.numNodes)
+            s.meanProbeLength = double(totalProbe) / double(d.numNodes);
+        return s;
+    }
+
+    /// Bytes requested from the allocator for all slot arrays and slabs (allocator headers not
+    /// included). Takes each shard's shared lock.
+    size_t heapBytes() const
+    {
+        size_t bytes = 0;
+        for (size_t i = 0; i < numShards; i++) {
+            std::shared_lock lock(mutexes[i]);
+            bytes += shards[i].capacity * sizeof(uint64_t) + shards[i].numSlabs * SlabBytes;
+        }
+        return bytes;
     }
 
 private:
     size_t                               numShards;
     size_t                               mask;
-    std::unique_ptr<Table[]>             tables;
+    size_t                               shardBits;
+    std::unique_ptr<ShardData[]>         shards;
     std::unique_ptr<std::shared_mutex[]> mutexes;
+
+    static Node *slotNode(uint64_t slot) { return reinterpret_cast<Node *>(slot & PointerMask); }
+    static uint64_t tagOf(HashKey hash) { return hash & ~PointerMask; }
+
+    /// Home slot of a hash. Uses the bits above the shard bits, so that the slot index does not
+    /// repeat the shard index.
+    size_t homeIndex(HashKey hash, size_t capacity) const
+    {
+        return size_t(hash >> shardBits) & (capacity - 1);
+    }
+
+    Node *lookup(const ShardData &d, HashKey hash) const
+    {
+        if (d.capacity == 0)
+            return nullptr;
+
+        const size_t   slotMask = d.capacity - 1;
+        const uint64_t tag      = tagOf(hash);
+        for (size_t i = homeIndex(hash, d.capacity);; i = (i + 1) & slotMask) {
+            uint64_t slot = d.slots[i];
+            if (!slot)
+                return nullptr;
+            // The tag only filters: the node's own hash decides.
+            if ((slot & ~PointerMask) == tag) {
+                Node *node = slotNode(slot);
+                if (node->getHash() == hash)
+                    return node;
+            }
+        }
+    }
+
+    /// Put a node into the first empty slot of its probe sequence. The hash must not be in the
+    /// table and the array must have a free slot.
+    void insertSlot(ShardData &d, HashKey hash, Node *node) const
+    {
+        const size_t slotMask = d.capacity - 1;
+        size_t       i        = homeIndex(hash, d.capacity);
+        while (d.slots[i])
+            i = (i + 1) & slotMask;
+        d.slots[i] = tagOf(hash) | reinterpret_cast<uintptr_t>(node);
+    }
+
+    /// Move all slot words into a new zeroed array of newCapacity slots. Nodes do not move.
+    void rehash(ShardData &d, size_t newCapacity) const
+    {
+        uint64_t *oldSlots    = d.slots;
+        size_t    oldCapacity = d.capacity;
+
+        d.slots    = new uint64_t[newCapacity]();
+        d.capacity = newCapacity;
+        for (size_t i = 0; i < oldCapacity; i++)
+            if (uint64_t slot = oldSlots[i])
+                insertSlot(d, slotNode(slot)->getHash(), slotNode(slot));
+        delete[] oldSlots;
+    }
+
+    /// After an erase: size the slot array for the survivors (load at most 3/4) and reinsert
+    /// them, which removes the holes the erase left in the probe sequences.
+    void rebuildAfterErase(ShardData &d) const
+    {
+        if (d.numNodes == 0) {
+            delete[] d.slots;
+            d.slots    = nullptr;
+            d.capacity = 0;
+            return;
+        }
+
+        size_t newCapacity = InitialSlots;
+        while (4 * d.numNodes > 3 * newCapacity)
+            newCapacity *= 2;
+        rehash(d, newCapacity);
+    }
+
+    /// Storage for one node: the free list first, then the newest slab, then a new slab.
+    static void *allocateNodeStorage(ShardData &d)
+    {
+        if (d.freeList) {
+            void *mem = d.freeList;
+            std::memcpy(&d.freeList, mem, sizeof(void *));
+            d.numFree--;
+            return mem;
+        }
+
+        if (d.slabUsed == SlabNodes) {
+            Slab *slab = new Slab;
+            if ((reinterpret_cast<uintptr_t>(slab) + sizeof(Slab)) >> PointerBits) {
+                std::fprintf(stderr,
+                             "NodeTable: slab address %p does not fit in %d bits\n",
+                             static_cast<void *>(slab),
+                             PointerBits);
+                std::abort();
+            }
+            slab->next = d.slabs;
+            d.slabs    = slab;
+            d.numSlabs++;
+            d.slabUsed = 0;
+        }
+        return d.slabs->storage + sizeof(Node) * d.slabUsed++;
+    }
+
+    /// Destroy a node and push its storage on the free list.
+    static void freeNodeStorage(ShardData &d, Node *node)
+    {
+        node->~Node();
+        void *mem = node;
+        std::memcpy(mem, &d.freeList, sizeof(void *));
+        d.freeList = mem;
+        d.numFree++;
+    }
+
+    /// Destroy every live node, then free the slot array and every slab.
+    static void releaseAll(ShardData &d)
+    {
+        for (size_t i = 0; i < d.capacity; i++)
+            if (uint64_t slot = d.slots[i])
+                slotNode(slot)->~Node();
+        delete[] d.slots;
+
+        for (Slab *slab = d.slabs; slab;) {
+            Slab *next = slab->next;
+            delete slab;
+            slab = next;
+        }
+
+        d.slots    = nullptr;
+        d.capacity = 0;
+        d.numNodes = 0;
+        d.slabs    = nullptr;
+        d.numSlabs = 0;
+        d.slabUsed = SlabNodes;
+        d.freeList = nullptr;
+        d.numFree  = 0;
+    }
 };
 
 }  // namespace Search::MCTS
