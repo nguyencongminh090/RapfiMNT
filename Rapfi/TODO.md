@@ -6,7 +6,7 @@ a matching `instruction.md` line when execution guidance exists. See
 
 ## Active
 
-- [CMD-02 — Swap2 "put two" nested search runs outside `thinking` and `protocolMutex`](docs/todo/CMD-02-swap2-puttwo-nested-search.md) — the second (BALANCE_TWO) search started from inside think's callback is not covered by `thinking` or the lock; its callback prints without the lock. Class C provisional. Found in CMD-01 (static reading).
+- [CMD-02 — Swap2 "put two" nested search runs outside `thinking` and `protocolMutex`](docs/todo/CMD-02-swap2-puttwo-nested-search.md) — the second (BALANCE_TWO) search started from inside think's callback is not covered by `thinking` or the lock; its callback prints without the lock. Class C provisional. Found in CMD-01 (static reading). Blocked 2026-11-09: no code path produces `Swap2PutTwo` (branch unreachable, latent); awaiting user decision (close / remove branch / implement put-two), see todo Finding.
 
 ## Done
 
