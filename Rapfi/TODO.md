@@ -6,6 +6,8 @@ a matching `instruction.md` line when execution guidance exists. See
 
 ## Active
 
+- [SEARCH-13 — MCTS singular-root stop blocks VCN proofs at a forced root](docs/todo/SEARCH-13-mcts-vcn-singular-root-stop.md) — stop after 100 nodes when the root has one move; AB is exempt in VCN (VCN-02 item 4). Found in VCN-03 slice 5. Class B, low priority.
+- [SEARCH-14 — MCTS prints no result line in BRIEF message mode](docs/todo/SEARCH-14-mcts-brief-mode-result-line.md) — AB prints `Speed … Eval … | Bestline`, MCTS nothing; only bare BRIEF sessions affected. Found in VCN-03 slice 5. Class C.
 - [SEARCH-12 — MCTS root with a five or flex four aborts in assert builds](docs/todo/SEARCH-12-mcts-forced-root-policy-assert.md) — ROOT picker's one-hot branches never set `hasPolicy`, `Node::createEdges` asserts it. Release unaffected. Found in VCN-03 slice 4. Class C.
 - [SEARCH-11 — MCTS edges not fully sorted by policy](docs/todo/SEARCH-11-mcts-policy-order-partial-sort.md) — `fastPartialSort(limit 0, PolicyComparator)` leaves score < 0 moves unsorted, breaking the cut and the first-unexplored-is-best assumption. Found in VCN-03 slice 3; measure on the real network first. Class B.
 - [SEARCH-04 — MCTS progressive widening](docs/todo/SEARCH-04-mcts-progressive-widening.md) — add edges as visits grow; needs safe reclamation of the replaced edge array. Class B.
