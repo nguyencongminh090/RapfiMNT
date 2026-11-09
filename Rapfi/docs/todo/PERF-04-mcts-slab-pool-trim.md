@@ -1,6 +1,6 @@
 # PERF-04 — MCTS retained slab pool after recycle
 
-**Status:** phase 2: verification done, final review pending (phase 1 done 2026-11-09). User choice 2026-11-09: (a). Found in the PERF-03 phase 2 review.
+**Status:** done 2026-11-09 (phase 1 and phase 2; final review clean, see "Final review"). User choice 2026-11-09: (a). 238/238 tests (asserts live, TSan, ASan), bench `17621937 / 8c1f72e5`, golden byte-identical, A/B recycle sequence byte-identical; §8 worst case real/graph limit 1.008 → 0.853; cycles/visit no regression (0.990 1T, 0.933 8T); recycle erase 170 → 244 ms over 25 recycles (about +3 ms per recycle). Branch `perf-04-slab-pool`, not merged. Found in the PERF-03 phase 2 review.
 **Class:** B (changes memory behaviour on budget-limited runs; search output on unbounded runs must
 stay byte-identical).
 
@@ -503,3 +503,85 @@ sequences still completed with exit 0.
   budgets (TT slice capped) stays derived, not measured.
 - The 8T budget run is one non-deterministic sample (run clean only).
 - TSan engine runs use the VCF TT suppression from PERF-03.
+
+## Final review (2026-11-09, Opus, before merge)
+
+Diff `2b1bfa0..perf-04-slab-pool` over `search/` and `tests/`, read against the current
+`search/mcts/nodetable.h`, the instruction's pitfalls / don't-touch / definition-of-done lists and
+`build/perf04/phase2/verify_raw.md`. `rapfi_tests` rerun in `build/`: 238/238, and
+`--check-asserts-live` aborts as it should. **No correctness bug found.**
+
+Checked, with the reasoning:
+
+- **Fast path** (`nodetable.h:452`, `numFree + bumpUnused < SlabNodes`). Only the head slab can
+  have never-handed-out slots: `allocateNodeStorage` opens a new slab only when `slabUsed ==
+  SlabNodes`, and after a head release `slabUsed` is reset to `SlabNodes` with a full slab as the new
+  head. So an empty non-head slab has 32 free-list entries, and an empty head has `slabUsed` free
+  entries plus `32 − slabUsed` unused ones, 32 in total as well. The condition is necessary, so the
+  early return is safe. The exact boundary (10 free + 22 unused = 32) is hit by
+  `eraseNodesIf_bumpSlabEmptied_slabReleased`.
+- **Node → slab mapping.** `upper_bound − 1` over slab addresses sorted by `std::less` (a total
+  order across separate allocations). A node at index 31 lies at `storage + 31·56 < storage + 1792`,
+  inside its own allocation, so it maps to its slab; `slab->storage` maps to its own slab too. The
+  debug assert checks the range.
+- **Free-list unlink.** One walk; it reads `next` before it relinks `prev`, and it handles both the
+  head and the middle of the list. It runs before any `delete`, and it touches only the first 8 bytes
+  of an entry (not poisoned).
+- **Release vs debug.** With no empty slab, the debug build walks the list but unlinks nothing
+  (`live[index] == 0` is never true) and then returns, the same result as the release early return
+  (`nodetable.h:482`). The `#ifndef NDEBUG` code only counts and asserts. `rapfi_tests` compiles
+  the engine sources itself with `-UNDEBUG`, so there is no ODR mix of the two variants. The release
+  path ran in the A/B recycle sequence on `rel/` (verification run 3).
+- **Bump slab** (`nodetable.h:523–534`). `slabUsed` is reset only when the head is freed; a kept
+  head keeps it. The guard test `..._bumpSlabReleased_nextInsertsStartNewSlabAndKeepSurvivors` would
+  catch a stale `slabUsed`.
+- **ASan.** Storage offsets are `8 + 56k` from an 8-aligned slab, so the poisoned range (bytes 8..55)
+  is granule-aligned. Unpoisoning happens on reuse (`allocateNodeStorage`) and on every slab
+  `delete` (`deleteSlab`, used by both `releaseEmptySlabs` and `releaseAllSlabs`).
+- **Order inside `rebuildAfterErase`.** `releaseEmptySlabs` runs before `rehash`, on the old slot
+  array, in which the erased entries are already zero.
+- **Locking and accounting.** The only caller is `eraseNodesIf`, called from `recycleOldNodes`
+  through `processAllShards`, which holds the shard's unique lock, between searches.
+  `nodetable.h` does not touch `graphMemoryUsed`.
+- **Use-after-free audit, rechecked against the code.** `setupRootNode` reassigns `graph.root`
+  before it recycles (`search.cpp:1539`). `recursiveApply` sets a node's age only after all its
+  children returned (`search.cpp:1254`), and new nodes get the pre-increment age
+  (`allocateOrFindNode`, `search.cpp:389`), so a node with the new age has its whole subtree
+  marked. `freeRetiredEdgeArrays` runs after every search (`search.cpp:1417`), and the new assert
+  is at `search.cpp:1564`. A grep outside `build/`, `external/` and `tests/` for `static … Node *`,
+  `thread_local`, `graph.root` and `MCTS::Node` finds only `graph.root` uses in `search.cpp` and
+  `NodeTable::slotNode`. `mcts_visits_tests.cpp` 523–572 reuses the same position (early return at
+  `search.cpp:1534`, no recycle). `mcts_vcn_tests.cpp` 315 does not dereference `vcnRoot` after the
+  next search. The audit holds.
+- **Scope.** Only `nodetable.h`, one assert in `search.cpp`, tests and docs changed. Nothing on the
+  don't-touch list moved.
+
+Minor, non-blocking:
+
+1. `recycleOldNodes_afterMoveForward_noShardKeepsSlabWithoutLiveNode` and the budget test
+   (`tests/mcts_nodetable_tests.cpp:834`, `:856`) check `numSlabs <= numNodes` per shard
+   (`noShardHasMoreSlabsThanNodes`, `:824`). That is necessary, not sufficient: a shard with 2 live
+   nodes in one slab plus one empty slab would pass. The test name claims the stronger property.
+   They did fail first, and the per-slab property is pinned by the `NodeTable`-level tests. No test
+   hook added (out of scope).
+2. The release-only early return (`nodetable.h:482`) gives the two builds different control flow. The
+   behaviour is the same and the A/B run covers it, but moving the debug consistency check into its
+   own loop and returning early unconditionally would make one path. Optional.
+
+**Recycle erase cost (+3 ms per recycle, 170 → 244 ms over 25 recycles, 1T).** Inherent to the
+design without per-slab counters. Per shard it adds a third pass over the slot words, two or three
+small vectors, a binary search per live and per free entry, a pointer chase through the free list
+(scattered dead storage, cache misses), and one `free()` per released 1800 B slab. On near-total
+recycles the `free()` calls dominate (largest recycle 22 → 34 ms). Folding the live count into
+`eraseNodesIf`'s own loop would save one slot pass, a modest gain. Not worth doing before merge;
+the cost is about 0.2 s per 37-move game against about 37 s of search.
+
+**Verdict:** ready to merge; the user decides.
+
+### Open follow-ups (observations, no TODO code)
+
+- **Pipe harness stall.** The verification harness (`build/perf04/phase2` `multi4.py`) sometimes
+  stalls: the engine sits idle on stdin without having sent a `bestmove`. It happens equally on the
+  base and the new binaries: 3 of 6 runs per binary in a 12-process stress run, plus one base 8T
+  stall on an otherwise idle machine. Not caused by PERF-04; recorded as an observation only.
+- Optional: fold the per-slab live count into the `eraseNodesIf` loop (minor note above).
