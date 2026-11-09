@@ -792,37 +792,10 @@ void yxvcn_afterInfoVcthread_restoresPersistentLevel()
 }
 
 // --------------------------------------------------------------------------
-// VCN-03 slice 0: VCN mode is alpha-beta only; the MCTS searcher must not answer as VCN
+// VCN-03 slice 5: VCN mode runs under the MCTS searcher too, so the protocol neither refuses nor
+// warns. The YXVCN-under-MCTS searches need an evaluator and live in tests/mcts_vcn_tests.cpp.
 
-void yxvcn_mctsSearcher_errorsAndDoesNotSearchAsVcn()
-{
-    // Arrange: MCTS searcher, persistent level VC2; fresh threads have no root moves
-    resetProtocolState(FREESTYLE, openThreePosition());
-    ScopedMctsSearcher mcts;
-    runInfo("VCTHREAD 2");
-    GP::options.maxNodes = 64;  // keep a wrongly started search short
-    assert(Search::Engine.main()->rootMoves.empty());
-    std::string out;
-
-    // Act
-    {
-        ScopedCoutCapture cap;
-        {
-            ScopedCin cin("3");
-            GP::searchVCN();
-        }
-        Search::Engine.waitForIdle();
-        out = cap.str();
-    }
-
-    // Assert: refused with an error, no search ran, persistent level untouched
-    assert(out.find("ERROR") != std::string::npos);
-    assert(out.find("MCTS") != std::string::npos);
-    assert(Search::Engine.main()->rootMoves.empty());
-    assert(GP::options.vcnMode.n == VCNLevel::VC2);
-}
-
-void infoVcthread_mctsSearcher_warns()
+void infoVcthread_mctsSearcher_noWarning()
 {
     // Arrange
     resetProtocolState(FREESTYLE, quietPosition());
@@ -831,13 +804,12 @@ void infoVcthread_mctsSearcher_warns()
     // Act
     std::string out = runInfoCaptured("VCTHREAD 1");
 
-    // Assert: warned, level still set (it applies again under alpha-beta)
-    assert(out.find("ERROR") != std::string::npos);
-    assert(out.find("not supported by the MCTS searcher") != std::string::npos);
+    // Assert: no error, level set
+    assert(out.find("ERROR") == std::string::npos);
     assert(GP::options.vcnMode.n == VCNLevel::VC3);
 }
 
-void infoVcthread_alphabetaSearcher_noMctsWarning()
+void infoVcthread_alphabetaSearcher_noWarning()
 {
     // Arrange: default (alpha-beta) searcher
     resetProtocolState(FREESTYLE, quietPosition());
@@ -846,11 +818,11 @@ void infoVcthread_alphabetaSearcher_noMctsWarning()
     std::string out = runInfoCaptured("VCTHREAD 1");
 
     // Assert
-    assert(out.find("not supported by the MCTS searcher") == std::string::npos);
+    assert(out.find("ERROR") == std::string::npos);
     assert(GP::options.vcnMode.n == VCNLevel::VC3);
 }
 
-void infoSearchType_mctsWithVcnLevelSet_warns()
+void infoSearchType_mctsWithVcnLevelSet_noWarningAndKeepsLevel()
 {
     // Arrange: a persistent level set under alpha-beta
     resetProtocolState(FREESTYLE, quietPosition());
@@ -864,8 +836,7 @@ void infoSearchType_mctsWithVcnLevelSet_warns()
     }
 
     // Assert
-    assert(out.find("ERROR") != std::string::npos);
-    assert(out.find("not supported by the MCTS searcher") != std::string::npos);
+    assert(out.find("ERROR") == std::string::npos);
     assert(GP::options.vcnMode.n == VCNLevel::VC2);
 }
 
@@ -907,8 +878,7 @@ void runVcnTests()
     RUN_TEST(infoVcthread_lowercaseAsSentByGui_isAccepted);
     RUN_TEST(yxvcn_levelOutOfRange_errorsAndDoesNotSearch);
     RUN_TEST(yxvcn_afterInfoVcthread_restoresPersistentLevel);
-    RUN_TEST(yxvcn_mctsSearcher_errorsAndDoesNotSearchAsVcn);
-    RUN_TEST(infoVcthread_mctsSearcher_warns);
-    RUN_TEST(infoVcthread_alphabetaSearcher_noMctsWarning);
-    RUN_TEST(infoSearchType_mctsWithVcnLevelSet_warns);
+    RUN_TEST(infoVcthread_mctsSearcher_noWarning);
+    RUN_TEST(infoVcthread_alphabetaSearcher_noWarning);
+    RUN_TEST(infoSearchType_mctsWithVcnLevelSet_noWarningAndKeepsLevel);
 }

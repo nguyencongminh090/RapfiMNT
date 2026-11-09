@@ -45,6 +45,7 @@
 #include "../search/mcts/searchtesting.h"
 #include "../search/movepick.h"
 #include "../search/searchconfig.h"
+#include "../core/iohelper.h"
 #include "../core/time.h"
 #include "../game/wincheck.h"
 #include "../search/hashtable.h"
@@ -67,6 +68,14 @@
     #include <sys/wait.h>
     #include <unistd.h>
 #endif
+
+namespace Command::GomocupProtocol {
+extern std::unique_ptr<Board> board;
+extern Search::SearchOptions  options;
+void                          searchVCN();
+}  // namespace Command::GomocupProtocol
+
+namespace GP = Command::GomocupProtocol;
 
 using namespace Search;
 using namespace Search::MCTS;
@@ -1420,6 +1429,181 @@ void mctsVcn_smokeVsAb_noMateAbRefutes()
 }
 
 // ----------------------------------------------------------------------------------------------
+// VCN-03 slice 5: YXVCN through the protocol under the MCTS searcher (stand-in evaluator, one
+// thread, fixed node count, so deterministic). Roots have no five or flex four (SEARCH-12).
+
+/// The protocol state of a YXVCN query: `moves` on a fresh board, a fixed node limit.
+void resetProtocolForMcts(const std::vector<Pos> &moves, uint64_t maxNodes)
+{
+    Search::Engine.clear(true);
+    Search::Engine.waitForIdle();
+    GP::options                     = SearchOptions {};
+    GP::options.rule                = {FREESTYLE, GameRule::FREEOPEN};
+    GP::options.disableOpeningQuery = true;
+    GP::options.maxDepth            = 8;  // ignored by MCTS; AB stops on it
+    GP::options.maxNodes            = maxNodes;
+    GP::board                       = plainBoard(FREESTYLE, moves);
+}
+
+/// Runs `YXVCN <level>` and returns everything it printed.
+std::string runYxvcnCaptured(int level)
+{
+    ScopedCoutCapture cap;
+    {
+        ScopedCin cin(std::to_string(level));
+        GP::searchVCN();
+    }
+    Search::Engine.waitForIdle();
+    return cap.str();
+}
+
+std::string movesText(const std::vector<Pos> &pv)
+{
+    std::ostringstream oss;
+    oss << MovesText {pv};
+    return oss.str();
+}
+
+constexpr uint64_t ProtocolNodes = 20000;
+
+/// The NORMAL message mode for one test (the mode a GUI gets: setGUIMode turns BRIEF into NORMAL).
+/// MCTS prints its root-move lines in NORMAL / UCILIKE only; the built-in default is BRIEF.
+struct ScopedNormalMessages
+{
+    MsgMode saved = Config::GeneralCfg.messageMode;
+    ScopedNormalMessages() { Config::GeneralCfg.messageMode = MsgMode::NORMAL; }
+    ~ScopedNormalMessages() { Config::GeneralCfg.messageMode = saved; }
+};
+
+void yxvcn_mctsSearcher_runsVcnSearchAndRestoresLevel()
+{
+    // Arrange: MCTS, persistent level VC2 set through INFO VCTHREAD, quiet position
+    MctsEngineFixture fx;
+    resetProtocolForMcts(quietMoves(), ProtocolNodes);
+    GP::options.vcnMode.n = VCNLevel::VC2;
+    assert(Search::Engine.main()->rootMoves.empty());
+
+    // Act: one-shot VC4 query
+    std::string out = runYxvcnCaptured(4);
+
+    // Assert: no refusal, a search ran in VCN mode (a quiet VC4 attacker loses: an ordinary
+    // search would print a near-zero value), the root is VCN-keyed, the persistent level is back
+    assert(out.find("ERROR") == std::string::npos);
+    assert(!Search::Engine.main()->rootMoves.empty());
+    assert(Search::Engine.main()->rootMoves[0].value <= VALUE_MATED_IN_MAX_PLY);
+    auto quiet = plainBoard(FREESTYLE, quietMoves());
+    assert(fx.searcher().graph.root->getHash() != quiet->zobristKey());
+    assert(GP::options.vcnMode.n == VCNLevel::VC2);
+}
+
+/// §7 slice 5 (`mctsVcn_vc2/vc3/vc4_openThreeAttacker_mates`): the open-three root is a forced
+/// ROOT-picker branch (a flex-four move exists), which aborts in assert builds (SEARCH-12). So the
+/// end-to-end mate is checked on the far-VCF root after the forced pair, at every level; the open
+/// three is measured on the release build (slice 5 Part C).
+void mctsVcn_vc2Vc3Vc4_farVcfAttacker_mates()
+{
+    MctsEngineFixture fx;
+    for (int level : {2, 3, 4}) {
+        // Arrange
+        resetProtocolForMcts(afterForcedPair(farVcfAfterForcedBlockMoves()), ProtocolNodes);
+
+        // Act
+        std::string out = runYxvcnCaptured(level);
+
+        // Assert
+        assert(out.find("ERROR") == std::string::npos);
+        assert(Search::Engine.main()->rootMoves[0].value >= VALUE_MATE_IN_MAX_PLY);
+        assert(!GP::options.vcnMode.enabled());
+    }
+}
+
+/// The double three after the forced pair: a VC3 win (pass, then an open four), a VC4 loss
+/// (a defender pass refutes it), through the protocol.
+void mctsVcn_doubleThreeAfterForcedPair_vc3WinsVc4Loses()
+{
+    MctsEngineFixture fx;
+    resetProtocolForMcts(afterForcedPair(doubleThreeAfterForcedBlockMoves()), ProtocolNodes);
+    runYxvcnCaptured(3);
+    assert(Search::Engine.main()->rootMoves[0].value >= VALUE_MATE_IN_MAX_PLY);
+
+    resetProtocolForMcts(afterForcedPair(doubleThreeAfterForcedBlockMoves()), ProtocolNodes);
+    runYxvcnCaptured(4);
+    assert(Search::Engine.main()->rootMoves[0].value <= VALUE_MATED_IN_MAX_PLY);
+}
+
+void yxvcn_mctsSearcher_vc4FarVcf_printsMateAndBestmoveNotPass()
+{
+    // Arrange: a non-forced root (SEARCH-12) with a VC4 win
+    ScopedNormalMessages messages;
+    MctsEngineFixture    fx;
+    const std::vector<Pos> moves = afterForcedPair(farVcfAfterForcedBlockMoves());
+    resetProtocolForMcts(moves, ProtocolNodes);
+    const auto before = plainBoard(FREESTYLE, moves);
+
+    // Act
+    std::string out = runYxvcnCaptured(4);
+
+    // Assert: a "+M" root line; the move sent (and played on the protocol board) is not a pass
+    const auto &rm = Search::Engine.main()->rootMoves[0];
+    assert(rm.value >= VALUE_MATE_IN_MAX_PLY);
+    assert(out.find("+M") != std::string::npos);
+    assert(rm.pv[0] != Pos::PASS);
+    assert(Search::Engine.ctx.bestMove != Pos::PASS);
+    assert(GP::board->ply() == before->ply() + 1);
+    assert(GP::board->getLastMove() == rm.pv[0]);
+    std::ostringstream passCoord;
+    passCoord << CoordText {Pos::PASS, 15, CoordConversionMode::NONE};
+    assert(out.find("\n" + passCoord.str() + "\n") == std::string::npos);
+}
+
+/// §7 slice 5: a VC4 attacker without a VCF loses, through the protocol.
+void mctsVcn_vc4_attackerWithoutVcf_loses()
+{
+    MctsEngineFixture fx;
+    resetProtocolForMcts(quietMoves(), ProtocolNodes);
+    runYxvcnCaptured(4);
+    assert(Search::Engine.main()->rootMoves[0].value <= VALUE_MATED_IN_MAX_PLY);
+}
+
+/// §7 slice 5: at VC3 a quiet attacker is refuted by a defender pass; the refutation is in the PV.
+void mctsVcn_vc3_attackerWithoutThreat_defenderPassRefutes()
+{
+    MctsEngineFixture fx;
+    resetProtocolForMcts(quietMoves(), ProtocolNodes);
+    runYxvcnCaptured(3);
+    const auto &rm = Search::Engine.main()->rootMoves[0];
+    assert(rm.value <= VALUE_MATED_IN_MAX_PLY);
+    assert(rm.pv.size() >= 2 && rm.pv[1] == Pos::PASS);
+}
+
+void extractPV_mctsVcnPassInLine_printsPassLikeAb()
+{
+    // Arrange: the AB answer to the same query, printed by the shared formatter
+    ScopedNormalMessages messages;
+    resetProtocolForMcts(quietMoves(), 0);
+    std::string abOut = runYxvcnCaptured(3);
+    std::vector<Pos> abPv = Search::Engine.main()->rootMoves[0].pv;
+    assert(std::count(abPv.begin(), abPv.end(), Pos::PASS) > 0 && "precondition: AB PV has a pass");
+    assert(abOut.find(movesText(abPv)) != std::string::npos);
+
+    MctsEngineFixture fx;
+    resetProtocolForMcts(quietMoves(), ProtocolNodes);
+
+    // Act
+    std::string out = runYxvcnCaptured(3);
+
+    // Assert: the MCTS PV holds a PASS, printed as AB prints it ("Pass" between moves), on the
+    // root-move line; no other move is garbage (every entry is PASS or an on-board cell)
+    std::vector<Pos> pv = Search::Engine.main()->rootMoves[0].pv;
+    assert(std::count(pv.begin(), pv.end(), Pos::PASS) > 0);
+    for (Pos p : pv)
+        assert(p == Pos::PASS || GP::board->isInBoard(p));
+    std::string text = movesText(pv);
+    assert(text.find("Pass") != std::string::npos);
+    assert(out.find("| " + text) != std::string::npos);
+}
+
+// ----------------------------------------------------------------------------------------------
 
 bool isolateMode()
 {
@@ -1521,4 +1705,13 @@ void runMctsVcnTests()
     RUN_ENGINE_TEST(simpleVcf_vcfOnlyMode_ttKeySeparatedFromPlain);
     RUN_ENGINE_TEST(evaluateNode_vcnLeaves_matchAbSignAndMateClass);
     RUN_ENGINE_TEST(mctsVcn_smokeVsAb_noMateAbRefutes);
+
+    // VCN-03 slice 5: YXVCN under MCTS through the protocol, PV with PASS
+    RUN_ENGINE_TEST(yxvcn_mctsSearcher_runsVcnSearchAndRestoresLevel);
+    RUN_ENGINE_TEST(mctsVcn_vc2Vc3Vc4_farVcfAttacker_mates);
+    RUN_ENGINE_TEST(mctsVcn_doubleThreeAfterForcedPair_vc3WinsVc4Loses);
+    RUN_ENGINE_TEST(yxvcn_mctsSearcher_vc4FarVcf_printsMateAndBestmoveNotPass);
+    RUN_ENGINE_TEST(mctsVcn_vc4_attackerWithoutVcf_loses);
+    RUN_ENGINE_TEST(mctsVcn_vc3_attackerWithoutThreat_defenderPassRefutes);
+    RUN_ENGINE_TEST(extractPV_mctsVcnPassInLine_printsPassLikeAb);
 }
