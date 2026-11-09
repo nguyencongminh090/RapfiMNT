@@ -224,8 +224,15 @@ jump does not recycle, because a recycle on a backward move needs `overBudget`. 
   changes: the public API, slab size and alignment, the slot arrays, `graphMemoryUsed`.
 - **Expected effect:** real table heap follows the survivors after a recycle. The invariant is
   "every slab holds at least one live node", so `H ≤ G + C0 + 31·56 B · N_s` (phase 1 table).
-  Search output does not change, bounded or not, because `graphMemoryUsed` is untouched and
-  nothing orders by `Node *` (audit item 9).
+  Search output does not change on unbounded runs or on runs with an explicit MAX_MEMORY,
+  because `graphMemoryUsed` is untouched and nothing orders by `Node *` (audit item 9).
+  Default-budget runs (no MAX_MEMORY) depend on MemAvailable, as before (next point).
+- **`deriveDefaultGraphBudget`:** its `graphUsedBytes` input is `G`, which is unchanged. The
+  default budget can move only through `availablePhysicalMemoryKB()`. It rises if glibc
+  returns the freed 1800 B chunks to the OS, and stays the same if they stay in the arena (likely
+  without `malloc_trim`). Before (a), the retained pool counted neither as available nor as owned,
+  so the default budget was low by up to the gap. (a) can only reduce that error, never make the
+  budget count memory twice.
 - **How it is measured:** unit tests below; bench `17621937 / 8c1f72e5`; golden byte-identical; ASan
   on the suite. Then, by the verification agent: the A/B recycle sequence byte-identical against
   the 1b6370a binary (unbounded and budget-limited), the gap curve, peak RSS, budget closure, cycles
@@ -398,7 +405,14 @@ Data under `build/perf04/phase2/`.
 | ASan + UBSan (`-fno-sanitize=enum`) on the suite | **238/238 pass, stderr empty** (no ASan or UBSan report), with poisoning active | `build_asan.sh` (pattern of `build/perf03/phase2/build_san.sh`) → `asan/`; `asan_tests.{txt,stderr}` |
 
 The golden run is a single search, so it does not exercise a recycle. Recycle byte-identity is
-the A/B sequence below.
+the A/B sequence below. **The release (NDEBUG) path of `releaseEmptySlabs` has not run yet.**
+`rapfi_tests` and the ASan binaries have asserts live, so every recycle so far took the debug
+path, which always walks the free list and checks it. The release-only early return ("no empty
+slab") and the walk without counters run for the first time in the A/B recycle sequence on
+`rel/pbrain-rapfi`.
+
+Placement: the engine-level tests are in `mcts_nodetable_tests.cpp`, not `mcts_memory_tests.cpp`,
+because only the former has an engine fixture. The `instruction.md` index line is unchanged.
 
 ### Pending (verification agent, scripted)
 
