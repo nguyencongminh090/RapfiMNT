@@ -6,10 +6,9 @@ to a detail file under `docs/instruction/`. Read the matching entry here before 
 
 ## Active
 
-- [CMD-02 — Swap2 "put two" nested search runs outside `thinking` and `protocolMutex`](docs/instruction/CMD-02-swap2-puttwo-nested-search.md) — deterministic test first, keep the CMD-01 flag-before-print invariant
-
 ## Done
 
+- [CMD-02 — Swap2 "put two" nested search runs outside `thinking` and `protocolMutex`](docs/instruction/CMD-02-swap2-puttwo-nested-search.md) — closed 2026-11-09 (user): branch unreachable, no code change
 - [CMD-01 — Engine stalls without sending a best move under a pipe harness](docs/instruction/CMD-01-engine-stall-no-bestmove.md) — done 2026-11-09 (see todo results; reduced scope approved by the user)
 - [PERF-04 — MCTS retained slab pool after recycle](docs/instruction/PERF-04-mcts-slab-pool-trim.md) — done 2026-11-09 (see todo results)
 - [PERF-03 — MCTS node table footprint](docs/instruction/PERF-03-mcts-node-table-footprint.md) — done 2026-11-09 (see todo results)

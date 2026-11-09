@@ -1,7 +1,10 @@
 # CMD-02 — Swap2 "put two" nested search runs outside `thinking` and `protocolMutex`
 
-**Status:** open, blocked on a user decision (2026-11-09): the `Swap2PutTwo` branch is unreachable
-in this tree, see "Finding" below. No code changed.
+**Status:** closed 2026-11-09 (user decision: option 1, close as not reachable). The `Swap2PutTwo`
+branch is unreachable in this tree, see "Finding" below. No code changed; the latent defects stay
+documented here for whoever makes the engine produce `Swap2PutTwo` (that would be a new class B
+item, and this fix must come first).
+Earlier status: open, blocked on a user decision (2026-11-09).
 (Recorded 2026-11-09 during CMD-01.)
 **Class:** C provisional (protocol layer, `command/gomocup.cpp`). Reclassify if the fix needs a
 change in the search start/stop signalling (B).
