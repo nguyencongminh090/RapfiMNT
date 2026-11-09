@@ -1605,6 +1605,161 @@ void extractPV_mctsVcnPassInLine_printsPassLikeAb()
 
 // ----------------------------------------------------------------------------------------------
 
+// ----------------------------------------------------------------------------------------------
+// SEARCH-12: the ROOT MovePicker marks a policy on forced roots (five, flex four), which
+// Node::createEdges asserts (hasPolicyScore) for every MCTS root expansion.
+
+/// What a ROOT picker built with a normalised policy yields: the moves in order, the policy of
+/// each (read right after the call that returned it), and the picker's two policy flags.
+struct RootPick
+{
+    std::vector<Pos>   moves;
+    std::vector<float> policy;
+    bool               hasPolicyScore      = false;
+    bool               hasNormalizedPolicy = false;
+};
+
+RootPick pickRoot(const Board &board, Rule rule)
+{
+    MovePicker mp(rule, board, MovePicker::ExtraArgs<MovePicker::ROOT> {true, 1.0f});
+    RootPick   r;
+    while (Pos move = mp()) {
+        r.moves.push_back(move);
+        r.policy.push_back(mp.curMoveNormalizePolicy());
+    }
+    r.hasPolicyScore      = mp.hasPolicyScore();
+    r.hasNormalizedPolicy = mp.hasNormalizedPolicy();
+    return r;
+}
+
+/// Black has a closed four on column 7 (white at (7,4)); its only five point is (7,9).
+/// White to move: the opponent has a five.
+std::vector<Pos> opponentFiveMoves()
+{
+    return {Pos(7, 5), Pos(7, 4), Pos(7, 6), Pos(0, 0), Pos(7, 7), Pos(0, 2), Pos(7, 8)};
+}
+
+/// The same closed four with black to move: the side to move has a five.
+std::vector<Pos> ownFiveMoves()
+{
+    std::vector<Pos> m = opponentFiveMoves();
+    m.push_back(Pos(0, 4));
+    return m;
+}
+
+/// Black has an open three (7,5)-(7,7) and white to move: the opponent has a flex-four threat.
+std::vector<Pos> opponentFlexFourMoves()
+{
+    return {Pos(7, 5), Pos(0, 0), Pos(7, 6), Pos(0, 2), Pos(7, 7)};
+}
+
+/// The same open three with black to move: the side to move can make a flex four.
+std::vector<Pos> ownFlexFourMoves()
+{
+    std::vector<Pos> m = opponentFlexFourMoves();
+    m.push_back(Pos(0, 4));
+    return m;
+}
+
+/// Asserts the picker output is one-hot: a non-empty list, first move 1.0, every other 0.0.
+void assertOneHot(const RootPick &r)
+{
+    assert(!r.moves.empty());
+    assert(r.policy.size() == r.moves.size());
+    assert(r.policy[0] == 1.0f);
+    for (size_t i = 1; i < r.policy.size(); i++)
+        assert(r.policy[i] == 0.0f);
+}
+
+void movePickerRoot_opponentFive_normalizedPolicy_hasPolicyScore()
+{
+    // Arrange: white to move, black threatens five at (7,9)
+    auto board = plainBoard(FREESTYLE, opponentFiveMoves());
+    assert(board->sideToMove() == WHITE);
+    assert(board->p4Count(BLACK, A_FIVE) && !board->p4Count(WHITE, A_FIVE));
+
+    // Act
+    RootPick r = pickRoot(*board, FREESTYLE);
+
+    // Assert: the single block, one-hot, flags set
+    assert(r.moves.size() == 1 && r.moves[0] == Pos(7, 9));
+    assertOneHot(r);
+    assert(r.hasNormalizedPolicy);
+    assert(r.hasPolicyScore);
+}
+
+void movePickerRoot_ownFive_normalizedPolicy_hasPolicyScore()
+{
+    // Arrange: black to move with a five available at (7,9)
+    auto board = plainBoard(FREESTYLE, ownFiveMoves());
+    assert(board->sideToMove() == BLACK);
+    assert(board->p4Count(BLACK, A_FIVE));
+
+    // Act
+    RootPick r = pickRoot(*board, FREESTYLE);
+
+    // Assert
+    assert(r.moves[0] == Pos(7, 9));
+    assertOneHot(r);
+    assert(r.hasNormalizedPolicy);
+    assert(r.hasPolicyScore);
+}
+
+void movePickerRoot_ownFlexFour_normalizedPolicy_hasPolicyScore()
+{
+    // Arrange: black to move with an open three, no five on the board
+    auto board = plainBoard(FREESTYLE, ownFlexFourMoves());
+    assert(board->sideToMove() == BLACK);
+    assert(!board->p4Count(BLACK, A_FIVE) && !board->p4Count(WHITE, A_FIVE));
+    assert(board->p4Count(BLACK, B_FLEX4));
+
+    // Act
+    RootPick r = pickRoot(*board, FREESTYLE);
+
+    // Assert
+    assertOneHot(r);
+    assert(r.hasNormalizedPolicy);
+    assert(r.hasPolicyScore);
+}
+
+void movePickerRoot_opponentFlexFour_normalizedPolicy_hasPolicyScore()
+{
+    // Arrange: white to move facing an open three; this branch scores through the evaluator
+    // (scoreAllMoves<POLICY>), so the board is bound to a thread with a stand-in evaluator.
+    MctsEngineFixture fx;
+    auto src = plainBoard(FREESTYLE, opponentFlexFourMoves());
+    Board board(*src, threadWithEvaluator(FREESTYLE));
+    assert(board.sideToMove() == WHITE);
+    assert(!board.p4Count(BLACK, A_FIVE) && !board.p4Count(WHITE, A_FIVE));
+    assert(!board.p4Count(WHITE, B_FLEX4) && board.p4Count(BLACK, B_FLEX4));
+
+    // Act
+    RootPick r = pickRoot(board, FREESTYLE);
+
+    // Assert: pins current behaviour (not changed by SEARCH-12)
+    assert(!r.moves.empty());
+    assert(r.hasNormalizedPolicy);
+    assert(r.hasPolicyScore);
+}
+
+void mctsSearch_rootOpponentFive_assertBuild_completesWithBlockMove()
+{
+    // Arrange: MCTS with the stand-in evaluator, white to move against a closed four
+    MctsEngineFixture fx;
+    auto board = plainBoard(FREESTYLE, opponentFiveMoves());
+    assert(board->p4Count(BLACK, A_FIVE));
+    SearchOptions opts = searchOptions(*board, 2000, VCNLevel::None);
+
+    // Act: asserts are live in rapfi_tests, so this aborts in Node::createEdges before the fix
+    runMctsSearch(*board, opts);
+
+    // Assert: the search completed and answers the only block
+    assert(!Search::Engine.main()->rootMoves.empty());
+    assert(Search::Engine.main()->rootMoves[0].pv[0] == Pos(7, 9));
+}
+
+// ----------------------------------------------------------------------------------------------
+
 bool isolateMode()
 {
     const char *env = std::getenv("RAPFI_TEST_ISOLATE");
@@ -1714,4 +1869,11 @@ void runMctsVcnTests()
     RUN_ENGINE_TEST(mctsVcn_vc4_attackerWithoutVcf_loses);
     RUN_ENGINE_TEST(mctsVcn_vc3_attackerWithoutThreat_defenderPassRefutes);
     RUN_ENGINE_TEST(extractPV_mctsVcnPassInLine_printsPassLikeAb);
+
+    // SEARCH-12: ROOT picker policy flag on forced roots
+    RUN_PURE_TEST(movePickerRoot_opponentFive_normalizedPolicy_hasPolicyScore);
+    RUN_PURE_TEST(movePickerRoot_ownFive_normalizedPolicy_hasPolicyScore);
+    RUN_PURE_TEST(movePickerRoot_ownFlexFour_normalizedPolicy_hasPolicyScore);
+    RUN_ENGINE_TEST(movePickerRoot_opponentFlexFour_normalizedPolicy_hasPolicyScore);
+    RUN_ENGINE_TEST(mctsSearch_rootOpponentFive_assertBuild_completesWithBlockMove);
 }
