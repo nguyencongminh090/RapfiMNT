@@ -6,11 +6,11 @@ a matching `instruction.md` line when execution guidance exists. See
 
 ## Active
 
-- [SEARCH-04 — MCTS progressive widening](docs/todo/SEARCH-04-mcts-progressive-widening.md) — add edges as visits grow; needs safe reclamation of the replaced edge array. Class B.
 - [PERF-03 — MCTS node table footprint](docs/todo/PERF-03-mcts-node-table-footprint.md) — measure real bytes per node; replace `std::set` shards. Class B/C.
 
 ## Done
 
+- [SEARCH-04 — MCTS progressive widening](docs/todo/SEARCH-04-mcts-progressive-widening.md) — add edges as visits grow; needs safe reclamation of the replaced edge array. Class B. Closed 2026-11-09 (user): not worth doing; SEARCH-10 already re-adds cut moves on the "every kept reply lost" trigger (quiescent-state reclamation, no epoch/hazard pointers needed), and no measurement shows a strength loss from one-shot cutting beyond those cases; general widening would weaken the SEARCH-03 memory bound. No code change.
 - [SEARCH-11 — MCTS edges not fully sorted by policy](docs/todo/SEARCH-11-mcts-policy-order-partial-sort.md) — `fastPartialSort(limit 0, PolicyComparator)` leaves score < 0 moves unsorted, breaking the cut and the first-unexplored-is-best assumption. Found in VCN-03 slice 3; measure on the real network first. Class B. Closed 2026-11-09 (user): measured on the real network (122 positions, 100K nodes, mass 0.99): 1.23 % of 788K expansions unsorted, 0.012 % of cuts wrong, mean misplaced mass 0.0009; negligible, no code change, bench and golden untouched.
 - [SEARCH-13 — MCTS singular-root stop blocks VCN proofs at a forced root](docs/todo/SEARCH-13-mcts-vcn-singular-root-stop.md) — stop after 100 nodes when the root has one move; AB is exempt in VCN (VCN-02 item 4). Found in VCN-03 slice 5. Class B, low priority. Done 2026-11-09: stop exempted under VCN (205/205 tests, bench and golden identical, zero wrong); P4 VC3/VC2 stayed unproven because of the 32 MB graph limit in the Part C harness, not the algorithm (SEARCH-15).
 - [SEARCH-15 — MCTS does not prove P4 VC3 / VC2 at a forced root](docs/todo/SEARCH-15-mcts-vcn-forced-root-unproven.md) — investigation only. Done 2026-11-09: the Part C runs had a 32 MB graph budget (graph closed after ~2.3M visits, a closed graph cannot finish a proof); with 64 MB (VC3 `-M8`) / 384 MB (VC2 `+M17`) the defaults prove both. No production change, no fix recommended.

@@ -1,6 +1,8 @@
 # SEARCH-04 — MCTS progressive widening
 
-**Status:** open (recorded 2026-11-07, not started).
+**Status:** closed 2026-11-09 (user), not done. Recorded 2026-11-07.
+
+**Reason:** SEARCH-10 already re-adds cut moves when every kept reply is lost, with a retire list freed at the search boundary, so epoch-based reclamation and hazard pointers are not needed. No measurement shows a strength loss from one-shot cutting beyond that case. General widening would also weaken the SEARCH-03 memory bound. Reopen only if a measurement on the real network shows many missed good moves (compare SEARCH-11: 0.012 %). No code change.
 **Class:** B.
 
 ## Problem
