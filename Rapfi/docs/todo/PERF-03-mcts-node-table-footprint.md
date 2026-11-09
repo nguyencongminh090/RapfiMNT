@@ -1,7 +1,8 @@
 # PERF-03 — MCTS node table footprint
 
-**Status:** phase 1 done 2026-11-09 (measurements and candidate ranking below); phase 2 waits for
-the user's choice of structure. Recorded 2026-11-07.
+**Status:** phase 1 done 2026-11-09; user chose option (b) 2026-11-09; phase 2 implemented on
+branch `perf-03-node-table`; verification (TSan/ASan, RSS, cycles/visit, PGO) pending.
+Recorded 2026-11-07.
 **Class:** B or C, depending on the final structure (representation change inside `NodeTable`).
 
 ## Problem
@@ -252,7 +253,7 @@ derived-state audit is needed.
 - **Growth.** The capacity doubles when an insert would take the load above 3/4. The rehash moves
   only slot words, never a `Node`.
 - **Slab pool.** Nodes live in per-shard slabs of raw storage built with placement new. Slabs are
-  allocated lazily, one fixed-size slab at a time, and are never moved or reallocated until the
+  allocated lazily, one fixed-size slab of 32 nodes (1800 B with the next pointer) at a time, and are never moved or reallocated until the
   shard is cleared. Freed nodes go on a LIFO free list (next pointer stored in the dead storage),
   and the free list is used before the bump pointer.
 - **Recycle.** `NodeTable::eraseNodesIf(shard, pred)` calls `pred(node)` on each live node while
@@ -308,3 +309,46 @@ file does not compile: tests 7, 8, 9, 14, 15, 16 and 18 use the new statistics A
 (`getShardStats`, `SlabNodes`, `SlabBytes`, `heapBytes`). With those 7 excluded by a temporary
 local `#if 0`, the other 13 pass on `std::set` (221/221, 208 before). So the `test:` commit
 alone does not build `rapfi_tests`; the `perf:` commit makes it build.
+
+### Footprint constant (decision note, hard rule 9)
+
+- **What:** `NodeTableEntryOverhead` 48 -> **19**, so `nodeFootprint()` = 56 + 19 = 75 B.
+- **Expected:** no change while the graph is unbounded (golden identical). On budget-limited
+  runs the graph closes later: the accounted cost per graph node drops from 306.4 B to
+  about 277.4 B at the phase-1 reference run (+10.5 % nodes per budget, edge estimate unchanged).
+  This is a class-B behaviour change on budget-limited runs only.
+- **How measured** (`build/perf03/phase2/footprint_measure.txt`, gcc 15.2.0 Release, glibc 2.43):
+  a throwaway local test (not committed) inserts N seeded random hashes into `NodeTable(10)`
+  (1024 shards, the default) and reports the `mallinfo2().uordblks` delta per node (allocator
+  headers included), `heapBytes()` per node, the slot bytes and the slab slack.
+
+| N nodes | per shard | slot LF | slots B/node | slab slack B/node | mallinfo2 B/node | mean / max probe |
+|---|---|---|---|---|---|---|
+| 100000 | 98 | 0.497 | 16.1 | 8.9 | 83.2 | 1.64 / 46 |
+| 250000 | 244 | 0.477 | 16.8 | 3.5 | 77.4 | 1.46 / 32 |
+| 400000 | 391 | 0.470 | 17.0 | 2.3 | 76.2 | 1.67 / 79 |
+| **511683** (phase-1 reference run) | 500 | 0.488 | 16.4 | 1.7 | **74.9** | 1.48 / 31 |
+| 700000 | 684 | 0.668 | 12.0 | 1.3 | 69.9 | 2.00 / 96 |
+| 1000000 | 977 | 0.477 | 16.8 | 0.9 | 74.3 | 1.45 / 32 |
+| 2000000 | 1953 | 0.477 | 16.8 | 0.5 | 73.8 | 1.45 / 33 |
+| 4000000 | 3906 | 0.477 | 16.8 | 0.2 | 73.5 | 1.45 / 42 |
+
+  The constant uses the reference-run value, 74.9 -> 75 B. The real cost moves between about
+  70 B (slot array just below 3/4 full) and 83 B (small shards, slab slack), so the constant is
+  within about 7 % of the real value over this range.
+
+### Phase 2 results so far (2026-11-09, before the verification pass)
+
+- Tests: `rapfi_tests` 228/228 with asserts live (208 before; the 20 new tests all pass);
+  `--check-asserts-live` aborts as expected. Output: `build/perf03/phase2/tests_final.txt`.
+- BENCH (gcc 15.2.0 Release, `build/`): Nodes `17621937`, Hash `8c1f72e5` (unchanged).
+- Golden (phase-1 setup, `cfg_golden`, 1T, 2M nodes, SHOW_DETAIL 2, gcc): extract **identical**
+  to `build/perf03/golden_gcc_1.extract` (11103 lines, `cmp` clean).
+- One gcc RSS reading from that golden run: 173180 KiB against 183780 / 184116 KiB in phase 1
+  (183780 - 173180 = 10600 KiB = 10.85 MB). The measured constant predicts (96 - 75) x 511683 =
+  10.75 MB, so the 75 B/node from the synthetic measurement is confirmed in the real search
+  (phase 1's 11.8 MB assumed about 73 B). Single run, not the verification number.
+- Known accounting gap: freed node storage stays in the shard's slab pool (reused only by new
+  nodes) until `clear`. After a large recycle the real heap stays above `graphMemoryUsed` until
+  new inserts refill the free list. The `std::set` table had the same effect through malloc's
+  free lists.
