@@ -6,10 +6,10 @@ to a detail file under `docs/instruction/`. Read the matching entry here before 
 
 ## Active
 
-- [PERF-03 — MCTS node table footprint](docs/instruction/PERF-03-mcts-node-table-footprint.md) — phase 1 measure real bytes/node + lock cost, report candidates, stop for user choice; phase 2 implement with pointer stability, golden-identical
 
 ## Done
 
+- [PERF-03 — MCTS node table footprint](docs/instruction/PERF-03-mcts-node-table-footprint.md) — done 2026-11-09 (see todo results)
 - [SEARCH-13 — MCTS singular-root stop blocks VCN proofs at a forced root](docs/instruction/SEARCH-13-mcts-vcn-singular-root-stop.md) — done 2026-11-09 (see todo results, SEARCH-15)
 - [SEARCH-15 — MCTS does not prove P4 VC3 / VC2 at a forced root](docs/instruction/SEARCH-15-mcts-vcn-forced-root-unproven.md) — done 2026-11-09 (see todo findings)
 - [SEARCH-14 — MCTS prints no result line in BRIEF message mode](docs/instruction/SEARCH-14-mcts-brief-mode-result-line.md) — done 2026-11-09 (see todo results)

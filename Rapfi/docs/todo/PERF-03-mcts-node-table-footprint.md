@@ -1,6 +1,9 @@
 # PERF-03 — MCTS node table footprint
 
-**Status:** phase 1 done 2026-11-09; user chose option (b) 2026-11-09; phase 2 implemented on
+**Status:** done 2026-11-09 — merged to `main` by the user (fast-forward, f9a5bd0..9518c97);
+tracking lines moved to `## Done`; retained-slab-pool follow-up recorded as PERF-04. PGO release
+rebuild on merged sources and the budget-limited self-play were not run at merge.
+History: phase 1 done 2026-11-09; user chose option (b) 2026-11-09; phase 2 implemented on
 branch `perf-03-node-table`; verified and reviewed 2026-11-09 (APPROVE WITH NITS, see the last
 section); awaiting user merge. Still open at merge: moving the `TODO.md` / `instruction.md` lines
 to `## Done` (user), and the PGO release rebuild (`scripts/pgo_build.sh x64-clang-AVX512VNNI`) on

@@ -6,9 +6,11 @@ a matching `instruction.md` line when execution guidance exists. See
 
 ## Active
 
-- [PERF-03 — MCTS node table footprint](docs/todo/PERF-03-mcts-node-table-footprint.md) — measure real bytes per node; replace `std::set` shards. Class B/C.
+- [PERF-04 — MCTS retained slab pool after recycle](docs/todo/PERF-04-mcts-slab-pool-trim.md) — PERF-03 keeps freed node slabs until `clear`, so real heap can exceed the graph budget after recycle; trim empty slabs or account the free list. Class B. Found in PERF-03 review.
 
 ## Done
+
+- [PERF-03 — MCTS node table footprint](docs/todo/PERF-03-mcts-node-table-footprint.md) — measure real bytes per node; replace `std::set` shards. Class B. Done 2026-11-09 (merged f9a5bd0..9518c97): per-shard tagged-pointer open addressing + slab pool; 96 → 75 B/node, peak RSS −5.9 % (2M nodes), cycles/visit −5.0 % 1T / −3.8 % 8T (PGO), +10.5 % nodes at budget closure; 228/228 tests, TSan/ASan clean on NodeTable, bench `17621937 / 8c1f72e5`, golden and 16-search recycle sequence byte-identical. Not run: self-play of the budget-limited change. Follow-up: PERF-04.
 
 - [SEARCH-04 — MCTS progressive widening](docs/todo/SEARCH-04-mcts-progressive-widening.md) — add edges as visits grow; needs safe reclamation of the replaced edge array. Class B. Closed 2026-11-09 (user): not worth doing; SEARCH-10 already re-adds cut moves on the "every kept reply lost" trigger (quiescent-state reclamation, no epoch/hazard pointers needed), and no measurement shows a strength loss from one-shot cutting beyond those cases; general widening would weaken the SEARCH-03 memory bound. No code change.
 - [SEARCH-11 — MCTS edges not fully sorted by policy](docs/todo/SEARCH-11-mcts-policy-order-partial-sort.md) — `fastPartialSort(limit 0, PolicyComparator)` leaves score < 0 moves unsorted, breaking the cut and the first-unexplored-is-best assumption. Found in VCN-03 slice 3; measure on the real network first. Class B. Closed 2026-11-09 (user): measured on the real network (122 positions, 100K nodes, mass 0.99): 1.23 % of 788K expansions unsorted, 0.012 % of cuts wrong, mean misplaced mass 0.0009; negligible, no code change, bench and golden untouched.
