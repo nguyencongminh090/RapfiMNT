@@ -226,18 +226,24 @@ MovePicker::MovePicker(Rule rule, const Board &board, ExtraArgs<MovePicker::ROOT
 
     if (board.p4Count(self, A_FIVE)) {
         endMove = generate<WINNING>(board, curMove);
-        if (useNormalizedPolicy)
+        if (useNormalizedPolicy) {
             markFirstMoveOneHot(curMove, endMove);
+            hasPolicy = true;
+        }
     }
     else if (board.p4Count(oppo, A_FIVE)) {
         endMove = generate<DEFEND_FIVE>(board, curMove);
-        if (useNormalizedPolicy)
+        if (useNormalizedPolicy) {
             markFirstMoveOneHot(curMove, endMove);
+            hasPolicy = true;
+        }
     }
     else if (board.p4Count(self, B_FLEX4)) {
         endMove = generate<WINNING>(board, curMove);
-        if (useNormalizedPolicy)
+        if (useNormalizedPolicy) {
             markFirstMoveOneHot(curMove, endMove);
+            hasPolicy = true;
+        }
     }
     else if (board.p4Count(oppo, B_FLEX4)) {
         endMove = generate<DEFEND_FOUR | ALL>(board, curMove);
