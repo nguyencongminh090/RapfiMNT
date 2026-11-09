@@ -707,6 +707,7 @@ if(BUILD_TESTS AND NOT EMSCRIPTEN)
         tests/mcts_bound_tests.cpp
         tests/mcts_widen_tests.cpp
         tests/mcts_vcn_tests.cpp
+        tests/mcts_nodetable_tests.cpp
     )
 
     add_executable(rapfi_tests ${TEST_ENGINE_SOURCES} ${TEST_DRIVER_SOURCES} ${HEADERS})

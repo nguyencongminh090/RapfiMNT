@@ -41,6 +41,7 @@ void runMctsVisitsTests();
 void runMctsBoundTests();
 void runMctsWidenTests();
 void runMctsVcnTests();
+void runMctsNodeTableTests();
 
 int testsRun    = 0;
 int testsPassed = 0;
@@ -74,6 +75,7 @@ int main(int argc, char *argv[])
     runMctsBoundTests();
     runMctsWidenTests();
     runMctsVcnTests();
+    runMctsNodeTableTests();
 
     std::printf("\n%d/%d tests passed\n", testsPassed, testsRun);
     return testsPassed == testsRun ? 0 : 1;

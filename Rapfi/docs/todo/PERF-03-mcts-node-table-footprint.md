@@ -233,3 +233,78 @@ not A, because no hash, position identity, encoding or compile-time table change
 derived-state audit is needed.
 
 **Decision: pending user choice** ((b) / accounting fix only / (a) / close).
+
+**Decision (2026-11-09, user): option (b).**
+
+## Phase 2 — option (b)
+
+### Design
+
+- **Shard data.** Each shard keeps its `std::shared_mutex` exactly as before (separate array,
+  shared lock for `findNode`, unique lock for `tryEmplaceNode` and for the recycle/clear hooks).
+  No lock-free reads.
+- **Slot array.** Open addressing, linear probing, power-of-two capacity, allocated lazily on
+  the first insert (16 slots). A slot is one `uint64_t`: the low 48 bits are the `Node *`, the
+  upper 16 bits are a tag (`hash >> 48`). `0` is the empty slot. The start index is
+  `(hash >> shardBits) & (capacity - 1)`, so it does not reuse the shard bits. A tag match is only
+  a filter: the node's own hash is compared before a hit is returned. A pointer wider than 48 bits
+  aborts, the same guard as `Edge`.
+- **Growth.** The capacity doubles when an insert would take the load above 3/4. The rehash moves
+  only slot words, never a `Node`.
+- **Slab pool.** Nodes live in per-shard slabs of raw storage built with placement new. Slabs are
+  allocated lazily, one fixed-size slab at a time, and are never moved or reallocated until the
+  shard is cleared. Freed nodes go on a LIFO free list (next pointer stored in the dead storage),
+  and the free list is used before the bump pointer.
+- **Recycle.** `NodeTable::eraseNodesIf(shard, pred)` calls `pred(node)` on each live node while
+  the node is still intact (the caller reads the edge footprint there), destroys the nodes for
+  which it returns true, puts their storage on the free list and rebuilds the shard's slot array
+  from the survivors (no tombstones). Survivors keep their addresses.
+- **Clear.** `NodeTable::clearShard(shard)` destroys every live node (which frees its edge array,
+  as `~Node` does today) and releases the slot array and all slabs. `~NodeTable` does the same.
+- **Iteration.** `NodeTable::forEachNode(shard, f)`. The container is not exposed.
+
+### Test list (phase 2, `tests/mcts_nodetable_tests.cpp`)
+
+Unit tests use a one-shard table (`NodeTable(0)`) unless the test is about shards, seeded
+`std::mt19937_64` hashes, and each test builds its own table.
+
+1. `findNode_emptyTable_returnsNull` — no slot array yet (capacity 0 must not be masked).
+2. `findNode_missingHashInNonEmptyShard_returnsNull`.
+3. `tryEmplaceNode_newHash_insertsOnceAndFindReturnsSamePointer`.
+4. `tryEmplaceNode_existingHash_returnsSameNodeNotInserted`.
+5. `tryEmplaceNode_newHash_constructsNodeWithHashAndAge`.
+6. `tryEmplaceNode_sameTagDifferentHash_bothFoundSeparately` — two hashes with the same upper 16
+   bits and the same probe start, differing only in middle bits.
+7. `tryEmplaceNode_manyInsertsOneShard_slotArrayGrowsAndHeldPointersStayValid` — hold pointers,
+   insert enough to force several rehashes; every held pointer still reads its own hash and
+   `findNode` returns the same pointer.
+8. `tryEmplaceNode_manyInsertsOneShard_slabsGrowAndHeldPointersStayValid` — same, checking that
+   new slabs were added and old nodes did not move.
+9. `tryEmplaceNode_manyInserts_loadFactorStaysAtMostThreeQuarters`.
+10. `tryEmplaceNode_sameHashFromManyThreads_exactlyOneInsertsAllGetSamePointer` — 8 threads,
+    barrier start, repeated over many hashes.
+11. `tryEmplaceNode_disjointHashesFromManyThreads_nothingLost` — 8 threads, 4 shards.
+12. `eraseNodesIf_staleAge_removesStaleAndKeepsReachedAtSameAddress`.
+13. `eraseNodesIf_predicateSeesEdgesBeforeDestruction` — the predicate can read the edge array
+    of the node it erases.
+14. `eraseNodesIf_thenInsert_reusesFreedStorageWithoutNewSlab`.
+15. `eraseNodesIf_manyRecycleRounds_probeLengthStaysBounded` — 20 rounds of insert + erase-half;
+    load factor at most 3/4 and the mean probe length stays small (no tombstone build-up).
+16. `clearShard_nonEmpty_emptiesShardAndReleasesStorage` — no nodes, no slots, no slabs, find
+    returns null, insert works again.
+17. `forEachNode_afterInsertsAndErase_visitsEachLiveNodeOnce`.
+18. `heapBytes_afterInserts_equalsSlotsPlusSlabs` — the measuring hook used for the footprint
+    constant.
+19. `recycleOldNodes_afterMoveForward_graphMemoryUsedEqualsLiveFootprints` — end to end through
+    the engine (real `allocateOrFindNode`, `createEdgesFrom` and `recycleOldNodes`): after a search,
+    a forward move and a second search, `graphMemoryUsed` equals the sum over live table nodes of
+    `nodeFootprint()` plus their edge-array footprints.
+20. `clear_afterSearch_tableEmptyAndGraphMemoryUsedZero` — end to end.
+
+Failing first (2026-11-09, `build/perf03/phase2/tests_failing_first.txt`): the hooks
+`eraseNodesIf` / `clearShard` / `forEachNode` were first added to the old `std::set` table and
+`recycleOldNodes` / `clear` switched to them (no behaviour change). Against that table the full
+file does not compile: tests 7, 8, 9, 14, 15, 16 and 18 use the new statistics API
+(`getShardStats`, `SlabNodes`, `SlabBytes`, `heapBytes`). With those 7 excluded by a temporary
+local `#if 0`, the other 13 pass on `std::set` (221/221, 208 before). So the `test:` commit
+alone does not build `rapfi_tests`; the `perf:` commit makes it build.

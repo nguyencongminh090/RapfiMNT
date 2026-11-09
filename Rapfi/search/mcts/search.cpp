@@ -1344,9 +1344,11 @@ void MCTSSearcher::clear(SearchEngine &pool, bool clearAllMemory)
         std::atomic<size_t> numShardsProcessed = 0;
         th.engine.runOnAllThreads(
             [this, &numShardsProcessed](SearchThread &t) {
-                processAllShards(*this->nodeTable, numShardsProcessed, [](NodeTable::Shard &shard) {
-                    shard.table.clear();
-                });
+                processAllShards(*this->nodeTable,
+                                 numShardsProcessed,
+                                 [this](NodeTable::Shard &shard) {
+                                     this->nodeTable->clearShard(shard);
+                                 });
             },
             true);
     });
@@ -1587,21 +1589,20 @@ void MCTSSearcher::recycleOldNodes(SearchThread &th)
                 *this->nodeTable,
                 numShardsProcessed,
                 [this, &numRecycledNodes](NodeTable::Shard &shard) {
-                    for (auto it = shard.table.begin(); it != shard.table.end();) {
-                        Node *node = std::addressof(const_cast<Node &>(*it));
-                        if (node->getAgeRef().load(std::memory_order_relaxed)
-                            != this->graph.globalNodeAge) {
-                            size_t footprint = nodeFootprint();
-                            if (const EdgeArray *edges = node->getEdges())
-                                footprint += edgeArrayFootprint(edges->numEdges);
-                            this->graphMemoryUsed.fetch_sub(footprint,
-                                                            std::memory_order_relaxed);
-                            it = shard.table.erase(it);
-                            numRecycledNodes.fetch_add(1, std::memory_order_relaxed);
-                        }
-                        else
-                            it++;
-                    }
+                    // The predicate runs before the node is destroyed, so its edge array
+                    // is still readable for the footprint.
+                    size_t numErased = this->nodeTable->eraseNodesIf(shard, [this](Node &node) {
+                        if (node.getAgeRef().load(std::memory_order_relaxed)
+                            == this->graph.globalNodeAge)
+                            return false;
+                        size_t footprint = nodeFootprint();
+                        if (const EdgeArray *edges = node.getEdges())
+                            footprint += edgeArrayFootprint(edges->numEdges);
+                        this->graphMemoryUsed.fetch_sub(footprint, std::memory_order_relaxed);
+                        return true;
+                    });
+                    numRecycledNodes.fetch_add(static_cast<uint32_t>(numErased),
+                                               std::memory_order_relaxed);
                 });
         },
         true);

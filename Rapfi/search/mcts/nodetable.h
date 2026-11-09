@@ -109,6 +109,38 @@ public:
         return {std::addressof(const_cast<Node &>(*it)), inserted};
     }
 
+    /// Erase every node of the shard for which pred(node) returns true.
+    /// pred sees the node intact (edges included) before it is destroyed.
+    /// @return The number of erased nodes.
+    /// @note The caller must hold the shard's unique lock.
+    template <typename Pred>
+    size_t eraseNodesIf(const Shard &shard, Pred &&pred)
+    {
+        size_t numErased = 0;
+        for (auto it = shard.table.begin(); it != shard.table.end();) {
+            if (pred(const_cast<Node &>(*it))) {
+                it = shard.table.erase(it);
+                numErased++;
+            }
+            else
+                it++;
+        }
+        return numErased;
+    }
+
+    /// Destroy every node of the shard and release its storage.
+    /// @note The caller must hold the shard's unique lock.
+    void clearShard(const Shard &shard) { shard.table.clear(); }
+
+    /// Call f(node) on every node of the shard.
+    /// @note The caller must hold the shard's lock.
+    template <typename F>
+    void forEachNode(const Shard &shard, F &&f) const
+    {
+        for (const Node &node : shard.table)
+            f(const_cast<Node &>(node));
+    }
+
 private:
     size_t                               numShards;
     size_t                               mask;
