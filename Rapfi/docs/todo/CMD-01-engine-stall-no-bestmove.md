@@ -1,6 +1,31 @@
 # CMD-01 — Engine stalls without sending a best move under a pipe harness
 
 **Status:** open (recorded 2026-11-09, not started). Seen during PERF-04 phase 2 verification.
+**Progress (paused 2026-11-09):** branch `cmd-01-stall` (from `fe37c22`), still active, no code
+changed. Done: read the evidence. No reproduction has been run yet (0 stress runs, so no stall
+count and no power-state record of our own; the PERF-04 run recorded PL1 24 W). The RelWithDebInfo
+build in `build/cmd01/rwdi` (gcc, AVX512/VNNI, `BUILD_TESTS=ON`) was configured but stopped
+before it finished. No backtraces or stress script saved yet.
+Findings so far:
+- The `.out` files in `build/perf04/phase2/verify/stress/` are **not** evidence of where the
+  engine stopped. `multi4.py` writes them through a buffered Python file that is lost on
+  `timeout` kill (bg_6/new_6 are 0 bytes; bg_1 `.out` shows 2 boards answered while its unbuffered
+  `.stderr` shows `BOARD n=8` sent). "Printed part of a search's output" is a harness artifact.
+- Leading hypothesis (new, not yet proven): **a race in the completion callback in
+  `command/gomocup.cpp` drops the next command.** `think`'s callback prints the move (flushed)
+  *before* `thinking = false`. `runProtocol` checks `thinking` without the lock and drops any
+  non-STOP command while it is true (`std::cin.ignore` rest of line). A fast client that answers
+  the move at once with `BOARD` can have it dropped; the following `x,y,c` / `DONE` lines are then
+  parsed as unknown commands, and both sides wait on each other forever. This matches the
+  signature: protocol thread in pipe read, search threads idle, no CPU. Load widens the window
+  between the print and the store, because the pipe write wakes the reader.
+Next step: finish the build (`ninja -C build/cmd01/rwdi pbrain-rapfi rapfi_tests`). Write a
+stress script from `multi4.py` that writes the log unbuffered (flush every line), sets a timeout
+per board and saves gdb `thread apply all bt`, `/proc/<pid>/fd` and the output tail. Run it with
+6 to 12 engines at 1T/8T plus CPU load, and record PL1. Confirm in a stalled log that the move
+line was received and the next `BOARD` got no reply (look for `ERROR Unknown command: DONE`-style
+lines). Then write the test list and fix the ordering at the protocol layer.
+
 **Class:** C provisional. Reclassify once the root cause is known: a race in the search threads or
 in the search's start/stop signalling makes it B.
 
