@@ -131,7 +131,7 @@ win. With §3.3 handled as a terminal in `evaluateNode`, the existing `tryMarkTe
   proven VCN line prints as `+M` / `-M` like AB. A non-proven line prints a win-rate value.
 - PV may contain `PASS` (`extractPVOfChildNode`); the printer must print it the way AB's VCN PV
   does (AB does not format it specially either — VCN §Deliberately not done).
-- Singular-root early stop (`search.cpp:1207`) and `numNodesAfterSingularRoot` are fine.
+- Singular-root early stop (`search.cpp:1207`) and `numNodesAfterSingularRoot` are fine (not under VCN, see SEARCH-13).
 - `recycleOldNodes` is key-agnostic; no change.
 
 ## 4. Findings that matter beyond a plain port

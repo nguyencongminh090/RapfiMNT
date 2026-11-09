@@ -1417,6 +1417,7 @@ const RootMove *MCTSSearcher::searchMain(SearchThread &th)
     // Rank root moves and record best move
     updateRootMovesData(th);
     ctx.printer.printRootMoves(th, ctx.timectl, scratch.numSelectableRootMoves);
+    ctx.printer.printMCTSSearchEnds(th, ctx.timectl);  // BRIEF result line (SEARCH-14)
 
     return &th.rootMoves[0];
 }
@@ -1485,7 +1486,9 @@ void MCTSSearcher::search(SearchThread &th)
                                                       scratch.numSelectableRootMoves);
             }
 
-            if (th.rootMoves.size() == 1
+            // A forced root says nothing about the attack under VCN (same exemption as AB's
+            // singular-root rule in search/ab/search.cpp; SEARCH-13).
+            if (th.rootMoves.size() == 1 && !options.vcnMode.enabled()
                 && th.engine.nodesSearched() >= SearchCfg.numNodesAfterSingularRoot)
                 th.engine.stopThinking();
         }

@@ -1,6 +1,7 @@
 # SEARCH-13 — MCTS singular-root stop blocks VCN proofs at a forced root
 
-**Status:** open (recorded 2026-11-09, user). Found in VCN-03 slice 5 (§9 "Slice 5", finding).
+**Status:** done 2026-11-09 (closed after SEARCH-15; originally partly done) (code and tests landed; the expected P4 VC3/VC2 proofs did not
+appear in Part C because of its 32 MB graph limit, see Results and SEARCH-15). Recorded 2026-11-09 by the user. Found in VCN-03 slice 5 (§9 "Slice 5", finding).
 
 **Class:** B (MCTS search behaviour, VCN mode only).
 
@@ -39,3 +40,61 @@
 - Bench `17621937 / 8c1f72e5`. Unit tests with asserts live. The MCTS golden with VCN off is
   identical.
 - Part C forced-root cells: report proven/correct/wrong before and after.
+
+## Results (2026-11-09)
+
+**Change.** `search/mcts/search.cpp`, main-thread block of `MCTSSearcher::search`: the singular-root
+stop is now `th.rootMoves.size() == 1 && !options.vcnMode.enabled() && nodesSearched() >=
+numNodesAfterSingularRoot`, with a comment pointing at the AB rule and SEARCH-13. Nothing else in
+production code. VCN off is unchanged.
+
+**Tests** (`tests/mcts_vcn_tests.cpp`, position P4 = counter four, block without four, black to
+move, one root move, `HashEvaluator`, 1 thread, 20000 nodes):
+`mctsVcn_vc3_forcedRootMoveWithNodeBudget_searchesPastSingularLimit` and
+`mctsSearch_vcnOff_singularRoot_stopsAfterNumNodesAfterSingularRoot`.
+- Fail first: the first test FAILED at HEAD, asserts live, with **100 nodes searched** (budget 20000;
+  `build/search13/failfirst.txt`). After the fix it searches 20000 nodes. The second test passes before
+  and after.
+- After: `rapfi_tests` 205/205 (203 + 2), `--check-asserts-live` aborts on its sentinel
+  (`build/search13/asserts_live.txt`).
+
+**Bit-identity.** Bench (gcc, `build/pbrain-rapfi`) Nodes 17621937, Hash 8c1f72e5 at HEAD and after;
+clang PGO builds of HEAD and after also give 17621937 / 8c1f72e5. MCTS golden with VCN off
+(`cfg_off`, 4 Standard positions, 300K nodes, 1 thread): the `.final` (last root print) files of all
+four positions are identical to HEAD. The full `.extract` is identical for positions 1-3; for position 0
+the intermediate prints differ, but they differ between two runs of the HEAD binary as well (periodic
+prints are timing-dependent), so that is not a regression signal.
+
+**Part C** (`build/search13/partc/`, `results_base.tsv` / `results_after.tsv`; PGO release builds of
+HEAD and of the fix, real network via `cfg_vcn`, MCTS only, P1/P4/P7/P8/P9 at `YXVCN 4/3/2`, one run
+each, 8-thread runs not reproducible). Classification rule of VCN-03 slice 5.
+
+| Budget | Threads | Before: proven / correct / wrong | After: proven / correct / wrong |
+|---|---|---|---|
+| 5 s | 1 | 13 / 13 / 0 | 13 / 13 / 0 |
+| 5 s | 8 | 13 / 13 / 0 | 13 / 13 / 0 |
+| 30 s | 1 | 13 / 13 / 0 | 13 / 13 / 0 |
+| 30 s | 8 | 13 / 13 / 0 | 13 / 13 / 0 |
+
+(15 cells; 13 proven; the two unproven are P4 VC3 and P4 VC2.) **No cell changed class. The stated
+expectation (P4 VC3 `-M8`, P4 VC2 `+M13` proven) was not met:** P4 VC3 went `-67 / -99 / -67 / -146`
+to `-625 / -686 / -522 / -789`, P4 VC2 `610 / 491 / 610 / 446` to `730 / 742 / 778 / 747` (5 s 1 thread,
+5 s 8, 30 s 1, 30 s 8), all still plain values with no mate bound, although the search now
+runs 24M-950M nodes (VC2) and 93M-2144M nodes (VC3) on that root. Zero wrong answers.
+
+Wall time per cell: before about 65-120 ms on every cell (stop at 100 nodes); after the full budget on
+every cell (4.53-4.60 s at 5 s, 27.0-27.1 s at 30 s), including the 13 cells that were already proven
+within the first 100 ms print. MCTS has no stop on a proven root, so a proven forced root now uses
+the whole budget; expected for this task, not fixed here.
+
+**Remaining.** The singular-root stop is no longer the blocker for P4 VC3/VC2. Why MCTS does not prove
+`-M8` / `+M13` there with the real network and billions of nodes is open (not investigated: a VC3
+mate of depth 8 / VC2 `+M13` through the pass-edge prior and the `Node` bounds, or the 0.99 policy
+edge cut). Needs its own todo before this item can be called Done. Possible follow-ups, not done:
+AB's rule also has `!isAnalysisMode() && !inPonder && !rmp.enabled()` and
+`markPonderingAvailable()`; MCTS has neither; MCTS could stop on a proven root.
+
+**Update 2026-11-09 (SEARCH-15).** The open question above is answered: the Part C runs had a 32 MB MCTS graph budget (`default_tt_size_kb`,
+no `INFO MAX_MEMORY`); the graph closed after about 2.3M visits (VC3) / under 0.3M (VC2) and a closed graph cannot finish a proof. With
+64 MB (VC3, `-M8`) or 384 MB (VC2, `+M17`) at 10M visits both are proven with the defaults. See
+[SEARCH-15](SEARCH-15-mcts-vcn-forced-root-unproven.md).

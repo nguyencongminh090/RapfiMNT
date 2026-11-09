@@ -67,6 +67,10 @@ struct SearchPrinter
                          const TimeControl &tc,
                          int                rootDepth,
                          SearchThread      &bestThread);
+    /// Print the result of an MCTS search once, after the final printRootMoves. Only in BRIEF,
+    /// where printRootMoves prints nothing: a "Speed | Eval | Node | Time" line and the Bestline
+    /// of the best root move, in the words of printSearchEnds but without a Depth field.
+    void printMCTSSearchEnds(SearchThread &th, const TimeControl &tc);
     /// Print when search is not needed to choose a bestmove.
     /// @param bestMove The best move to print.
     /// @param moveValue The theoretical value of this best move.
