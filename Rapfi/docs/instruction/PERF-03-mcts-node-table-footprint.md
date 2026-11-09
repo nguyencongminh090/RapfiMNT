@@ -5,6 +5,23 @@ Task: [`../todo/PERF-03-mcts-node-table-footprint.md`](../todo/PERF-03-mcts-node
 The task has two phases with a **user decision between them**. Phase 1 only measures and does not
 change behaviour. Do not start phase 2 until the user picks a structure from the phase-1 report.
 
+## Model split
+
+Use the strongest model (Opus) for judgement and concurrency work, and a cheaper model (Sonnet)
+for scripted runs:
+
+| Step | Model | Why |
+|---|---|---|
+| Phase 1 steps 1-3: baselines, bytes/node probes, `perf record` runs | Sonnet | Mechanical, existing scripts (`build/search08/`) |
+| Phase 1 step 4: SKILLS_TREE lookup | Sonnet (Agent) | Search only |
+| Phase 1 step 5: interpret numbers, rank (a)/(b)/(c), classify, write the report | Opus | Decides the direction of the whole task |
+| Phase 2: race and pointer-stability tests, core `NodeTable` for (b) or (c) | Opus | Emplace race, memory ordering, tombstones; bugs here give rare wrong results, not crashes |
+| Phase 2: simple tests (`findNode_missingHash_returnsNull`, ...) | Sonnet | |
+| Phase 2: core for (a) pool allocator | Sonnet, Opus reviews accounting and clear/recycle | Mostly mechanical |
+| Phase 2 step 4-5: TSan/ASan, golden, RSS, NPS, PGO runs, tracking, commits | Sonnet | Scripted |
+| TSan/ASan failure or golden diff: root cause | Opus | Hard rule 4 |
+| Final diff review before merge | Opus | |
+
 ## Current state (read before starting)
 
 - `search/mcts/nodetable.h`: `NodeTable` is `1 << numNodeTableShardsPowerOfTwo` shards (default 10,
