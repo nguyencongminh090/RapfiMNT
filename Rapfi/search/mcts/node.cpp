@@ -201,6 +201,7 @@ bool Node::createEdgesFrom(const Pos          *moveList,
 
     // Copy the move and policy array to the allocated edge array
     tempEdges->numEdges = numEdges;
+    tempEdges->numMoves = numMoves;
     for (uint32_t i = 0; i < numEdges; i++)
         new (&tempEdges->edges[i]) Edge(moveList[i], std::min(policyList[i] * scale, 1.0f));
 
@@ -233,7 +234,7 @@ float Node::getQVar(float priorVar, float priorWeight) const
     return regularizedVariance;
 }
 
-void Node::updateStats()
+bool Node::updateStats()
 {
     // Concurrency note: child visit counts and values are read with relaxed
     // atomics while other threads may be updating them. The aggregation is
@@ -243,7 +244,7 @@ void Node::updateStats()
     const EdgeArray *edgeArray = getEdges();
     // If this node is not expanded, then we do not need to update any stats
     if (!edgeArray)
-        return;
+        return false;
 
     uint64_t   nSum     = 1;
     float      qSum     = utility;
@@ -274,14 +275,140 @@ void Node::updateStats()
         maxBound |= childNode->bound.load(std::memory_order_relaxed);
     }
 
+    // Every kept child is a proven win for the opponent: only a cut move can still save this
+    // node, so the caller should add the cut moves back (SEARCH-10).
+    bool widenNeeded = false;
+
+    // Cut moves (SEARCH-09) count as one unexplored child with an unknown bound: the kept
+    // children alone can prove a win (lower) but never a loss or a draw cap (upper).
+    if (edgeArray->edgesCut()) {
+        widenNeeded = maxBound.upper <= VALUE_MATED_IN_MAX_PLY;
+        maxBound |= ValueBound {};
+    }
+
     float norm = 1.0f / nSum;
     q.store(qSum * norm, std::memory_order_relaxed);
     qSqr.store(qSqrSum * norm, std::memory_order_relaxed);
     d.store(dSum * norm, std::memory_order_relaxed);
 
     // Only update bound if this is not a terminal node
-    if (!isTerminal())
-        bound.store(maxBound, std::memory_order_relaxed);
+    if (isTerminal())
+        return false;
+    bound.store(maxBound, std::memory_order_relaxed);
+    return widenNeeded;
+}
+
+bool Node::replaceEdgesWithFull(EdgeArray           *expectedOld,
+                                const Pos           *moves,
+                                const float         *policy,
+                                uint32_t             numMoves,
+                                std::atomic<size_t> *allocCounter,
+                                RetiredEdgeArrays   &retired)
+{
+    assert(expectedOld);
+    const uint32_t numKept = expectedOld->numEdges;
+
+    // Match every old edge by move in the full list. A missing move should never happen for the
+    // same board; if it does, keep the old array.
+    int  fullIndexOf[MAX_MOVES];
+    bool isKept[MAX_MOVES] = {};
+    if (numMoves > MAX_MOVES || numKept > numMoves)
+        return false;
+    for (uint32_t i = 0; i < numKept; i++) {
+        Pos move  = expectedOld->edges[i].getMove();
+        int found = -1;
+        for (uint32_t j = 0; j < numMoves; j++)
+            if (moves[j] == move) {
+                found = int(j);
+                break;
+            }
+        if (found < 0 || isKept[found])
+            return false;
+        fullIndexOf[i] = found;
+        isKept[found]  = true;
+    }
+
+    size_t     numAllocs = (sizeof(EdgeArray) + numMoves * sizeof(Edge)) / sizeof(EdgeArrayAlloc);
+    EdgeArray *tempEdges = reinterpret_cast<EdgeArray *>(new EdgeArrayAlloc[numAllocs]);
+    tempEdges->numEdges  = numMoves;
+    tempEdges->numMoves  = numMoves;
+
+    // Old edges first, in their old order, so the visited edges stay a prefix. Copy the visits
+    // and children into the private array before it is published.
+    uint64_t copiedVisits[MAX_MOVES];
+    for (uint32_t i = 0; i < numKept; i++) {
+        const Edge &oldEdge = expectedOld->edges[i];
+        Edge *edge = new (&tempEdges->edges[i]) Edge(oldEdge.getMove(),
+                                                     std::min(policy[fullIndexOf[i]], 1.0f));
+        // Visits first (acquire): a visited edge had its child set before its first visit.
+        copiedVisits[i] = oldEdge.getVisits();
+        Node *child     = oldEdge.getChild();
+        // Every old edge must be visited (the widen trigger needs every kept child proven), so
+        // that the appended unvisited edges keep the visited edges a prefix.
+        if (copiedVisits[i] == 0 || !child) {
+            delete[] reinterpret_cast<EdgeArrayAlloc *>(tempEdges);
+            return false;
+        }
+        edge->setChild(child);
+        edge->addVisits(copiedVisits[i]);
+    }
+    // Then the cut moves, unvisited, in the order of the full list (descending policy).
+    for (uint32_t j = 0, k = numKept; j < numMoves; j++)
+        if (!isKept[j])
+            new (&tempEdges->edges[k++]) Edge(moves[j], std::min(policy[j], 1.0f));
+
+    EdgeArray *expected = expectedOld;
+    bool       suc = edges.compare_exchange_strong(expected, tempEdges, std::memory_order_acq_rel);
+    if (!suc) {
+        // Another thread replaced the array first: drop ours, retire nothing.
+        delete[] reinterpret_cast<EdgeArrayAlloc *>(tempEdges);
+        return false;
+    }
+
+    if (allocCounter)
+        allocCounter->fetch_add(edgeArrayFootprint(numMoves), std::memory_order_relaxed);
+
+    // Catch up: visits added to the old edges since the copy would be lost otherwise. Threads
+    // that still hold an old edge may add more later; those few visits are dropped.
+    for (uint32_t i = 0; i < numKept; i++) {
+        uint64_t now = expectedOld->edges[i].getVisits();
+        if (now > copiedVisits[i])
+            tempEdges->edges[i].addVisits(now - copiedVisits[i]);
+    }
+
+    // Other threads may still read the old array: free it only at the search boundary.
+    retired.retire(expectedOld);
+    return true;
+}
+
+void RetiredEdgeArrays::retire(EdgeArray *edgeArray)
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    arrays.push_back(edgeArray);
+    totalBytes += edgeArrayFootprint(edgeArray->numEdges);
+}
+
+size_t RetiredEdgeArrays::freeAll()
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    for (EdgeArray *edgeArray : arrays)
+        delete[] reinterpret_cast<EdgeArrayAlloc *>(edgeArray);
+    arrays.clear();
+    size_t freed = totalBytes;
+    totalBytes   = 0;
+    return freed;
+}
+
+size_t RetiredEdgeArrays::count() const
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    return arrays.size();
+}
+
+size_t RetiredEdgeArrays::bytes() const
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    return totalBytes;
 }
 
 }  // namespace Search::MCTS

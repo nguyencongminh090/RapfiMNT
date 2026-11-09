@@ -27,6 +27,8 @@
 #include <cassert>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <vector>
 
 namespace Search::MCTS {
 
@@ -134,7 +136,13 @@ static_assert(sizeof(Edge) == 16, "Edge must stay 16 bytes (edge-array memory bu
 struct alignas(alignof(Edge)) EdgeArray
 {
     uint32_t numEdges;
+    /// Number of generated moves before the policy-mass cut (SEARCH-09). Lives in the padding
+    /// before edges[]; written once before the array is published, immutable afterwards.
+    uint32_t numMoves;
     Edge     edges[];
+
+    /// Whether some generated moves were cut and have no edge (SEARCH-02/05 policy-mass cut).
+    bool edgesCut() const { return numEdges < numMoves; }
 
     /// Get the edge reference at the given index.
     Edge &operator[](uint32_t index)
@@ -152,7 +160,41 @@ struct alignas(alignof(Edge)) EdgeArray
 };
 
 static_assert(alignof(EdgeArray) == alignof(Edge), "Sanity check on EdgeArray's alignment");
+static_assert(sizeof(EdgeArray) == 8, "EdgeArray header must stay 8 bytes (allocation math, SEARCH-09)");
 static_assert(sizeof(Edge) % sizeof(EdgeArray) == 0, "Sanity check on Edge's size");
+
+/// Edge arrays replaced by Node::replaceEdgesWithFull (SEARCH-10). A search thread may still hold
+/// an `EdgeArray &` or `Edge *` into a replaced array, so it stays allocated (and counted in the
+/// graph memory) until a quiescent point where no search thread runs: see
+/// MCTSSearcher::freeRetiredEdgeArrays(). retire() is thread-safe; freeAll() and the destructor
+/// must only run when no search thread can read the retired arrays.
+class RetiredEdgeArrays
+{
+public:
+    RetiredEdgeArrays() = default;
+    ~RetiredEdgeArrays() { freeAll(); }
+
+    RetiredEdgeArrays(const RetiredEdgeArrays &)            = delete;
+    RetiredEdgeArrays &operator=(const RetiredEdgeArrays &) = delete;
+
+    /// Takes ownership of an edge array that is no longer reachable from its node.
+    void retire(EdgeArray *edgeArray);
+
+    /// Frees every retired array.
+    /// @return The sum of edgeArrayFootprint() of the freed arrays.
+    size_t freeAll();
+
+    /// Number of arrays currently retired.
+    size_t count() const;
+
+    /// Sum of edgeArrayFootprint() of the arrays currently retired.
+    size_t bytes() const;
+
+private:
+    mutable std::mutex       mutex;
+    std::vector<EdgeArray *> arrays;
+    size_t                   totalBytes = 0;
+};
 
 /// Limits on how many of the generated moves become edges of a node (SEARCH-02).
 /// The default keeps every move.
@@ -263,6 +305,27 @@ public:
                          const EdgeLimits   &limits,
                          std::atomic<size_t> *allocCounter = nullptr);
 
+    /// Replaces a cut edge array with one that holds every generated move (SEARCH-10).
+    /// The new array keeps the old edges first, in their old order, with their visits and child
+    /// pointers copied, then appends the moves the old array cut, unvisited, in the given order.
+    /// Every edge takes its policy from the given full list. The new array is built completely
+    /// before it is published with a CAS against expectedOld; afterwards, visits added to the old
+    /// edges in the meantime are carried over.
+    /// @param expectedOld The edge array the caller read and wants replaced.
+    /// @param moves, policy The full move list of this node, sorted by descending policy.
+    /// @param numMoves Number of moves in the full list.
+    /// @param allocCounter If non-null, edgeArrayFootprint(numMoves) is added on success.
+    /// @param retired The old array goes here on success; its footprint stays counted until freed.
+    /// @return Whether this call replaced the array. False when another thread replaced it first
+    ///   or when an old edge's move is missing from the full list or is unvisited; nothing
+    ///   changes then.
+    bool replaceEdgesWithFull(EdgeArray           *expectedOld,
+                              const Pos           *moves,
+                              const float         *policy,
+                              uint32_t             numMoves,
+                              std::atomic<size_t> *allocCounter,
+                              RetiredEdgeArrays   &retired);
+
     /// Returns the graph hash key of this node.
     HashKey getHash() const { return hash; }
 
@@ -310,9 +373,10 @@ public:
     }
 
     /// Update the average utility and the average draw rate from childrens.
-    /// @param board The corresponding board of this node.
-    /// @param nodeTable The node table for finding children nodes.
-    void updateStats();
+    /// @return Whether the edge list was cut and every kept child is a proven win for the
+    ///   opponent, so only a cut move can still save this node: the caller should replace the
+    ///   edges with the full move list (SEARCH-10). Callers may ignore it.
+    bool updateStats();
 
     /// Begin the visit of this node.
     void beginVisit(uint32_t newVisits)

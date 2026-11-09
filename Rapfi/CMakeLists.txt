@@ -703,6 +703,8 @@ if(BUILD_TESTS AND NOT EMSCRIPTEN)
         tests/razor_tests.cpp
         tests/mcts_memory_tests.cpp
         tests/mcts_visits_tests.cpp
+        tests/mcts_bound_tests.cpp
+        tests/mcts_widen_tests.cpp
     )
 
     add_executable(rapfi_tests ${TEST_ENGINE_SOURCES} ${TEST_DRIVER_SOURCES} ${HEADERS})

@@ -38,6 +38,8 @@ void runMoveSortTests();
 void runRazorTests();
 void runMctsMemoryTests();
 void runMctsVisitsTests();
+void runMctsBoundTests();
+void runMctsWidenTests();
 
 int testsRun    = 0;
 int testsPassed = 0;
@@ -68,6 +70,8 @@ int main(int argc, char *argv[])
     runRazorTests();
     runMctsMemoryTests();
     runMctsVisitsTests();
+    runMctsBoundTests();
+    runMctsWidenTests();
 
     std::printf("\n%d/%d tests passed\n", testsPassed, testsRun);
     return testsPassed == testsRun ? 0 : 1;

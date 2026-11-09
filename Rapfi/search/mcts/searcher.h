@@ -88,6 +88,10 @@ public:
     /// the node table contents; zeroed by clear(true).
     std::atomic<size_t> graphMemoryUsed {0};
 
+    /// Edge arrays replaced during the current search (SEARCH-10). Still counted in
+    /// graphMemoryUsed; freed by freeRetiredEdgeArrays() once no search thread runs.
+    RetiredEdgeArrays retiredEdgeArrays;
+
     MCTSSearcher();
     ~MCTSSearcher() = default;
 
@@ -119,6 +123,11 @@ public:
     /// The main best first search loop. It calls search() repeatedly until the stop
     /// condition is reached. Results are updated to thread bounded with the board.
     void search(SearchThread &th) override;
+
+    /// Frees the retired edge arrays and subtracts their footprint from graphMemoryUsed.
+    /// Only call when no search thread runs: after the workers of searchMain have returned, in
+    /// clear(true), or in the destructor (SEARCH-10).
+    void freeRetiredEdgeArrays();
 
     /// Checks if current search reaches timeup condition.
     bool checkTimeupCondition(const TimeControl &timectl) override;

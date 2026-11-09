@@ -505,6 +505,54 @@ void evaluateNode(Node &node, const SearchOptions &options, Board &board, int pl
         expandNode<Root>(node, options, board, ply);
 }
 
+/// widen: replace the cut edge array of a node whose every kept reply is a proven loss with one
+/// holding every generated move, so that the node can be proven lost (SEARCH-10).
+/// @param node A non-root node whose updateStats() reported that a widen is needed.
+/// @param board The board state of this node.
+void widenNode(Node &node, const SearchOptions &options, const Board &board)
+{
+    MCTSSearcher &searcher = static_cast<MCTSSearcher &>(*board.thisThread()->engine.searcher());
+
+    // Another thread may have widened the node already; a closed graph takes no new edge array.
+    EdgeArray *oldEdges = node.getEdges();
+    if (!oldEdges || !oldEdges->edgesCut() || searcher.graphClosed())
+        return;
+
+    // The same move generation as expandNode<false>, without the cut
+    MovePicker mp(options.rule,
+                  board,
+                  MovePicker::ExtraArgs<MovePicker::MAIN> {
+                      Pos::NONE,
+                      {},
+                      true,
+                      PolicyTemperature,
+                  });
+    Pos      moveList[MAX_MOVES];
+    float    policyList[MAX_MOVES];
+    uint32_t numMoves = 0;
+    while (Pos move = mp()) {
+        assert(mp.hasPolicyScore());
+        assert(mp.hasNormalizedPolicy());
+        moveList[numMoves]   = move;
+        policyList[numMoves] = mp.curMoveNormalizePolicy();
+        numMoves++;
+    }
+
+#ifndef NDEBUG
+    // The board is at this node's position, so every kept move must be regenerated.
+    for (uint32_t i = 0; i < oldEdges->numEdges; i++)
+        assert(std::find(moveList, moveList + numMoves, (*oldEdges)[i].getMove())
+               != moveList + numMoves);
+#endif
+
+    node.replaceEdgesWithFull(oldEdges,
+                              moveList,
+                              policyList,
+                              numMoves,
+                              &searcher.graphMemoryUsed,
+                              searcher.retiredEdgeArrays);
+}
+
 /// select and backpropagate: select the best child node and backpropagate the statistics
 /// @param node The node to search, must been already allocated.
 /// @param board The board state of this node. The board's hash must be equal to the node's.
@@ -565,6 +613,9 @@ uint32_t searchNode(Node &node, Board &board, int ply, uint32_t newVisits)
     bool     stopThisPlayout = false;
     uint32_t actualNewVisits = 0;
     while (!stopThisPlayout && newVisits > 0) {
+        // Set when updateStats() finds every kept reply proven lost (SEARCH-10)
+        bool widenNeeded = false;
+
         // Select the best edge to explore
         auto [childEdge, childNode] = selectChild<Root>(node, board, graphClosed);
 
@@ -610,7 +661,7 @@ uint32_t searchNode(Node &node, Board &board, int ply, uint32_t newVisits)
 
             // Increment child edge visit count
             childEdge->addVisits(1);
-            node.updateStats();
+            widenNeeded = node.updateStats();
             node.finishVisit(1, 1);
             actualNewVisits++;
             newVisits--;
@@ -630,7 +681,7 @@ uint32_t searchNode(Node &node, Board &board, int ply, uint32_t newVisits)
 
                 if (actualChildNewVisits > 0) {
                     childEdge->addVisits(actualChildNewVisits);
-                    node.updateStats();
+                    widenNeeded = node.updateStats();
                     actualNewVisits += actualChildNewVisits;
                 }
                 // Discard this playout if we can not make new visits to the best child,
@@ -644,7 +695,7 @@ uint32_t searchNode(Node &node, Board &board, int ply, uint32_t newVisits)
             else {
                 // Increment edge visits without search the node
                 childEdge->addVisits(1);
-                node.updateStats();
+                widenNeeded = node.updateStats();
                 node.incrementVisits(1);
                 actualNewVisits++;
                 newVisits--;
@@ -653,6 +704,13 @@ uint32_t searchNode(Node &node, Board &board, int ply, uint32_t newVisits)
 
         // Undo the move
         board.undo(options.rule);
+
+        // Add the cut moves back once the board is at this node again (SEARCH-10). The root is
+        // never cut, so it never widens.
+        if constexpr (!Root) {
+            if (widenNeeded)
+                widenNode(node, options, board);
+        }
 
         // Record root move's seldepth
         if constexpr (Root) {
@@ -1051,6 +1109,13 @@ void MCTSSearcher::setMemoryLimit(size_t memorySizeKB)
     TT.resize(vcfTTSizeKB);
 }
 
+void MCTSSearcher::freeRetiredEdgeArrays()
+{
+    size_t freed = retiredEdgeArrays.freeAll();
+    if (freed)
+        graphMemoryUsed.fetch_sub(freed, std::memory_order_relaxed);
+}
+
 size_t MCTSSearcher::getMemoryLimit() const
 {
     return memoryLimitKB;
@@ -1078,6 +1143,7 @@ void MCTSSearcher::clear(SearchEngine &pool, bool clearAllMemory)
             true);
     });
     pool.waitForIdle();
+    freeRetiredEdgeArrays();
     graphMemoryUsed.store(0, std::memory_order_relaxed);
 
     // The shared VCF TT is also search state: clear it so YXHASHCLEAR and
@@ -1132,6 +1198,10 @@ const RootMove *MCTSSearcher::searchMain(SearchThread &th)
     ctx.printer.printSearchStarts(th, ctx.timectl);
     setupRootNode(th);  // Setup root node and other stuffs
     th.engine.runOnAllThreads([this](SearchThread &t) { search(t); }, true);
+
+    // Every search thread has returned (runOnAllThreads waits for the workers), so no thread
+    // holds a pointer into a replaced edge array any more (SEARCH-10).
+    freeRetiredEdgeArrays();
 
     // Rank root moves and record best move
     updateRootMovesData(th);
