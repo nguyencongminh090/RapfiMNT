@@ -24,11 +24,15 @@
 // Search::MCTS::Testing::generateNodeMoves (search/mcts/searchtesting.h), on a board bound to the
 // engine's main thread with a stand-in evaluator.
 //
+// Slice 4 (VC4 / VC5 terminals): evaluateNode and SimpleVCF are reached through the Testing
+// forwarders; the AB cross-check and the smoke run drive both searchers directly.
+//
 // Set RAPFI_TEST_ISOLATE=1 to run each pure test in a forked child (one failing assert reports
 // [FAIL] and the suite continues); RAPFI_TEST_SKIP=<substring> skips an engine-driven test.
 
 #include "testutil.h"
 
+#include "../eval/eval.h"
 #include "../eval/evaluator.h"
 #include "../game/board.h"
 #include "../search/mcts/node.h"
@@ -41,6 +45,9 @@
 #include "../search/mcts/searchtesting.h"
 #include "../search/movepick.h"
 #include "../search/searchconfig.h"
+#include "../core/time.h"
+#include "../game/wincheck.h"
+#include "../search/hashtable.h"
 #include "../search/vcn.h"
 
 #include <algorithm>
@@ -773,6 +780,646 @@ void searchNode_vcnDefenderPass_childKeyHasRaisedLevel()
 }
 
 // ----------------------------------------------------------------------------------------------
+// VCN-03 slice 4: VC4 / VC5 terminal rules in evaluateNode, the VCF-only mode of SimpleVCF and its
+// VCN-keyed VCF TT entries. evaluateNode and SimpleVCF are reached through the Testing forwarders
+// (search/mcts/searchtesting.h) on a board bound to the engine's main thread (stand-in evaluator).
+// Fixtures marked "as in vcn_tests.cpp" are copies of the AB VCN test positions.
+
+/// Interleave black and white stones into a move sequence starting with black.
+std::vector<Pos> alternateMoves(const std::vector<Pos> &black, const std::vector<Pos> &white)
+{
+    std::vector<Pos> moves;
+    for (size_t i = 0; i < std::max(black.size(), white.size()); i++) {
+        if (i < black.size())
+            moves.push_back(black[i]);
+        if (i < white.size())
+            moves.push_back(white[i]);
+    }
+    return moves;
+}
+
+/// A single black stone and a far white stone. Black to move (as in vcn_tests.cpp).
+std::vector<Pos> quietMoves()
+{
+    return {Pos(7, 7), Pos(3, 3)};
+}
+
+/// Black has an open three on row 7; white stones are far away. Black to move (vcn_tests.cpp).
+std::vector<Pos> openThreeMoves()
+{
+    return {Pos(7, 7), Pos(3, 3), Pos(8, 7), Pos(3, 12), Pos(9, 7), Pos(12, 12)};
+}
+
+/// Black to move with a double open three at (5,5) and no four (vcn_tests.cpp doubleThreeBoard).
+std::vector<Pos> doubleThreeMoves()
+{
+    return alternateMoves({Pos(3, 5), Pos(4, 5), Pos(5, 3), Pos(5, 4)},
+                          {Pos(0, 0), Pos(14, 0), Pos(0, 14), Pos(14, 14)});
+}
+
+/// vcn_tests.cpp farVcfAfterForcedBlockPosition(): black to move, must block white's five at
+/// (12,9) (a block four), white blocks at (13,9); black's only VCF is then far from (12,9).
+std::vector<Pos> farVcfAfterForcedBlockMoves()
+{
+    return alternateMoves({Pos(3, 8),
+                           Pos(3, 9),
+                           Pos(4, 6),
+                           Pos(5, 6),
+                           Pos(6, 6),
+                           Pos(5, 5),
+                           Pos(6, 4),
+                           Pos(9, 9),
+                           Pos(10, 9),
+                           Pos(11, 9),
+                           Pos(12, 14)},
+                          {Pos(3, 10),
+                           Pos(7, 6),
+                           Pos(7, 3),
+                           Pos(8, 9),
+                           Pos(12, 10),
+                           Pos(12, 11),
+                           Pos(12, 12),
+                           Pos(12, 13),
+                           Pos(0, 0),
+                           Pos(2, 9),
+                           Pos(2, 10)});
+}
+
+/// vcn_tests.cpp doubleThreeAfterForcedBlockPosition(): the same forced pair, after which black has
+/// no four anywhere, only a double open three at (5,5).
+std::vector<Pos> doubleThreeAfterForcedBlockMoves()
+{
+    return alternateMoves(
+        {Pos(3, 5), Pos(4, 5), Pos(5, 3), Pos(5, 4), Pos(9, 9), Pos(10, 9), Pos(11, 9), Pos(12, 14)},
+        {Pos(8, 9), Pos(12, 10), Pos(12, 11), Pos(12, 12), Pos(12, 13), Pos(0, 0), Pos(14, 0), Pos(0, 14)});
+}
+
+/// `moves` followed by the forced pair (12,9) / (13,9) of the two positions above.
+std::vector<Pos> afterForcedPair(std::vector<Pos> moves)
+{
+    moves.push_back(Pos(12, 9));
+    moves.push_back(Pos(13, 9));
+    return moves;
+}
+
+/// Black has a four on row 7 closed at (7,4); its five point is (7,9). White to move.
+std::vector<Pos> blackFourWhiteToMoveMoves()
+{
+    return alternateMoves({Pos(7, 5), Pos(7, 6), Pos(7, 7), Pos(7, 8)},
+                          {Pos(7, 4), Pos(0, 0), Pos(0, 14)});
+}
+
+/// White to move with a four-three at (6,5): a block four on y = 5 (closed by black (2,5)) and a
+/// flex three on x = 6. Black has no four. Used under Renju, where quickWinCheck reports this
+/// C_BLOCK4_FLEX3 win only when its beta gate admits it.
+std::vector<Pos> whiteFourThreeMoves()
+{
+    return alternateMoves({Pos(2, 5), Pos(0, 14), Pos(14, 0), Pos(14, 14), Pos(0, 7), Pos(12, 12)},
+                          {Pos(3, 5), Pos(4, 5), Pos(5, 5), Pos(6, 3), Pos(6, 4)});
+}
+
+std::unique_ptr<Board> plainBoard(Rule rule, const std::vector<Pos> &moves)
+{
+    auto board = std::make_unique<Board>(15, CandidateRange::SQUARE3_LINE4);
+    board->newGame(rule);
+    for (Pos p : moves)
+        board->move(rule, p);
+    return board;
+}
+
+/// The position bound to the engine's main thread, which gets a fresh stand-in evaluator.
+std::unique_ptr<Board> leafBoard(Rule rule, const std::vector<Pos> &moves)
+{
+    auto src = plainBoard(rule, moves);
+    return std::make_unique<Board>(*src, threadWithEvaluator(rule));
+}
+
+SearchOptions leafOptions(Rule rule, VCNLevel level, Color attacker)
+{
+    SearchOptions opts    = vcnOptions(level, attacker);
+    opts.rule             = {rule, GameRule::FREEOPEN};
+    if (level == VCNLevel::None)
+        opts.vcnMode.attacker = BLACK;  // unused when VCN is off
+    return opts;
+}
+
+struct LeafResult
+{
+    bool  terminal;
+    Value value;    // the terminal value (VALUE_NONE when not terminal)
+    float utility;  // the evaluated utility
+};
+
+/// Evaluates `board` as a freshly allocated non-root node (tree ply 1) of a search whose root had
+/// `rootDefenderPasses` defender passes.
+LeafResult evaluateLeaf(MctsEngineFixture   &fx,
+                        Board               &board,
+                        const SearchOptions &opts,
+                        int                  rootDefenderPasses = 0)
+{
+    fx.searcher().scratch.rootDefenderPasses = rootDefenderPasses;
+    Node node(mctsNodeKey(board, opts, rootDefenderPasses), 0);
+    Testing::evaluateNode(node, opts, board, 1);
+    const bool terminal = node.isTerminal();
+    return {terminal, terminal ? Value(node.getBound().lower) : VALUE_NONE, node.getEvalUtility()};
+}
+
+void evaluateNode_vc4AttackerDoubleThreeOnly_attackerLoses()
+{
+    // Arrange: black attacks at VC4 with a double open three and no four (VCN-02 1b).
+    MctsEngineFixture fx;
+    TT.clear();
+    auto board = leafBoard(FREESTYLE, doubleThreeMoves());
+    assert(board->pattern4(Pos(5, 5), BLACK) == F_FLEX3_2X && "fixture: (5,5) double three");
+    SearchOptions opts = leafOptions(FREESTYLE, VCNLevel::VC4, BLACK);
+
+    // Act
+    LeafResult r = evaluateLeaf(fx, *board, opts);
+
+    // Assert: a double three is not a VCF; the defender passes and the attacker loses (AB value).
+    assert(r.terminal);
+    assert(r.value == mated_in(board->ply() + 2));
+}
+
+void evaluateNode_vc4AttackerFarVcf_attackerWins()
+{
+    // Arrange: after the forced pair black's only VCF starts far from its last stone (VCN-02 1).
+    MctsEngineFixture fx;
+    TT.clear();
+    auto board = leafBoard(FREESTYLE, afterForcedPair(farVcfAfterForcedBlockMoves()));
+    assert(board->sideToMove() == BLACK);
+    assert(board->getLastActualMoveOfSide(BLACK) == Pos(12, 9));
+    assert(board->pattern4(Pos(3, 6), BLACK) >= E_BLOCK4 && "fixture: (3,6) must be a four");
+    assert(board->p4Count(BLACK, B_FLEX4) + board->p4Count(BLACK, C_BLOCK4_FLEX3)
+                   + board->p4Count(BLACK, F_FLEX3_2X)
+               == 0
+           && "fixture: nothing quickWinCheck() reports on its own");
+    SearchOptions opts = leafOptions(FREESTYLE, VCNLevel::VC4, BLACK);
+
+    // Act
+    LeafResult r = evaluateLeaf(fx, *board, opts);
+
+    // Assert: the whole-board VCF picker finds it.
+    assert(r.terminal);
+    assert(r.value >= VALUE_MATE_IN_MAX_PLY);
+}
+
+void evaluateNode_vc4AttackerNoVcf_attackerLosesNotNnValue()
+{
+    // Arrange
+    MctsEngineFixture fx;
+    TT.clear();
+    auto          board = leafBoard(FREESTYLE, quietMoves());
+    SearchOptions opts  = leafOptions(FREESTYLE, VCNLevel::VC4, BLACK);
+
+    // Act
+    LeafResult r = evaluateLeaf(fx, *board, opts);
+
+    // Assert: terminal loss, never the network value.
+    assert(r.terminal);
+    assert(r.value == mated_in(board->ply() + 2));
+}
+
+void evaluateNode_vc4DefenderNoFiveThreat_defenderWins()
+{
+    // Arrange: black (attacker) made a quiet move; white (defender) is to move at VC4.
+    MctsEngineFixture fx;
+    TT.clear();
+    std::vector<Pos> moves = quietMoves();
+    moves.push_back(Pos(10, 10));
+    auto board = leafBoard(FREESTYLE, moves);
+    assert(board->sideToMove() == WHITE);
+    assert(!board->p4Count(BLACK, A_FIVE));
+    SearchOptions opts = leafOptions(FREESTYLE, VCNLevel::VC4, BLACK);
+
+    // Act
+    LeafResult r = evaluateLeaf(fx, *board, opts);
+
+    // Assert: the defender wins by passing (AB vcfdefend value).
+    assert(r.terminal);
+    assert(r.value == mate_in(board->ply() + 1));
+}
+
+void evaluateNode_vc4DefenderFacingFive_notTerminalByPassRule()
+{
+    // Arrange: black (attacker) has a four, white (defender) to move must block at (7,9). After
+    // the block black has no four left.
+    MctsEngineFixture fx;
+    TT.clear();
+    auto board = leafBoard(FREESTYLE, blackFourWhiteToMoveMoves());
+    assert(board->sideToMove() == WHITE);
+    assert(board->p4Count(BLACK, A_FIVE) == 1);
+    assert(board->pattern4(Pos(7, 9), BLACK) == A_FIVE);
+    SearchOptions opts = leafOptions(FREESTYLE, VCNLevel::VC4, BLACK);
+
+    // Act
+    LeafResult r = evaluateLeaf(fx, *board, opts);
+
+    // Assert: not the pass rule (mate_in(ply + 1)); the block line decides: after the forced block
+    // the VC4 attacker has no VCF, so the defender wins two plies later (AB vcfdefend value).
+    assert(r.value != mate_in(board->ply() + 1));
+    assert(r.terminal);
+    assert(r.value == mate_in(board->ply() + 3));
+}
+
+/// White has a four on y = 2 closed by black (1,2); its five point is (6,2), which is not a four for
+/// black. Black (attacker) to move.
+std::vector<Pos> whiteFourBlackToMoveMoves()
+{
+    return alternateMoves({Pos(1, 2), Pos(10, 10), Pos(12, 12), Pos(9, 13)},
+                          {Pos(2, 2), Pos(3, 2), Pos(4, 2), Pos(5, 2)});
+}
+
+void evaluateNode_vc4AttackerBlocksFiveWithNonFour_attackerLoses()
+{
+    // Arrange: the VC4 attacker must block the defender's five, and the block is not a four.
+    MctsEngineFixture fx;
+    TT.clear();
+    auto board = leafBoard(FREESTYLE, whiteFourBlackToMoveMoves());
+    assert(board->sideToMove() == BLACK);
+    assert(board->p4Count(WHITE, A_FIVE) == 1);
+    assert(board->pattern4(Pos(6, 2), WHITE) == A_FIVE);
+    assert(board->pattern4(Pos(6, 2), BLACK) < E_BLOCK4 && "fixture: the block is not a four");
+    SearchOptions opts = leafOptions(FREESTYLE, VCNLevel::VC4, BLACK);
+
+    // Act
+    LeafResult r = evaluateLeaf(fx, *board, opts);
+
+    // Assert: after the forced block the defender passes (AB vcfdefend), so a loss, not a draw.
+    assert(r.terminal);
+    assert(r.value == mated_in(board->ply() + 2));
+}
+
+/// Quiet position, then black (10,2) and a white pass: black to move, one defender pass after a
+/// VC4 root, so the node level is VC5.
+std::vector<Pos> vc5QuietMoves()
+{
+    std::vector<Pos> moves = quietMoves();
+    moves.push_back(Pos(10, 2));
+    moves.push_back(Pos::PASS);
+    return moves;
+}
+
+void evaluateNode_vc5AttackerNoFive_attackerLoses()
+{
+    // Arrange
+    MctsEngineFixture fx;
+    TT.clear();
+    auto          board = leafBoard(FREESTYLE, vc5QuietMoves());
+    SearchOptions opts  = leafOptions(FREESTYLE, VCNLevel::VC4, BLACK);
+    assert(board->sideToMove() == BLACK);
+    assert(mctsNodeVcnLevel(*board, opts, 0) == VCNLevel::VC5);
+
+    // Act
+    LeafResult r = evaluateLeaf(fx, *board, opts, 0);
+
+    // Assert
+    assert(r.terminal);
+    assert(r.value == mated_in(board->ply()));
+}
+
+void evaluateNode_vcnBoardFull_returnsDrawLikeAb()
+{
+    // Arrange: maxMoves reached (the board-full rule) at a VC3 attacker node.
+    MctsEngineFixture fx;
+    TT.clear();
+    auto          board = leafBoard(FREESTYLE, quietMoves());
+    SearchOptions opts  = leafOptions(FREESTYLE, VCNLevel::VC3, BLACK);
+    opts.maxMoves       = board->nonPassMoveCount();
+
+    // Act
+    LeafResult r = evaluateLeaf(fx, *board, opts);
+
+    // Assert: a draw, as AB (decision §8.3)
+    assert(r.terminal);
+    assert(r.value == getDrawValue(*board, opts, board->ply()));
+}
+
+void evaluateNode_vc5AttackerNoFiveOnFullBoard_attackerLosesNotDraw()
+{
+    // Arrange: a VC5 attacker without a five at maxMoves.
+    MctsEngineFixture fx;
+    TT.clear();
+    auto          board = leafBoard(FREESTYLE, vc5QuietMoves());
+    SearchOptions opts  = leafOptions(FREESTYLE, VCNLevel::VC4, BLACK);
+    opts.maxMoves       = board->nonPassMoveCount();
+    assert(mctsNodeVcnLevel(*board, opts, 0) == VCNLevel::VC5);
+
+    // Act
+    LeafResult r = evaluateLeaf(fx, *board, opts, 0);
+
+    // Assert: the VC5 loss is checked before the draw
+    assert(r.terminal);
+    assert(r.value == mated_in(board->ply()));
+    assert(r.value != getDrawValue(*board, opts, board->ply()));
+}
+
+void evaluateNode_vc3_unchangedFromOrdinaryRules()
+{
+    // Arrange: VC3 nodes of both sides; VCN off is the reference.
+    MctsEngineFixture             fx;
+    std::vector<std::vector<Pos>> positions = {doubleThreeMoves(),
+                                               quietMoves(),
+                                               afterForcedPair(farVcfAfterForcedBlockMoves()),
+                                               blackFourWhiteToMoveMoves()};
+    for (const auto &moves : positions) {
+        TT.clear();
+        auto          board = leafBoard(FREESTYLE, moves);
+        SearchOptions off   = leafOptions(FREESTYLE, VCNLevel::None, BLACK);
+        SearchOptions vc3   = leafOptions(FREESTYLE, VCNLevel::VC3, BLACK);
+
+        // Act
+        LeafResult a = evaluateLeaf(fx, *board, off);
+        LeafResult b = evaluateLeaf(fx, *board, vc3);
+
+        // Assert
+        assert(a.terminal == b.terminal);
+        assert(a.value == b.value);
+        if (!a.terminal)
+            assert(a.utility == b.utility);
+    }
+}
+
+void evaluateNode_vcnOff_unchanged()
+{
+    // Arrange / Act / Assert per position: the values evaluateNode gave before slice 4.
+    MctsEngineFixture fx;
+    SearchOptions     off = leafOptions(FREESTYLE, VCNLevel::None, BLACK);
+
+    {  // double three: quickWinCheck's double-three rule
+        TT.clear();
+        auto       board = leafBoard(FREESTYLE, doubleThreeMoves());
+        LeafResult r     = evaluateLeaf(fx, *board, off);
+        assert(r.terminal && r.value == mate_in(board->ply() + 5));
+    }
+    {  // quiet: the network value
+        TT.clear();
+        auto       board = leafBoard(FREESTYLE, quietMoves());
+        LeafResult r     = evaluateLeaf(fx, *board, off);
+        assert(!r.terminal);
+        assert(r.utility == Evaluation::computeEvaluatorValue(*board).winLossRate());
+    }
+    {  // facing a single five, no VCF after the block: SimpleVCF stands pat, network value
+        TT.clear();
+        auto       board = leafBoard(FREESTYLE, blackFourWhiteToMoveMoves());
+        LeafResult r     = evaluateLeaf(fx, *board, off);
+        assert(!r.terminal);
+    }
+    {  // maxMoves: draw
+        TT.clear();
+        auto          board = leafBoard(FREESTYLE, quietMoves());
+        SearchOptions o     = off;
+        o.maxMoves          = board->nonPassMoveCount();
+        LeafResult r        = evaluateLeaf(fx, *board, o);
+        assert(r.terminal && r.value == getDrawValue(*board, o, board->ply()));
+    }
+    {  // Renju, white four-three (the wrapper's beta is pinned in quickWinCheckRuntime_*)
+        TT.clear();
+        auto board = leafBoard(RENJU, whiteFourThreeMoves());
+        assert(board->sideToMove() == WHITE);
+        assert(board->pattern4(Pos(6, 5), WHITE) == C_BLOCK4_FLEX3 && "fixture: four-three");
+        SearchOptions o = leafOptions(RENJU, VCNLevel::None, BLACK);
+        LeafResult    r = evaluateLeaf(fx, *board, o);
+        assert(r.terminal && r.value == mate_in(board->ply() + 5));
+    }
+}
+
+void simpleVcf_vcfOnlyMode_ttKeySeparatedFromPlain()
+{
+    // Arrange: a quiet position, black (VC4 attacker) to move, no four anywhere.
+    MctsEngineFixture fx;
+    auto              board = leafBoard(FREESTYLE, quietMoves());
+    SearchOptions     vc4   = leafOptions(FREESTYLE, VCNLevel::VC4, BLACK);
+    SearchOptions     off   = leafOptions(FREESTYLE, VCNLevel::None, BLACK);
+    const HashKey     zob   = board->zobristKey();
+    const HashKey     vcnKey = zob ^ Vcn::hashXor(vc4, VCNLevel::VC4);
+    const Value       fake   = mate_in(board->ply() + 9);  // a planted, wrong "win"
+    assert(vcnKey != zob);
+
+    // Act 1: a plain-VCF entry for this position must not satisfy a VC4 probe.
+    TT.clear();
+    TT.store(zob, fake, VALUE_NONE, true, BOUND_EXACT, Pos::NONE, 0, 0);
+    Value vc4Value = Testing::simpleVcf(*board, vc4, VCNLevel::VC4, 1);
+
+    // Assert 1: the VC4 attacker has no VCF, so it loses (no stand-pat), the plain entry unseen.
+    assert(vc4Value == mated_in(board->ply() + 2));
+
+    // Act 2: a VC4 entry must not satisfy a plain probe, and the VC4 probe uses that key.
+    TT.clear();
+    TT.store(vcnKey, fake, VALUE_NONE, true, BOUND_EXACT, Pos::NONE, 0, 0);
+    Value plainValue = Testing::simpleVcf(*board, off, VCNLevel::None, 1);
+    Value vc4Again   = Testing::simpleVcf(*board, vc4, VCNLevel::VC4, 1);
+
+    // Assert 2
+    assert(plainValue == VALUE_ZERO);
+    assert(vc4Again == fake);
+    TT.clear();
+}
+
+void quickWinCheckRuntime_vcfOnlyFlag_matchesTemplate()
+{
+    for (Rule rule : {FREESTYLE, STANDARD}) {
+        // Arrange: a double three and no four
+        auto board = plainBoard(rule, doubleThreeMoves());
+        assert(board->pattern4(Pos(5, 5), BLACK) == F_FLEX3_2X && "fixture: double three");
+
+        // Act
+        Value dflt    = quickWinCheck(rule, *board, 0);
+        Value plain   = quickWinCheck(rule, *board, 0, VALUE_MATE_IN_MAX_PLY, false);
+        Value vcfOnly = quickWinCheck(rule, *board, 0, VALUE_MATE_IN_MAX_PLY, true);
+
+        // Assert: the flag reaches the template; the default is unchanged
+        Value tplPlain = rule == FREESTYLE
+                             ? quickWinCheck<FREESTYLE>(*board, 0, VALUE_MATE_IN_MAX_PLY, false)
+                             : quickWinCheck<STANDARD>(*board, 0, VALUE_MATE_IN_MAX_PLY, false);
+        Value tplVcf = rule == FREESTYLE
+                           ? quickWinCheck<FREESTYLE>(*board, 0, VALUE_MATE_IN_MAX_PLY, true)
+                           : quickWinCheck<STANDARD>(*board, 0, VALUE_MATE_IN_MAX_PLY, true);
+        assert(dflt == mate_in(5));
+        assert(plain == tplPlain && plain == mate_in(5));
+        assert(vcfOnly == tplVcf && vcfOnly == VALUE_ZERO);
+    }
+
+    // Renju: the wrapper's default beta (VALUE_MATE_IN_MAX_PLY) admits the four-three check that
+    // the template's default (VALUE_INFINITE) skips; passing vcfOnly must keep the wrapper's beta.
+    auto renju = plainBoard(RENJU, whiteFourThreeMoves());
+    assert(renju->pattern4(Pos(6, 5), WHITE) == C_BLOCK4_FLEX3 && "fixture: four-three");
+    assert(quickWinCheck(RENJU, *renju, 0) == mate_in(5));
+    assert(quickWinCheck(RENJU, *renju, 0, VALUE_MATE_IN_MAX_PLY, true) == mate_in(5));
+    assert(quickWinCheck<RENJU>(*renju, 0) == VALUE_ZERO);
+}
+
+// --- AB cross-check and VCN-on smoke run --------------------------------------------------------
+
+enum class MateClass { Win, Loss, Draw, None };
+
+MateClass mateClass(bool terminal, Value v)
+{
+    if (!terminal)
+        return MateClass::None;
+    return v >= VALUE_MATE_IN_MAX_PLY ? MateClass::Win
+           : v <= VALUE_MATED_IN_MAX_PLY ? MateClass::Loss
+                                          : MateClass::Draw;
+}
+
+const char *className(MateClass c)
+{
+    switch (c) {
+    case MateClass::Win: return "win";
+    case MateClass::Loss: return "loss";
+    case MateClass::Draw: return "draw";
+    default: return "none";
+    }
+}
+
+/// AB's VCN answer at `moves` (the side to move attacks from `level`): the root move value of an
+/// alpha-beta search driven directly (not through the protocol), depth 8 as tests/vcn_tests.cpp.
+/// Runs on the default searcher and built-in evaluation; call outside MctsEngineFixture.
+Value abVcnValue(const std::vector<Pos> &moves, VCNLevel level)
+{
+    Search::Engine.waitForIdle();
+    Search::Engine.setupSearcher(Search::createSearcher(""));
+    Search::Engine.clear(true);
+    auto          board = plainBoard(FREESTYLE, moves);
+    SearchOptions o;
+    o.rule                = {FREESTYLE, GameRule::FREEOPEN};
+    o.disableOpeningQuery = true;
+    o.maxDepth            = 8;
+    o.vcnMode.n           = level;
+    o.vcnMode.attacker    = board->sideToMove();
+    {
+        ScopedCoutCapture cap;
+        Search::Engine.startThinking(*board, o);
+        Search::Engine.waitForIdle();
+    }
+    Value v = Search::Engine.main()->rootMoves[0].value;
+    Search::Engine.clear(true);  // the TT is shared with the MCTS VCF (same VCN key formula)
+    return v;
+}
+
+void evaluateNode_vcnLeaves_matchAbSignAndMateClass()
+{
+    // Arrange: VC4 / VC5 attacker-to-move leaves from tests/vcn_tests.cpp (plus a VC5 attacker
+    // that has a five). AB is asked at the same position and level; AB's value is relative to its
+    // root (ply 0), MCTS's to the game start (board.ply()), so only sign and class are compared.
+    std::vector<Pos> fiveOnBoard = openThreeMoves();
+    fiveOnBoard.push_back(Pos(10, 7));  // black open four
+    fiveOnBoard.push_back(Pos(13, 13));
+    struct Case
+    {
+        const char      *name;
+        std::vector<Pos> moves;
+        VCNLevel         level;
+        Value            ab;
+    };
+    std::vector<Case> cases = {
+        {"farVcfAfterPair VC4", afterForcedPair(farVcfAfterForcedBlockMoves()), VCNLevel::VC4},
+        {"doubleThreeAfterPair VC4",
+         afterForcedPair(doubleThreeAfterForcedBlockMoves()),
+         VCNLevel::VC4},
+        {"doubleThreeAfterPair VC3",
+         afterForcedPair(doubleThreeAfterForcedBlockMoves()),
+         VCNLevel::VC3},
+        {"quiet VC4", quietMoves(), VCNLevel::VC4},
+        {"openThree VC4", openThreeMoves(), VCNLevel::VC4},
+        {"quiet VC5", quietMoves(), VCNLevel::VC5},
+        {"fiveOnBoard VC5", fiveOnBoard, VCNLevel::VC5},
+        {"whiteFourNonFourBlock VC4", whiteFourBlackToMoveMoves(), VCNLevel::VC4},
+    };
+    for (Case &c : cases)
+        c.ab = abVcnValue(c.moves, c.level);
+
+    MctsEngineFixture fx;
+    for (const Case &c : cases) {
+        TT.clear();
+        auto          board = leafBoard(FREESTYLE, c.moves);
+        SearchOptions opts  = leafOptions(FREESTYLE, c.level, board->sideToMove());
+
+        // Act
+        LeafResult r = evaluateLeaf(fx, *board, opts);
+
+        // Assert
+        MateClass ab = mateClass(true, c.ab), mcts = mateClass(r.terminal, r.value);
+        std::printf("  cross-check %-26s AB %6d (%s)  MCTS %6d (%s)\n",
+                    c.name,
+                    int(c.ab),
+                    className(ab),
+                    int(r.value),
+                    className(mcts));
+        std::fflush(stdout);
+        assert(mcts == ab);
+    }
+}
+
+/// VCN-on smoke run through the searcher (not the protocol): root result of a fixed-node MCTS
+/// VCN search next to AB's answer. Informational, except that a proven MCTS win AB does not
+/// confirm is a failure. RAPFI_VCN_SMOKE_NODES overrides the node count.
+void mctsVcn_smokeVsAb_noMateAbRefutes()
+{
+    uint64_t nodes = 20000;
+    if (const char *env = std::getenv("RAPFI_VCN_SMOKE_NODES"))
+        nodes = std::strtoull(env, nullptr, 10);
+    struct Case
+    {
+        const char      *name;
+        std::vector<Pos> moves;
+        VCNLevel         level;
+        Value            ab;
+    };
+    // Roots without a five or a flex four on the board: the ROOT picker does not mark a policy on
+    // those forced roots, which Node::createEdges asserts (pre-existing, VCN off too; not slice 4).
+    // So the forced positions of tests/vcn_tests.cpp start after their forced pair.
+    std::vector<Case> cases = {
+        {"doubleThreeAfterPair", afterForcedPair(doubleThreeAfterForcedBlockMoves()), VCNLevel::VC4},
+        {"doubleThreeAfterPair", afterForcedPair(doubleThreeAfterForcedBlockMoves()), VCNLevel::VC3},
+        {"farVcfAfterPair", afterForcedPair(farVcfAfterForcedBlockMoves()), VCNLevel::VC4},
+        {"farVcfAfterPair", afterForcedPair(farVcfAfterForcedBlockMoves()), VCNLevel::VC3},
+        {"quiet", quietMoves(), VCNLevel::VC4},
+        {"quiet", quietMoves(), VCNLevel::VC3},
+    };
+    for (const Case &c : cases) {
+        auto b = plainBoard(FREESTYLE, c.moves);
+        for (Color side : {BLACK, WHITE})
+            assert(!b->p4Count(side, A_FIVE) && !b->p4Count(side, B_FLEX4) && "smoke: forced root");
+    }
+    for (Case &c : cases)
+        c.ab = abVcnValue(c.moves, c.level);
+
+    MctsEngineFixture fx;
+    for (const Case &c : cases) {
+        Search::Engine.clear(true);
+        auto          board = plainBoard(FREESTYLE, c.moves);
+        SearchOptions opts  = searchOptions(*board, nodes, c.level);
+        Time          t0    = now();
+        runMctsSearch(*board, opts);
+        Time       elapsed = now() - t0;
+        Node      *root    = fx.searcher().graph.root;
+        ValueBound bound   = root ? root->getBound() : ValueBound {};
+        Value      best    = Search::Engine.main()->rootMoves[0].value;
+        Pos        move    = Search::Engine.main()->rootMoves[0].pv[0];
+        bool       mctsWin = best >= VALUE_MATE_IN_MAX_PLY || bound.lower >= VALUE_MATE_IN_MAX_PLY;
+        std::printf("  smoke %-22s VC%d nodes %llu: AB %6d (%s) | MCTS best (%d,%d) value %6d "
+                    "bound [%d, %d] root visits %u time %lld ms\n",
+                    c.name,
+                    int(c.level) + 1,
+                    (unsigned long long)nodes,
+                    int(c.ab),
+                    className(mateClass(true, c.ab)),
+                    move.x(),
+                    move.y(),
+                    int(best),
+                    int(bound.lower),
+                    int(bound.upper),
+                    root ? unsigned(root->getVisits()) : 0u,
+                    (long long)elapsed);
+        std::fflush(stdout);
+        // A proven MCTS win that AB refutes is a wrong +M.
+        if (mctsWin)
+            assert(c.ab >= VALUE_MATE_IN_MAX_PLY);
+    }
+}
+
+// ----------------------------------------------------------------------------------------------
 
 bool isolateMode()
 {
@@ -857,4 +1504,21 @@ void runMctsVcnTests()
     RUN_ENGINE_TEST(expandNode_vcnDefenderRenjuBlack_passEdgeAndNoForbiddenMove);
     RUN_ENGINE_TEST(widenNode_vcnDefenderCutNodeWithPassEdge_widensAndKeepsPass);
     RUN_ENGINE_TEST(searchNode_vcnDefenderPass_childKeyHasRaisedLevel);
+
+    // VCN-03 slice 4: VC4 / VC5 terminals
+    RUN_PURE_TEST(quickWinCheckRuntime_vcfOnlyFlag_matchesTemplate);
+    RUN_ENGINE_TEST(evaluateNode_vc4AttackerDoubleThreeOnly_attackerLoses);
+    RUN_ENGINE_TEST(evaluateNode_vc4AttackerFarVcf_attackerWins);
+    RUN_ENGINE_TEST(evaluateNode_vc4AttackerNoVcf_attackerLosesNotNnValue);
+    RUN_ENGINE_TEST(evaluateNode_vc4DefenderNoFiveThreat_defenderWins);
+    RUN_ENGINE_TEST(evaluateNode_vc4DefenderFacingFive_notTerminalByPassRule);
+    RUN_ENGINE_TEST(evaluateNode_vc4AttackerBlocksFiveWithNonFour_attackerLoses);
+    RUN_ENGINE_TEST(evaluateNode_vc5AttackerNoFive_attackerLoses);
+    RUN_ENGINE_TEST(evaluateNode_vcnBoardFull_returnsDrawLikeAb);
+    RUN_ENGINE_TEST(evaluateNode_vc5AttackerNoFiveOnFullBoard_attackerLosesNotDraw);
+    RUN_ENGINE_TEST(evaluateNode_vc3_unchangedFromOrdinaryRules);
+    RUN_ENGINE_TEST(evaluateNode_vcnOff_unchanged);
+    RUN_ENGINE_TEST(simpleVcf_vcfOnlyMode_ttKeySeparatedFromPlain);
+    RUN_ENGINE_TEST(evaluateNode_vcnLeaves_matchAbSignAndMateClass);
+    RUN_ENGINE_TEST(mctsVcn_smokeVsAb_noMateAbRefutes);
 }

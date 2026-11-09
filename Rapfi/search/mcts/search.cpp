@@ -41,13 +41,36 @@ struct SearchStack
     Pattern4 moveP4[2];
 };
 
-// forward declaration
-template <Rule Rule>
-Value vcfsearch(Board &board, SearchStack *ss, int ply, Value alpha, Value beta, Depth depth);
-template <Rule Rule>
-Value vcfdefend(Board &board, SearchStack *ss, int ply, Value alpha, Value beta, Depth depth);
+/// VCN state of one VCF chain (VCN-03 slice 4). No pass is played inside a VCF, so the level is
+/// constant along the chain and is computed once at the entry.
+struct VcnContext
+{
+    VCNLevel level;     ///< The VCN level of every node of the chain
+    Color    attacker;  ///< The VCN attacker
+    HashKey  keyXor;    ///< Vcn::hashXor(options, level): VCF TT entries of this level only
+};
 
-Value vcf(Rule rule, Board &board, int ply)
+// forward declaration
+template <Rule Rule, bool VcnOn>
+Value vcfsearch(Board            &board,
+                SearchStack      *ss,
+                int               ply,
+                Value             alpha,
+                Value             beta,
+                Depth             depth,
+                const VcnContext &vcn);
+template <Rule Rule, bool VcnOn>
+Value vcfdefend(Board            &board,
+                SearchStack      *ss,
+                int               ply,
+                Value             alpha,
+                Value             beta,
+                Depth             depth,
+                const VcnContext &vcn);
+
+/// Shared entry of the plain (VcnOn = false) and the VCN (VcnOn = true) VCF search.
+template <bool VcnOn>
+Value vcfEntry(Rule rule, Board &board, int ply, const VcnContext &vcn)
 {
     Value alpha = -VALUE_EVAL_MAX;
     Value beta  = VALUE_EVAL_MAX;
@@ -60,19 +83,25 @@ Value vcf(Rule rule, Board &board, int ply)
         ss[ply - i].moveP4[WHITE] = NONE;
     }
 
-    if (board.p4Count(~board.sideToMove(), A_FIVE)) {
+    // The VC4 attacker always runs the attack side, as AB's search() does: when the defender has
+    // a five, the QVCF picker yields the block, which must itself continue the VCF.
+    bool vc4Attacker = false;
+    if constexpr (VcnOn)
+        vc4Attacker = vcn.level == VCNLevel::VC4 && board.sideToMove() == vcn.attacker;
+
+    if (!vc4Attacker && board.p4Count(~board.sideToMove(), A_FIVE)) {
         switch (rule) {
-        case FREESTYLE: return vcfdefend<FREESTYLE>(board, ss, ply, alpha, beta, depth);
-        case STANDARD: return vcfdefend<STANDARD>(board, ss, ply, alpha, beta, depth);
-        case RENJU: return vcfdefend<RENJU>(board, ss, ply, alpha, beta, depth);
+        case FREESTYLE: return vcfdefend<FREESTYLE, VcnOn>(board, ss, ply, alpha, beta, depth, vcn);
+        case STANDARD: return vcfdefend<STANDARD, VcnOn>(board, ss, ply, alpha, beta, depth, vcn);
+        case RENJU: return vcfdefend<RENJU, VcnOn>(board, ss, ply, alpha, beta, depth, vcn);
         default: break;
         }
     }
     else {
         switch (rule) {
-        case FREESTYLE: return vcfsearch<FREESTYLE>(board, ss, ply, alpha, beta, depth);
-        case STANDARD: return vcfsearch<STANDARD>(board, ss, ply, alpha, beta, depth);
-        case RENJU: return vcfsearch<RENJU>(board, ss, ply, alpha, beta, depth);
+        case FREESTYLE: return vcfsearch<FREESTYLE, VcnOn>(board, ss, ply, alpha, beta, depth, vcn);
+        case STANDARD: return vcfsearch<STANDARD, VcnOn>(board, ss, ply, alpha, beta, depth, vcn);
+        case RENJU: return vcfsearch<RENJU, VcnOn>(board, ss, ply, alpha, beta, depth, vcn);
         default: break;
         }
     }
@@ -80,8 +109,30 @@ Value vcf(Rule rule, Board &board, int ply)
     return VALUE_ZERO;
 }
 
-template <Rule Rule>
-Value vcfsearch(Board &board, SearchStack *ss, int ply, Value alpha, Value beta, Depth depth)
+/// The plain VCF of the side to move (ordinary search, VCN off).
+Value vcf(Rule rule, Board &board, int ply)
+{
+    return vcfEntry<false>(rule, board, ply, VcnContext {VCNLevel::None, BLACK, 0});
+}
+
+/// The VCF under VCN rules (VCN-03 slice 4), with the same flags and values as AB's
+/// vcfsearch/vcfdefend: the VC4 attacker plays fours only (quickWinCheck vcfOnly, whole-board
+/// QVCF picker with plain block fours) and has no stand-pat, so a missing VCF returns
+/// mated_in(ply + 2); a VC4 defender facing no five wins by passing; a VC5 attacker without a
+/// five loses. TT entries live under zobristKey() ^ vcn.keyXor.
+Value vcf(Rule rule, Board &board, int ply, const VcnContext &vcn)
+{
+    return vcfEntry<true>(rule, board, ply, vcn);
+}
+
+template <Rule Rule, bool VcnOn>
+Value vcfsearch(Board            &board,
+                SearchStack      *ss,
+                int               ply,
+                Value             alpha,
+                Value             beta,
+                Depth             depth,
+                const VcnContext &vcn)
 {
     Color                self = board.sideToMove();
     SearchThread        *thisThread = board.thisThread();
@@ -92,12 +143,25 @@ Value vcfsearch(Board &board, SearchStack *ss, int ply, Value alpha, Value beta,
     if (ply > thisThread->selDepth)
         thisThread->selDepth = ply;
 
+    // VCN: decided per node from the side to move (the level is constant along the chain)
+    bool vcfOnly = false;
+    if constexpr (VcnOn) {
+        const bool isAttacker = self == vcn.attacker;
+        vcfOnly               = isAttacker && vcn.level == VCNLevel::VC4;
+
+        // VC5: the attacker must already have a five, otherwise they lose at once (before the
+        // draw check, as AB)
+        if (isAttacker && vcn.level == VCNLevel::VC5 && Vcn::vc5AttackerLoses(board, self))
+            return mated_in(board.ply());
+    }
+
     // Check if the board has been filled or we have reached the max game ply.
     if (board.movesLeft() == 0 || board.nonPassMoveCount() >= options.maxMoves)
         return getDrawValue(board, options, board.ply());
 
-    // Check for immediate winning
-    if (Value value = quickWinCheck(options.rule, board, board.ply()); value != VALUE_ZERO) {
+    // Check for immediate winning (the VC4 attacker counts only wins made of fours)
+    if (Value value = quickWinCheck(options.rule, board, board.ply(), VALUE_MATE_IN_MAX_PLY, vcfOnly);
+        value != VALUE_ZERO) {
         // Do not return mate that longer than maxMoves option
         if (mate_step(value, 0) > options.maxMoves)
             value = getDrawValue(board, options, board.ply());
@@ -111,15 +175,17 @@ Value vcfsearch(Board &board, SearchStack *ss, int ply, Value alpha, Value beta,
     if (alpha >= beta)
         return alpha;
 
-    // Step 4. Transposition table lookup
-    HashKey posKey  = board.zobristKey();
-    Value   ttValue = VALUE_NONE;
-    Value   ttEval  = VALUE_NONE;
-    bool    ttIsPv  = false;
-    Bound   ttBound = BOUND_NONE;
-    Pos     ttMove  = Pos::NONE;
-    int     ttDepth = (int)DEPTH_LOWER_BOUND;
-    bool    ttHit   = TT.probe(posKey, ttValue, ttEval, ttIsPv, ttBound, ttMove, ttDepth, 0);
+    // Step 4. Transposition table lookup (VCN results live under their own keys)
+    HashKey posKey = board.zobristKey();
+    if constexpr (VcnOn)
+        posKey ^= vcn.keyXor;
+    Value ttValue = VALUE_NONE;
+    Value ttEval  = VALUE_NONE;
+    bool  ttIsPv  = false;
+    Bound ttBound = BOUND_NONE;
+    Pos   ttMove  = Pos::NONE;
+    int   ttDepth = (int)DEPTH_LOWER_BOUND;
+    bool  ttHit   = TT.probe(posKey, ttValue, ttEval, ttIsPv, ttBound, ttMove, ttDepth, 0);
 
     // Check for an early TT cutoff (for all types of nodes)
     if (ttHit && ttDepth >= depth) {
@@ -131,17 +197,26 @@ Value vcfsearch(Board &board, SearchStack *ss, int ply, Value alpha, Value beta,
             return ttValue;
     }
 
-    // Stand pat for the situation that we do not find a mate
-    bestValue = VALUE_ZERO;
-    if (bestValue > alpha)
-        alpha = bestValue;
+    if (vcfOnly) {
+        // The VC4 attacker cannot stand pat: without a four they are refuted by a defender pass.
+        // Start from that worst case so a missing VCF returns it.
+        bestValue = mated_in(board.ply() + 2);
+    }
+    else {
+        // Stand pat for the situation that we do not find a mate
+        bestValue = VALUE_ZERO;
+        if (bestValue > alpha)
+            alpha = bestValue;
+    }
 
     MovePicker mp(Rule,
                   board,
                   MovePicker::ExtraArgs<MovePicker::QVCF> {
                       Pos::NONE,
                       depth,
-                      {ss[ply - 2].moveP4[self], ss[ply - 4].moveP4[self]}});
+                      {ss[ply - 2].moveP4[self], ss[ply - 4].moveP4[self]},
+                      vcfOnly,
+                      vcfOnly});
 
     while (Pos move = mp()) {
         assert(board.isLegal(move));
@@ -152,7 +227,7 @@ Value vcfsearch(Board &board, SearchStack *ss, int ply, Value alpha, Value beta,
         board.move<Rule, Board::MoveType::NO_EVAL>(move);
 
         // Call defence-side vcf search
-        Value value = -vcfdefend<Rule>(board, ss, ply + 1, -beta, -alpha, depth - 1);
+        Value value = -vcfdefend<Rule, VcnOn>(board, ss, ply + 1, -beta, -alpha, depth - 1, vcn);
 
         board.undo<Rule, Board::MoveType::NO_EVAL>();
 
@@ -187,8 +262,14 @@ Value vcfsearch(Board &board, SearchStack *ss, int ply, Value alpha, Value beta,
     return bestValue;
 }
 
-template <Rule Rule>
-Value vcfdefend(Board &board, SearchStack *ss, int ply, Value alpha, Value beta, Depth depth)
+template <Rule Rule, bool VcnOn>
+Value vcfdefend(Board            &board,
+                SearchStack      *ss,
+                int               ply,
+                Value             alpha,
+                Value             beta,
+                Depth             depth,
+                const VcnContext &vcn)
 {
     Color                self = board.sideToMove(), oppo = ~self;
     SearchThread        *thisThread = board.thisThread();
@@ -197,8 +278,15 @@ Value vcfdefend(Board &board, SearchStack *ss, int ply, Value alpha, Value beta,
         thisThread->selDepth = ply;
 
     // Return evaluation immediately if there is no vcf threat
-    if (!board.p4Count(oppo, A_FIVE))
+    if (!board.p4Count(oppo, A_FIVE)) {
+        // VCN: the VC4 attacker's last move created no five threat, so the defender wins by
+        // passing (the attacker would then be at VC5 without a five). AB's vcfdefend value.
+        if constexpr (VcnOn) {
+            if (self != vcn.attacker && vcn.level == VCNLevel::VC4)
+                return mate_in(board.ply() + 1);
+        }
         return VALUE_ZERO;
+    }
 
     // Check if the board has been filled or we have reached the max game ply.
     if (board.movesLeft() == 0 || board.nonPassMoveCount() >= options.maxMoves)
@@ -217,12 +305,15 @@ Value vcfdefend(Board &board, SearchStack *ss, int ply, Value alpha, Value beta,
         ss[ply].moveP4[BLACK] = board.pattern4(move, BLACK);
         ss[ply].moveP4[WHITE] = board.pattern4(move, WHITE);
 
-        TT.prefetch(board.zobristKeyAfter(move));  // pre-make, overlaps the board update
+        HashKey nextKey = board.zobristKeyAfter(move);
+        if constexpr (VcnOn)
+            nextKey ^= vcn.keyXor;
+        TT.prefetch(nextKey);  // pre-make, overlaps the board update
         board.move<Rule, Board::MoveType::NO_EVAL>(move);
 
         // Call attack-side vcf search
         // Note that we do not reduce depth for vcf defence move.
-        value = -vcfsearch<Rule>(board, ss, ply + 1, -beta, -alpha, depth);
+        value = -vcfsearch<Rule, VcnOn>(board, ss, ply + 1, -beta, -alpha, depth, vcn);
 
         board.undo<Rule, Board::MoveType::NO_EVAL>();
     }
@@ -553,15 +644,39 @@ void evaluateNode(Node &node, const SearchOptions &options, Board &board, int pl
         if (ply > thisThread->selDepth)
             thisThread->selDepth = ply;
 
-        // Check if the board has been filled or we have reached the max game ply.
+        // VCN mode (VCN-03 slice 4): the leaf rules of AB, in AB's order. The level comes from the
+        // defender passes since the root (slice 2); VCN off reads nothing here.
+        const bool vcnOn             = options.vcnMode.enabled();
+        const Color vcnAttacker      = options.vcnMode.attacker;
+        VCNLevel   vcnLevel          = VCNLevel::None;
+        bool       vcnAttackerToMove = false;
+        if (vcnOn) {
+            MCTSSearcher &searcher =
+                static_cast<MCTSSearcher &>(*thisThread->engine.searcher());
+            vcnLevel = mctsNodeVcnLevel(board, options, searcher.scratch.rootDefenderPasses);
+            vcnAttackerToMove = board.sideToMove() == vcnAttacker;
+
+            // 1. VC5: the attacker must already have a five, otherwise they lose at once. Before
+            // the draw check, so a full board does not turn a lost attacker into a draw.
+            if (vcnAttackerToMove && vcnLevel == VCNLevel::VC5
+                && Vcn::vc5AttackerLoses(board, vcnAttacker)) {
+                node.setTerminal(mated_in(board.ply()));
+                return;
+            }
+        }
+
+        // 2. Check if the board has been filled or we have reached the max game ply.
         if (board.movesLeft() == 0 || board.nonPassMoveCount() >= options.maxMoves) {
             Value value = getDrawValue(board, options, board.ply());
             node.setTerminal(value);
             return;
         }
 
-        // Check for immediate winning
-        if (Value value = quickWinCheck(options.rule, board, board.ply()); value != VALUE_ZERO) {
+        // 3. Check for immediate winning (the VC4 attacker counts only wins made of fours)
+        const bool vcfOnly = vcnAttackerToMove && vcnLevel == VCNLevel::VC4;
+        if (Value value =
+                quickWinCheck(options.rule, board, board.ply(), VALUE_MATE_IN_MAX_PLY, vcfOnly);
+            value != VALUE_ZERO) {
             // Do not return mate that longer than maxMoves option
             if (mate_step(value, 0) > options.maxMoves)
                 value = getDrawValue(board, options, board.ply());
@@ -570,8 +685,36 @@ void evaluateNode(Node &node, const SearchOptions &options, Board &board, int pl
             return;
         }
 
+        if (vcnOn) {
+            const SimpleVCF::VcnContext vcn {vcnLevel,
+                                             vcnAttacker,
+                                             Vcn::hashXor(options, vcnLevel)};
+
+            if (vcnLevel == VCNLevel::VC4) {
+                // 4. VC4 defender and the attacker made no five threat: the defender wins by
+                // passing (the attacker would be at VC5 without a five).
+                if (!vcnAttackerToMove && !board.p4Count(vcnAttacker, A_FIVE)) {
+                    node.setTerminal(mate_in(board.ply() + 1));
+                    return;
+                }
+
+                // 5. VC4 attacker: always solved here. The fours-only VCF has no stand-pat and
+                // returns mated_in(ply + 2) when there is no VCF; never the network value.
+                if (vcnAttackerToMove) {
+                    node.setTerminal(SimpleVCF::vcf(options.rule, board, ply, vcn));
+                    return;
+                }
+            }
+
+            // 6. Otherwise (VC2/VC3, a VC4 defender facing a five, VC5 defender): the VCF under
+            // VCN rules, then the network value.
+            if (Value value = SimpleVCF::vcf(options.rule, board, ply, vcn); value != VALUE_ZERO) {
+                node.setTerminal(value);
+                return;
+            }
+        }
         // Search VCF
-        if (Value value = SimpleVCF::vcf(options.rule, board, ply); value != VALUE_ZERO) {
+        else if (Value value = SimpleVCF::vcf(options.rule, board, ply); value != VALUE_ZERO) {
             node.setTerminal(value);
             return;
         }
@@ -1545,4 +1688,26 @@ uint32_t Search::MCTS::Testing::generateNodeMoves(const Board         &board,
                                                   float               *policyList)
 {
     return ::generateNodeMoves(board, options, moveList, policyList);
+}
+
+void Search::MCTS::Testing::evaluateNode(Node                &node,
+                                         const SearchOptions &options,
+                                         Board               &board,
+                                         int                  ply)
+{
+    ::evaluateNode<false>(node, options, board, ply);
+}
+
+Value Search::MCTS::Testing::simpleVcf(Board               &board,
+                                       const SearchOptions &options,
+                                       VCNLevel             level,
+                                       int                  ply)
+{
+    if (!options.vcnMode.enabled() || level == VCNLevel::None)
+        return SimpleVCF::vcf(options.rule, board, ply);
+    return SimpleVCF::vcf(
+        options.rule,
+        board,
+        ply,
+        SimpleVCF::VcnContext {level, options.vcnMode.attacker, Vcn::hashXor(options, level)});
 }

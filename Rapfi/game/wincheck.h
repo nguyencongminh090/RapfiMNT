@@ -113,14 +113,19 @@ quickWinCheck(const Board &board, int ply, Value beta = VALUE_INFINITE, bool vcf
     return VALUE_ZERO;
 }
 
-/// Runtime-rule dispatch wrapper around the rule-templated quickWinCheck.
-inline Value
-quickWinCheck(Rule rule, const Board &board, int ply, Value beta = VALUE_MATE_IN_MAX_PLY)
+/// Runtime-rule dispatch wrapper around the rule-templated quickWinCheck. Note the default beta
+/// differs from the template's (it gates the deeper Renju checks); pass it explicitly when
+/// passing vcfOnly.
+inline Value quickWinCheck(Rule         rule,
+                          const Board &board,
+                          int          ply,
+                          Value        beta    = VALUE_MATE_IN_MAX_PLY,
+                          bool         vcfOnly = false)
 {
     switch (rule) {
     default:
-    case FREESTYLE: return quickWinCheck<FREESTYLE>(board, ply, beta);
-    case STANDARD: return quickWinCheck<STANDARD>(board, ply, beta);
-    case RENJU: return quickWinCheck<RENJU>(board, ply, beta);
+    case FREESTYLE: return quickWinCheck<FREESTYLE>(board, ply, beta, vcfOnly);
+    case STANDARD: return quickWinCheck<STANDARD>(board, ply, beta, vcfOnly);
+    case RENJU: return quickWinCheck<RENJU>(board, ply, beta, vcfOnly);
     }
 }

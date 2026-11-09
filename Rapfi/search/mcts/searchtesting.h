@@ -18,13 +18,16 @@
 
 #pragma once
 
+#include "../../core/types.h"
+#include "../searchcommon.h"
+
 #include <cstdint>
 
 class Board;
 struct Pos;
 
-namespace Search {
-struct SearchOptions;
+namespace Search::MCTS {
+class Node;
 }
 
 /// Thin test-only wrappers over helpers that live in search.cpp's anonymous namespace
@@ -50,5 +53,16 @@ uint32_t generateNodeMoves(const Board         &board,
                            const SearchOptions &options,
                            Pos                 *moveList,
                            float               *policyList);
+
+/// Forwards to evaluateNode<false>() in search.cpp: the first evaluation of a non-root node,
+/// terminal rules included (VCN-03 slice 4). In VCN mode the node level is read from
+/// scratch.rootDefenderPasses of the engine's MCTS searcher. The board must be bound to a search
+/// thread (with an evaluator if the node can fall through to the network value).
+void evaluateNode(Node &node, const SearchOptions &options, Board &board, int ply);
+
+/// Runs SimpleVCF::vcf() in search.cpp on `board` with the VCN context of `level` for the
+/// attacker in `options` (VCNLevel::None, or VCN off in `options`: the plain VCF, as for an
+/// ordinary search). Returns the VCF value (VALUE_ZERO when nothing is found by the plain VCF).
+Value simpleVcf(Board &board, const SearchOptions &options, VCNLevel level, int ply);
 
 }  // namespace Search::MCTS::Testing
