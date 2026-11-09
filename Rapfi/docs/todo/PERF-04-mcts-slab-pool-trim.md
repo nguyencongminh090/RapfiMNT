@@ -1,6 +1,6 @@
 # PERF-04 — MCTS retained slab pool after recycle
 
-**Status:** phase 1 done (date 2026-11-09), awaiting user choice. Found in the PERF-03 phase 2 review.
+**Status:** phase 2 in progress (phase 1 done 2026-11-09). User choice 2026-11-09: (a). Found in the PERF-03 phase 2 review.
 **Class:** B (changes memory behaviour on budget-limited runs; search output on unbounded runs must
 stay byte-identical).
 
@@ -39,7 +39,7 @@ defaults, the shard-count compare in `MCTSSearcher::clear`.
 
 ## Test list
 
-To be written before code: recycle frees an empty slab and keeps live nodes at their addresses;
+Phase 2 list for (a): see "Phase 2 — candidate (a)" below. Phase 1 outline, before the choice: recycle frees an empty slab and keeps live nodes at their addresses;
 partially used slabs are kept; free-list entries of a freed slab are gone (no reuse of freed
 memory); accounting identity after insert / recycle / clear under the chosen rule; `graphClosed()`
 fires at the same real heap level before and after a recycle.
@@ -212,3 +212,138 @@ Repeat §8 at 200 MB, and once at 8T 40 MB. Use the same command with `MEM=20000
 baseline. **The run is valid only if search 1 shows `gmu / soft = 1.00`.** Otherwise the backward
 jump does not recycle, because a recycle on a backward move needs `overBudget`. This checks that the
 1.008 ratio does not grow with budget size or threads. Each run is two searches (minutes).
+
+## Phase 2 — candidate (a): free fully empty slabs after recycle
+
+**User choice 2026-11-09: (a)**, class B. `graphMemoryUsed` and `nodeFootprint()` stay unchanged.
+
+### Decision note (class B, hard rule 9)
+
+- **What changes:** after an erase, `NodeTable` frees every slab of the shard that holds no live
+  node, including the bump slab, and drops those slabs' entries from the free list. Nothing else
+  changes: the public API, slab size and alignment, the slot arrays, `graphMemoryUsed`.
+- **Expected effect:** real table heap follows the survivors after a recycle. The invariant is
+  "every slab holds at least one live node", so `H ≤ G + C0 + 31·56 B · N_s` (phase 1 table).
+  Search output does not change, bounded or not, because `graphMemoryUsed` is untouched and
+  nothing orders by `Node *` (audit item 9).
+- **How it is measured:** unit tests below; bench `17621937 / 8c1f72e5`; golden byte-identical; ASan
+  on the suite. Then, by the verification agent: the A/B recycle sequence byte-identical against
+  the 1b6370a binary (unbounded and budget-limited), the gap curve, peak RSS, budget closure, cycles
+  per visit, TSan.
+- **No reserve, no threshold.** An empty bump slab is freed as well, so a shard with no live node
+  owns no memory. Churn (one `new` per 32 regrown nodes) happens between searches for the frees and
+  during the search for the `new`s, as on a fresh graph. A per-shard reserve costs up to
+  1024 × 1800 B and would weaken the invariant. Add one only if the verification shows a cost in
+  recycle time or cycles per visit.
+
+### Use-after-free audit (complete, written before any slab is released)
+
+A slab is freed only inside `eraseNodesIf` (called from `recycleOldNodes`) or in
+`releaseAll` (`clear(true)`, destructor; unchanged). So the question is which `Node *` can be
+dereferenced after `recycleOldNodes` and points to an erased node.
+
+1. **`graph.root`** — `setupRootNode` reassigns it by `allocateOrFindNode` before calling
+   `recycleOldNodes`, and the marking starts from it, so the root is always marked.
+   `clear(false)` sets it to null. `clear(true)` frees everything and nulls it too.
+2. **Edge `childWord`s of survivors** — `recursiveApply` (search.cpp ~1222) follows every edge with
+   a non-null child of every non-leaf node it visits, and it sets the node's age only after all
+   children have returned. A child returns early only if its own age was already set, which happens
+   only after its own children were done. The graph is acyclic (each child has one more move), so by
+   induction a marked node has a marked subtree. `runOnAllThreads(..., true)` waits for every
+   marking thread before the erase starts. So every child of a survivor is a survivor.
+   Edges of erased nodes go away with them (`~Node` frees the edge array).
+3. **`RetiredEdgeArrays`** (old arrays still hold child words) — `searchMain` calls
+   `freeRetiredEdgeArrays()` after `runOnAllThreads(search)` returns. `clear(true)` also frees
+   them. The next recycle runs in the next `setupRootNode`, so the list is empty at recycle.
+   Phase 2 adds `assert(retiredEdgeArrays.count() == 0)` at the entry of `recycleOldNodes`
+   (compiled out in release).
+4. **`createEdgesFrom`** copies child words from an old array during a search only.
+5. **Root-move data** — `th.rootMoves` hold `Pos`, values and PV moves, no `Node *`.
+   `updateRootMovesData` reads `graph.root` after the search, before any recycle.
+6. **`scratch` (SearchScratch)** holds counters, a time and an int, no `Node *`.
+   **`GraphState`** holds only `root` (item 1), plus a move list, a key and the age.
+   `MCTSSearcher::makeSearchData` returns null, so there is no per-thread MCTS data.
+   `selectedPath` is local to `search()`.
+7. **Outside `search/mcts/`** — no engine `Node *` holder (phase 1 grep, item 6 of the initial
+   audit). There is no `static` or `thread_local` `Node *` in `search/mcts/*.cpp` (grep).
+8. **Erase predicate and shard parallelism** — the predicate in `recycleOldNodes` reads only the
+   node itself. Each shard is erased under its own unique lock, and the release touches only that
+   shard's slabs. A slab holds nodes of one shard only, so no other shard's predicate can read a
+   freed slab.
+9. **Nothing orders by `Node *`** — freed slabs change the addresses later nodes get, so this is
+   what byte-identical output rests on. A grep of `search/mcts/` for `sort`, `std::set`, `std::map`,
+   `less<`, `unordered_`, `hash<` and pointer-to-integer casts finds only policy / root-move
+   sorts by value (search.cpp 523, 1682) and the child-word packing in `node.h`. The slot position
+   depends on the hash, not the address. `rehash` walks the old slots by index.
+10. **Tests holding `Node *`:**
+    - `mcts_visits_tests.cpp` 523–572 hold `root` / `child` across two searches of the same
+      position. `setupRootNode` returns early (same position and key, unbounded), so no recycle runs.
+      The pointers are reachable anyway.
+    - `mcts_vcn_tests.cpp` 315 (`vcnRoot`): the next ordinary search has a new root key and recycles,
+      so `vcnRoot` may be erased and its slab freed. The test does not dereference `vcnRoot` after
+      that search; it compares the new root by key.
+    - `mcts_vcn_tests.cpp` 1405 (`root`): dereferenced right after the search, before the next
+      `clear(true)`.
+    - `mcts_bound_tests` / `mcts_widen_tests` build their nodes outside the table.
+    - `mcts_nodetable_tests.cpp`: the pointer vectors in the growth and thread tests see no erase.
+      `eraseNodesIf_staleAge_...` dereferences only survivors. `eraseNodesIf_thenInsert_...`
+      compares freed addresses with new ones. Under (a) its first 100 nodes fill whole slabs that are
+      freed, so it is rewritten (below).
+
+**Conclusion:** no `Node *` that can be dereferenced after a recycle points to an erased node, so
+freeing empty slabs creates no use-after-free in engine code. As a test aid, freed node storage is
+poisoned under ASan (bytes 8..55; the first 8 hold the free-list link) and unpoisoned on reuse. A
+stale read of a recycled node inside a kept slab is then reported too, which was invisible before.
+
+### Test list (written before the code)
+
+`tests/mcts_nodetable_tests.cpp`. Slab layout is controlled through the fresh single-shard
+order: on `NodeTable(0)` with no erase, insert *i* lands in slab *i*/32, slot *i*%32. Labels:
+**red** = fails before the change; **guard** = passes before and after (pins behaviour that must
+not change).
+
+| Test | Checks | Label |
+|---|---|---|
+| `eraseNodesIf_allNodesOfSlabErased_slabReleased` | 3 full slabs, erase the 32 nodes of the middle one: `numSlabs` 3 → 2, `heapBytes` drops by `SlabBytes`, `numFreeNodes == 0` | red |
+| `eraseNodesIf_slabPartlyLive_slabKept` | erase 31 of the middle slab's 32: `numSlabs == 3`, `numFreeNodes == 31` | guard |
+| `eraseNodesIf_slabReleased_survivorsKeepAddresses` | 4 full slabs; erase slabs 1 and 3 whole and the even nodes of slab 0: every survivor is found at its old address with its hash; erased hashes are gone | guard |
+| `eraseNodesIf_slabReleased_freeListHoldsOnlyKeptSlabSlots` | 3 full slabs; erase slab 1 whole and the first 8 nodes of slabs 0 and 2: `numFreeNodes == 16`; draining the free list (16 inserts, no new slab) returns exactly the 16 freed addresses of kept slabs, never one in the freed slab | red |
+| `eraseNodesIf_bumpSlabEmptied_slabReleased` | 32 + 10 nodes (bump slab at `slabUsed` 10), erase the 10: `numSlabs == 1`, `numFreeNodes == 0` | red |
+| `eraseNodesIf_bumpSlabReleased_nextInsertsStartNewSlabAndKeepSurvivors` | same arrangement, then 33 inserts: 3 slabs, no free node, no new node inside slab 0, every survivor's hash intact and found. Catches a stale `slabUsed` after the bump slab is freed, which would place new nodes over live ones in slab 0. It passes before the change because there the bump slab is kept | guard |
+| `eraseNodesIf_bumpSlabPartlyLive_keptAndBumpContinues` | 32 + 10 nodes, erase 5 of the bump slab's: `numSlabs == 2`, `numFreeNodes == 5`; 5 inserts reuse the freed addresses, 22 more fill the bump slab with no new slab, the next one adds a slab | guard |
+| `eraseNodesIf_allNodesErased_shardOwnsNoMemory` | 100 nodes, erase all: `numSlabs == 0`, `numFreeNodes == 0`, `slotCapacity == 0`, `heapBytes() == 0`; then an insert works and owns one slab | red |
+| `eraseNodesIf_partlyFreedSlabsThenInsert_reusesFreedStorageWithoutNewSlab` | rewrite of `eraseNodesIf_thenInsert_reusesFreedStorageWithoutNewSlab` (see below) | guard |
+| `recycleOldNodes_afterMoveForward_noShardKeepsSlabWithoutLiveNode` | engine, 1024 shards: search, move forward two moves, search (recycle): every shard has `numSlabs <= numNodes` (each kept slab holds a live node), and `graphMemoryUsed` equals the live footprint (accounting identity unchanged) | red |
+| `recycleOldNodes_budgetRunAfterSlabRelease_graphClosedFollowsLiveFootprint` | engine, explicit memory limit small enough to close the graph in search 1; move forward, search 2 recycles: `graphMemoryUsed` equals the live footprint, `graphClosed()` equals `graphInsertionClosed(true, liveFootprint, limit)`, every shard `numSlabs <= numNodes`. The memory limit is reset to 0 before the fixture ends (the fixture copies it into the next searcher) | red (slab bound) |
+
+The existing `recycleOldNodes_afterMoveForward_graphMemoryUsedEqualsLiveFootprints`,
+`heapBytes_afterInserts_equalsSlotsPlusSlabs` and `clearShard_nonEmpty_...` stay as guards for
+the accounting identity and `releaseAll`.
+
+**Rewrite of `eraseNodesIf_thenInsert_reusesFreedStorageWithoutNewSlab`.** It erases the first 100
+of 400 inserts. Those fill slabs 0–2 whole, which (a) frees, so only 4 free slots stay and the
+100 new inserts would need new slabs. The test's purpose is "freed storage is reused before a new
+slab". It is kept by erasing `i % 4 == 0` among the 400 inserts instead: every slab keeps 24 live
+nodes (the bump slab, `slabUsed` 16, keeps 12), so nothing is freed and all original asserts
+(100 free before, 0 after, same slab count, every new node at a freed address) still hold. It is
+renamed to `eraseNodesIf_partlyFreedSlabsThenInsert_reusesFreedStorageWithoutNewSlab` to name the
+scenario.
+
+**Failing-first method.** `RUN_TEST` aborts at the first failed assert, so each red test is run
+alone against the unchanged `nodetable.h` (temporary local filter, not committed). Output goes to
+`build/perf04/phase2/tests_failing_first.txt`.
+
+**Failing first (2026-11-09, recorded before any change to `nodetable.h`).** Built in `build/`
+(gcc 15.2.0 Release, `rapfi_tests` with `-UNDEBUG`; `--check-asserts-live` aborts as it should).
+Each test was run alone through a temporary local `RT_ONLY` filter in `tests/testutil.h`, which was
+reverted and not committed. Record: `build/perf04/phase2/tests_failing_first.txt`.
+
+| Test | Before the change |
+|---|---|
+| `eraseNodesIf_allNodesOfSlabErased_slabReleased` | **fails**: `s.numSlabs == 2` |
+| `eraseNodesIf_slabReleased_freeListHoldsOnlyKeptSlabSlots` | **fails**: `afterErase.numFreeNodes == 16` |
+| `eraseNodesIf_bumpSlabEmptied_slabReleased` | **fails**: `s.numSlabs == 1` |
+| `eraseNodesIf_allNodesErased_shardOwnsNoMemory` | **fails**: `s.numSlabs == 0` |
+| `recycleOldNodes_afterMoveForward_noShardKeepsSlabWithoutLiveNode` | **fails**: `noShardHasMoreSlabsThanNodes` |
+| `recycleOldNodes_budgetRunAfterSlabRelease_graphClosedFollowsLiveFootprint` | **fails** on `slabBound`. Its earlier asserts pass: graph closed after search 1, `graphMemoryUsed == live footprint`, `graphClosed()` matches, so the setup is valid |
+| `eraseNodesIf_slabPartlyLive_slabKept`, `..._survivorsKeepAddresses`, `..._nextInsertsStartNewSlabAndKeepSurvivors`, `..._bumpSlabPartlyLive_keptAndBumpContinues`, `eraseNodesIf_partlyFreedSlabsThenInsert_...` | pass (guards, as labelled) |
