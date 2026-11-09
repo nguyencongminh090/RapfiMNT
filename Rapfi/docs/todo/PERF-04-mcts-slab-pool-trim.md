@@ -1,6 +1,6 @@
 # PERF-04 — MCTS retained slab pool after recycle
 
-**Status:** phase 2: core done, verification runs pending (phase 1 done 2026-11-09). User choice 2026-11-09: (a). Found in the PERF-03 phase 2 review.
+**Status:** phase 2: verification done, final review pending (phase 1 done 2026-11-09). User choice 2026-11-09: (a). Found in the PERF-03 phase 2 review.
 **Class:** B (changes memory behaviour on budget-limited runs; search output on unbounded runs must
 stay byte-identical).
 
@@ -428,3 +428,78 @@ because only the former has an engine fixture. The `instruction.md` index line i
 - Gap curve after the change (13-move game, L1, L2, §8 worst case), peak RSS, budget closure at
   40 / 90 / 200 MB (counts must equal phase 1), cycles per visit A/B (PGO, interleaved, power
   state recorded), recycle time vs churn, PGO release rebuild.
+
+## Phase 2 verification (2026-11-09, Sonnet verification agent)
+
+Raw data: `build/perf04/phase2/verify_raw.md` and `build/perf04/phase2/verify/`. Code under test:
+engine sources of 428956b (HEAD differs in docs only). No source or test file changed. Every hard-stop
+condition was clear: no sanitizer report, no byte difference, no test failure.
+
+| Run | Result | Key numbers |
+|---|---|---|
+| 1 TSan | PASS | `rapfi_tests` 238/238, NodeTable suite x50 1500/1500, real 8T game with 4 recycles and YXHASHCLEAR (`tsan.supp` for the VCF TT as in PERF-03): 0 TSan reports |
+| 2 ASan + UBSan engine (`-fno-sanitize=enum`, leak check on) | PASS | 13-move game, same with YXHASHCLEAR, same at 40 MB, L2 (37 searches), section 8 worst case: all bestmoves answered, stderr empty |
+| 3 A/B recycle sequence (4..16, YXHASHCLEAR, 10..12, 14 recycles) NEW vs 1b6370a binary and vs `pbrain-B-gcc` | PASS | unbounded, 25 MB, 40 MB, 90 MB, section 8 worst case (191747-node recycle): all byte-identical (1335 / 258 lines). 8T: runs clean unbounded and at 40 MB. Golden md5 f3e620af unchanged. The release (NDEBUG) path of `releaseEmptySlabs` ran with real recycles |
+| 4 Gap curve | PASS | see tables below |
+| 5 Peak RSS, 2M-node golden | PASS | median 173208 KB (base) vs 173196 KB (new); one search, no recycle |
+| 6 Budget closure | PASS | 113554 / 258816 / 585725 nodes and 286449 / 827649 / 2374249 root visits at 40 / 90 / 200 MB, equal to phase 1 and PERF-03 |
+| 7 Cycles per visit, PGO | no regression | see table; recycle erase phase +44 % (1T) |
+| 8 PGO rebuild `scripts/pgo_build.sh x64-clang-AVX512VNNI` | PASS | BENCH Nodes 17621937, Hash 8c1f72e5 (1154930 n/s throttled; base PGO 1130916) |
+
+### Gap curve, 1T, MB (gap1 = `heapBytes()` minus 75 B x live nodes)
+
+| game | max gap1 before / after | final gap1 | final tableHeap | final slabs | peak RSS |
+|---|---|---|---|---|---|
+| 13-move game | 11.41 / 7.66 | 11.41 / 5.24 | 11.94 / 5.78 | 6560 / 3135 | 90.9 / 90.5 |
+| long game L1 (n=4..36) | 16.67 / 12.70 | 15.11 / 0.46 | 17.08 / 2.43 | 9259 / 1123 | 114.0 / 113.9 |
+| L2 (n=4..40) | 11.96 / 8.91 | -0.81 / -0.81 | 39.57 / 39.57 | 17323 / 17323 | 120.4 / 122.3 |
+
+The 13-move game at n=10..16 (live 28157 .. 7108 nodes): tableHeap 12.26 .. 11.94 MB before, 9.77 .. 5.78 MB
+after. L2 collapse (27..570 live nodes): tableHeap 0.83 MB after (12.01 before), 430 slabs (6639).
+Peak RSS does not drop (VmHWM is monotone; glibc keeps the freed 1800 B chunks as reusable heap); L2 is
++1.9 MB (+1.6 %). The freed memory is visible to the allocator (uordblks), not to the OS.
+
+### Section 8 worst case (L2, 40 MB, 1T, MAX_NODE 1M, search n=40 then n=4)
+
+| | tableHeap MB | free-list MB | real graph heap MB | real minus soft | real / graph limit |
+|---|---|---|---|---|---|
+| before | 12.96 | 5.65 | 37.79 | +5.91 | **1.008** |
+| after | 7.20 | 0.00 | 31.98 | +0.11 | **0.853** |
+
+Budget games with recycles near the soft limit: g13 25 MB max real/graph limit 0.905 -> 0.895, max
+real minus soft +1.29 -> +1.05 MB; g13 40 MB 0.878 -> 0.874, +1.05 -> +0.90 MB.
+
+### Cycles per visit (PGO, clang 21.1.8, interleaved, 5 pairs, L2 workload with 25 recycles)
+
+Base PGO was built from the 2b1bfa0 sources with the same script. Visits: 1T 5001142 in both; 8T about 15.03M (non-deterministic).
+
+| | base median | new median | new/base | pairs with new lower |
+|---|---|---|---|---|
+| 1T cycles/visit | 13639 (13498..14583) | 13506 (13419..13849) | 0.990 | 5/5 |
+| 8T cycles/visit | 17923 (16763..18533) | 16717 (15988..17786) | 0.933 (median of pair ratios 0.978) | 5/5 |
+
+Instructions per visit 1T: 25.6k vs 25.66k. The differences are inside the run spread: read as no regression, not as a gain.
+Power state: PL1 24 W, powersave, cpu0 frequency 0.86..2.49 GHz between pairs, 72..75 C: throttled, so only cycles are compared.
+
+Recycle time (throwaway timing patch in copies, gcc Release, 25 recycles of the L2 game, 3 runs): mark
+phase 190 ms (base) vs 182 ms (new), erase phase 170 ms vs 244 ms at 1T (+74 ms per game, about +3 ms
+per recycle; the largest recycle, 304034 nodes, 22 -> 34 ms); 8T is noisy with no visible difference.
+No per-shard reserve was added: the cost is small against the search time between recycles, so the
+"no reserve, no threshold" decision stands.
+
+### Anomaly (not caused by PERF-04)
+
+The multi-process pipe harness sometimes loses the final answer of a search: the engine goes idle waiting
+for stdin and the harness waits forever. It happens under load (and once with an idle machine at 8T)
+and hits the baseline `pbrain-B-gcc` and the 1b6370a binary equally (stress run: 3 of 6 stalled for each
+binary). Affected runs were killed by a timeout and repeated; all numbers above are from completed runs.
+It looks like a pre-existing engine or protocol race; it is worth its own TODO if it matters. The
+kernel OOM killer also fired once while five ASan engines ran together with other jobs; all five ASan
+sequences still completed with exit 0.
+
+### Not done / limits
+
+- Section 8 and the cycles workload are single-position pairs at 1T, so the worst-case ratio at large
+  budgets (TT slice capped) stays derived, not measured.
+- The 8T budget run is one non-deterministic sample (run clean only).
+- TSan engine runs use the VCF TT suppression from PERF-03.
