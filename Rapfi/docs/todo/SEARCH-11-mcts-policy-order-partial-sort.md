@@ -1,7 +1,9 @@
 # SEARCH-11 — MCTS edges not fully sorted by policy (partial sort keeps score < 0 unsorted)
 
-**Status:** open (recorded 2026-11-09, user). Found during VCN-03 slice 3. Not yet measured on the real
-network.
+**Status:** closed 2026-11-09 (user), measured negligible, no code change. Recorded 2026-11-09, user. Found during
+VCN-03 slice 3. Step 1 on the real network: 1.23 % of expansions not in descending policy order, but
+only 0.012 % of cuts keep a worse prefix (mean misplaced mass 0.0009); see "Step 1 result". Possible
+future option: a build-assert check of the order, or a full sort if its NPS cost is under 0.5 %.
 
 **Class:** B (MCTS search behaviour: edge order, edge cut).
 
@@ -51,6 +53,22 @@ network.
     SEARCH-05 stage-1 settings, peak RSS.
 - VCN-03 slice 3 already re-sorts the whole list when a PASS is generated. Once this is fixed, that
   re-sort may become redundant. Keep it until then.
+
+## Step 1 result (2026-11-09, temporary counter, not committed)
+
+- Counter in `Node::createEdgesFrom` (all non-root expansions): checks that `policyList` is
+  non-increasing, and compares the policy mass of the kept prefix with the ideal top-k mass for the
+  same k chosen by `selectEdgeCount`. (Root goes through `createEdges`; not counted.)
+- Set: 122 positions (every 50th line of `build/search09/positions.txt`), real network
+  `model260809.bin`, `cfg_on` (`mcts_edge_policy_mass = 0.99`), 100K nodes, 1 thread each.
+- Result: 788,380 expansions with more than one move; **9,731 (1.23 %) not in descending policy
+  order**. Of 595,612 expansions where the 0.99 cut dropped moves, **70 (0.012 %) kept a prefix
+  with less mass than the ideal top-k**, average misplaced mass **0.0009**.
+- Reading: the misordering is real but sits in the low-policy tail (score < 0 moves), so the cut
+  loses almost nothing. The effect on the first-unexplored-is-best rule was not measured separately;
+  it involves the same low-prior moves.
+- Recommendation (open for the user): low value. Either close as measured-negligible, or fix only
+  for correctness (full stable sort on the normalised-policy path) if the change is wanted.
 
 ## Function → test-case list (write before code)
 
