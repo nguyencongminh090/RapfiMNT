@@ -6,6 +6,7 @@ a matching `instruction.md` line when execution guidance exists. See
 
 ## Active
 
+- [CMD-02 — Swap2 "put two" nested search runs outside `thinking` and `protocolMutex`](docs/todo/CMD-02-swap2-puttwo-nested-search.md) — the second (BALANCE_TWO) search started from inside think's callback is not covered by `thinking` or the lock; its callback prints without the lock. Class C provisional. Found in CMD-01 (static reading).
 - [CMD-01 — Engine stalls without sending a best move under a pipe harness](docs/todo/CMD-01-engine-stall-no-bestmove.md) — engine goes idle on stdin with no move printed, on base and new binaries alike (3 of 6 per binary under load). Class C provisional. Found in PERF-04 verification.
 
 ## Done

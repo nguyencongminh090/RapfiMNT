@@ -6,6 +6,7 @@ to a detail file under `docs/instruction/`. Read the matching entry here before 
 
 ## Active
 
+- [CMD-02 — Swap2 "put two" nested search runs outside `thinking` and `protocolMutex`](docs/instruction/CMD-02-swap2-puttwo-nested-search.md) — deterministic test first, keep the CMD-01 flag-before-print invariant
 - [CMD-01 — Engine stalls without sending a best move under a pipe harness](docs/instruction/CMD-01-engine-stall-no-bestmove.md) — reproduce with backtraces first, rule out the harness, fix the ordering (no sleeps or retries)
 
 ## Done
