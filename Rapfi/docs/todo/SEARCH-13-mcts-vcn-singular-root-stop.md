@@ -1,7 +1,7 @@
 # SEARCH-13 — MCTS singular-root stop blocks VCN proofs at a forced root
 
-**Status:** partly done 2026-11-09 (code and tests landed, uncommitted; the expected P4 VC3/VC2 proofs did NOT
-appear, see Results). Recorded 2026-11-09 by the user. Found in VCN-03 slice 5 (§9 "Slice 5", finding).
+**Status:** done 2026-11-09 (closed after SEARCH-15; originally partly done) (code and tests landed; the expected P4 VC3/VC2 proofs did not
+appear in Part C because of its 32 MB graph limit, see Results and SEARCH-15). Recorded 2026-11-09 by the user. Found in VCN-03 slice 5 (§9 "Slice 5", finding).
 
 **Class:** B (MCTS search behaviour, VCN mode only).
 
@@ -93,3 +93,8 @@ mate of depth 8 / VC2 `+M13` through the pass-edge prior and the `Node` bounds, 
 edge cut). Needs its own todo before this item can be called Done. Possible follow-ups, not done:
 AB's rule also has `!isAnalysisMode() && !inPonder && !rmp.enabled()` and
 `markPonderingAvailable()`; MCTS has neither; MCTS could stop on a proven root.
+
+**Update 2026-11-09 (SEARCH-15).** The open question above is answered: the Part C runs had a 32 MB MCTS graph budget (`default_tt_size_kb`,
+no `INFO MAX_MEMORY`); the graph closed after about 2.3M visits (VC3) / under 0.3M (VC2) and a closed graph cannot finish a proof. With
+64 MB (VC3, `-M8`) or 384 MB (VC2, `+M17`) at 10M visits both are proven with the defaults. See
+[SEARCH-15](SEARCH-15-mcts-vcn-forced-root-unproven.md).

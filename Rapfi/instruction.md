@@ -6,10 +6,11 @@ to a detail file under `docs/instruction/`. Read the matching entry here before 
 
 ## Active
 
-- [SEARCH-13 — MCTS singular-root stop blocks VCN proofs at a forced root](docs/instruction/SEARCH-13-mcts-vcn-singular-root-stop.md)
 
 ## Done
 
+- [SEARCH-13 — MCTS singular-root stop blocks VCN proofs at a forced root](docs/instruction/SEARCH-13-mcts-vcn-singular-root-stop.md) — done 2026-11-09 (see todo results, SEARCH-15)
+- [SEARCH-15 — MCTS does not prove P4 VC3 / VC2 at a forced root](docs/instruction/SEARCH-15-mcts-vcn-forced-root-unproven.md) — done 2026-11-09 (see todo findings)
 - [SEARCH-14 — MCTS prints no result line in BRIEF message mode](docs/instruction/SEARCH-14-mcts-brief-mode-result-line.md) — done 2026-11-09 (see todo results)
 - [SEARCH-12 — MCTS root with a five or flex four aborts in assert builds](docs/instruction/SEARCH-12-mcts-forced-root-policy-assert.md) — done 2026-11-09 (see todo results)
 - [VCN-03 — VCN search mode under the MCTS searcher](docs/instruction/VCN-03-mcts-vcn.md) — slices 2–5 done 2026-11-09; slice 5: guard removed, PASS in PV like AB, Part C zero wrong answers (AB 27/27 proven, MCTS 23/27), default pass prior kept
