@@ -10,6 +10,8 @@ to a detail file under `docs/instruction/`. Read the matching entry here before 
 
 ## Done
 
+- [SEARCH-10 — MCTS: add the cut moves back when every kept reply is lost](docs/instruction/SEARCH-10-mcts-readd-cut-moves.md) — done 2026-11-09 (see todo results)
+- [SEARCH-09 — MCTS mate bound unsound under the policy-mass edge cut](docs/instruction/SEARCH-09-mcts-bound-under-edge-cut.md) — done 2026-11-09 (see todo results)
 - [SEARCH-08 — MCTS 64-bit visit counters without growing `Edge`](docs/instruction/SEARCH-08-mcts-64bit-visits.md) — done 2026-11-08 (see todo results)
 - [PERF-02 — Branch misses in the short-list (insertion) branch of `fastPartialSort`](docs/instruction/PERF-02-insertion-branch-sort.md)
 - [PERF-01 — Branch-miss reduction in move-list ordering](docs/instruction/PERF-01-movepick-branch-miss.md)

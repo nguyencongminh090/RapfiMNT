@@ -1,7 +1,14 @@
 # VCN-03 — VCN search mode under the MCTS searcher (research report)
 
 **Status:** option B chosen (2026-11-08, user). Slice 0 (guard) done 2026-11-08, see §9; slices
-1–5 not started. Depends on [SEARCH-09](SEARCH-09-mcts-bound-under-edge-cut.md). Decisions in §8.
+1–5 not started. Depended on [SEARCH-09](SEARCH-09-mcts-bound-under-edge-cut.md), done 2026-11-09
+(option (a); `EdgeArray::numMoves` / `edgesCut()` available), and on
+[SEARCH-10](SEARCH-10-mcts-readd-cut-moves.md), done 2026-11-09 (option (b)): when every kept reply of
+a cut node is proven lost, the node's edge array is replaced by the full move list, so the edge cut
+no longer blocks a proof ("every defender reply loses" is provable again). Caveat: once the graph is
+closed (SEARCH-03 memory budget reached) no widening happens, and such a node stays unprovable (sound,
+not complete). The cut no longer blocks a proof except in a closed graph. VCN mode keeps the cut
+(decision 4, §8). Decisions in §8.
 
 **Class (if implemented):** B (search behaviour) + C (command surface). The MCTS node key change
 (§3.1) follows the same reasoning as the AB TT key in [VCN](VCN-search-mode.md): a VCN-only XOR,
@@ -248,6 +255,9 @@ so also an MCTS fixed-node golden output with VCN off); AB vs MCTS on the VCN-02
    `evaluateNode_vcnBoardFull_returnsDrawLikeAb`; the §3.3 table row reads "draw, as AB".
    Note: VC5 "attacker without five loses" is checked **before** the draw, as in AB
    (`search/ab/search.cpp:1285`).
+4. VCN mode does **not** turn off the policy-mass edge cut (user, 2026-11-09). SEARCH-10 restores
+   provability; the closed-graph caveat is accepted. The TSan reports seen during SEARCH-10 are all in
+   the lockless VCF TT (`search/hashtable.cpp`), pre-existing, and left as is for now (user).
 
 ## 9. Progress
 
