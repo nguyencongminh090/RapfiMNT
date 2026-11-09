@@ -7,6 +7,7 @@ a matching `instruction.md` line when execution guidance exists. See
 ## Active
 
 - [SEARCH-13 — MCTS singular-root stop blocks VCN proofs at a forced root](docs/todo/SEARCH-13-mcts-vcn-singular-root-stop.md) — stop after 100 nodes when the root has one move; AB is exempt in VCN (VCN-02 item 4). Found in VCN-03 slice 5. Class B, low priority. Partly done 2026-11-09: stop exempted under VCN (205/205 tests, bench and golden identical), but P4 VC3/VC2 still unproven in Part C; see the todo's Results.
+- [SEARCH-15 — MCTS does not prove P4 VC3 / VC2 at a forced root](docs/todo/SEARCH-15-mcts-vcn-forced-root-unproven.md) — still unproven after SEARCH-13 removed the early stop; find the cause (pass-edge prior, bound propagation, edge cut). Class B, low priority.
 - [SEARCH-11 — MCTS edges not fully sorted by policy](docs/todo/SEARCH-11-mcts-policy-order-partial-sort.md) — `fastPartialSort(limit 0, PolicyComparator)` leaves score < 0 moves unsorted, breaking the cut and the first-unexplored-is-best assumption. Found in VCN-03 slice 3; measure on the real network first. Class B.
 - [SEARCH-04 — MCTS progressive widening](docs/todo/SEARCH-04-mcts-progressive-widening.md) — add edges as visits grow; needs safe reclamation of the replaced edge array. Class B.
 - [PERF-03 — MCTS node table footprint](docs/todo/PERF-03-mcts-node-table-footprint.md) — measure real bytes per node; replace `std::set` shards. Class B/C.
