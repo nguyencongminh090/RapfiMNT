@@ -135,8 +135,12 @@ void think(Board                             &board,
         std::lock_guard<std::mutex> lock(protocolMutex);
 #endif
 
-        sendActionAndUpdateBoard(Search::Engine.ctx.resultAction, Search::Engine.ctx.bestMove);
+        // Clear `thinking` before the result is printed. A client may answer
+        // the move at once (e.g. with the next BOARD); the protocol thread
+        // must then see the flag false and wait on protocolMutex, not drop
+        // that command as "received while thinking" (CMD-01).
         thinking = false;
+        sendActionAndUpdateBoard(Search::Engine.ctx.resultAction, Search::Engine.ctx.bestMove);
 
         // Subtract used match time
         Time usedTime = now() - startTime;
