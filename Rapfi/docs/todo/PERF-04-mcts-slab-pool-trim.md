@@ -1,6 +1,6 @@
 # PERF-04 — MCTS retained slab pool after recycle
 
-**Status:** phase 2 in progress (phase 1 done 2026-11-09). User choice 2026-11-09: (a). Found in the PERF-03 phase 2 review.
+**Status:** phase 2: core done, verification runs pending (phase 1 done 2026-11-09). User choice 2026-11-09: (a). Found in the PERF-03 phase 2 review.
 **Class:** B (changes memory behaviour on budget-limited runs; search output on unbounded runs must
 stay byte-identical).
 
@@ -347,3 +347,70 @@ reverted and not committed. Record: `build/perf04/phase2/tests_failing_first.txt
 | `recycleOldNodes_afterMoveForward_noShardKeepsSlabWithoutLiveNode` | **fails**: `noShardHasMoreSlabsThanNodes` |
 | `recycleOldNodes_budgetRunAfterSlabRelease_graphClosedFollowsLiveFootprint` | **fails** on `slabBound`. Its earlier asserts pass: graph closed after search 1, `graphMemoryUsed == live footprint`, `graphClosed()` matches, so the setup is valid |
 | `eraseNodesIf_slabPartlyLive_slabKept`, `..._survivorsKeepAddresses`, `..._nextInsertsStartNewSlabAndKeepSurvivors`, `..._bumpSlabPartlyLive_keptAndBumpContinues`, `eraseNodesIf_partlyFreedSlabsThenInsert_...` | pass (guards, as labelled) |
+
+### Core change (2026-11-09, commits 281719c `test:`, 428956b `perf:`)
+
+Everything is in `search/mcts/nodetable.h`, plus one assert in `search.cpp`.
+
+- **Where:** `rebuildAfterErase` first calls `releaseEmptySlabs`. It runs only when
+  `eraseNodesIf` erased something, under the shard's unique lock. `releaseAll` shares the
+  slab-freeing helper `releaseAllSlabs`. The public API is unchanged.
+- **Node → slab:** the shard's slab pointers are sorted (`std::less`), and each survivor is
+  binary-searched (`upper_bound − 1`, with an assert that it lies in that slab's storage). Slab size
+  (1800 B) and alignment are unchanged.
+- **Fast paths:**
+  - A shard with no live node frees all its slabs and resets the pool.
+  - If `numFree + bump unused < 32`, no slab can be empty, and the mapping is skipped.
+  - In release builds, nothing more is done when no slab is empty.
+- **Free list:** walked once; entries in empty slabs are unlinked in place, so the kept entries keep
+  their LIFO order. When no slab is freed, the pool is unchanged.
+  - Debug builds also check, for every slab, that live + free equals the slots handed out (32, or
+    `slabUsed` for the head).
+- **Bump slab:** freed like any other slab when it holds no live node. If the head was freed,
+  `slabUsed = SlabNodes`, so the next allocation takes the free list and then a new slab. A kept
+  head keeps its `slabUsed`.
+- **Invariant:** every slab holds at least one live node at all times. A new slab is created only by
+  an allocation that puts a node in it, and nodes leave only through `eraseNodesIf`. So the
+  table heap ≤ slot arrays + one slab per live node, i.e. `H ≤ G + C0 + 31·56 B · N_s`, stated in
+  the `NodeTable` class comment. No stronger bound is claimed.
+- **No reserve or threshold** (decision note above). Churn is left to the verification
+  measurements.
+- **ASan test aid:**
+  - `freeNodeStorage` poisons bytes 8..55 of dead storage; the first 8 hold the free-list link.
+  - `allocateNodeStorage` unpoisons it on reuse.
+  - Slabs are unpoisoned before `delete`.
+  - Active under gcc `__SANITIZE_ADDRESS__` or clang `__has_feature(address_sanitizer)`. Both
+    binaries of the ASan build link `__asan_poison_memory_region`.
+- **`recycleOldNodes`** asserts `retiredEdgeArrays.count() == 0` on entry (audit item 3).
+- **Not touched:** `graphMemoryUsed`, `nodeFootprint()`, Node/Edge layout, the edge-array path,
+  the slot-array design, search defaults.
+
+### Core verification (run by the implementer, 2026-11-09)
+
+Data under `build/perf04/phase2/`.
+
+| Check | Result | Command / file |
+|---|---|---|
+| Unit tests, asserts live | **238/238 pass**; `--check-asserts-live` aborts as it should | `build/` (gcc 15.2.0 Release, `-UNDEBUG` on `rapfi_tests`): `ninja rapfi_tests && ./rapfi_tests` → `tests_after_impl.txt` |
+| New tests failed first | 6 red tests fail before the change, 5 guards pass | `tests_failing_first.txt` (table above) |
+| Bench | **Nodes 17621937, Hash 8c1f72e5** | separate gcc 15.2.0 Release build `rel/` (`cmake -S Rapfi -B build/perf04/phase2/rel -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DNO_COMMAND_MODULES=ON -DBUILD_TESTS=OFF`, AVX512+VNNI on), `echo BENCH \| rel/pbrain-rapfi` → `bench_rel.txt` |
+| Golden (2M nodes, 1T, SHOW_DETAIL 2, cfg_golden, unbounded) | **byte-identical** to `build/perf03/golden_gcc_1.extract` (11103 lines, md5 f3e620af…); peak RSS 173468 KB | `python3 build/search08/run_fixed.py build/perf04/phase2/rel/pbrain-rapfi … nodes=2000000 threads=1 detail=2 cfg=cfg_golden` + `golden_extract.sh` → `golden_rel_1.{txt,extract}` |
+| ASan + UBSan (`-fno-sanitize=enum`) on the suite | **238/238 pass, stderr empty** (no ASan or UBSan report), with poisoning active | `build_asan.sh` (pattern of `build/perf03/phase2/build_san.sh`) → `asan/`; `asan_tests.{txt,stderr}` |
+
+The golden run is a single search, so it does not exercise a recycle. Recycle byte-identity is
+the A/B sequence below.
+
+### Pending (verification agent, scripted)
+
+- TSan on the thread tests (`build/perf03/phase2/nt_loop.cpp`, `tsan.supp`).
+- ASan on the real game sequence with recycles and `YXHASHCLEAR`: engine binary
+  `build/perf04/phase2/asan/pbrain-rapfi`.
+- PERF-03 A/B recycle sequence byte-identical, unbounded and budget-limited (explicit MAX_MEMORY).
+  - New binary: `build/perf04/phase2/rel/pbrain-rapfi`.
+  - Baseline: `build/perf04/base_build/pbrain-rapfi`. It was built at 2b1bfa0; the engine
+    sources are identical at 1b6370a (`git diff 2b1bfa0 1b6370a` touches only `.md`). The PERF-03
+    `pbrain-B-gcc` is the same source line.
+  - Any diff brings back the self-play of hard rule 9.
+- Gap curve after the change (13-move game, L1, L2, §8 worst case), peak RSS, budget closure at
+  40 / 90 / 200 MB (counts must equal phase 1), cycles per visit A/B (PGO, interleaved, power
+  state recorded), recycle time vs churn, PGO release rebuild.

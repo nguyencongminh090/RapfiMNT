@@ -6,7 +6,7 @@ a matching `instruction.md` line when execution guidance exists. See
 
 ## Active
 
-- [PERF-04 — MCTS retained slab pool after recycle](docs/todo/PERF-04-mcts-slab-pool-trim.md) — PERF-03 keeps freed node slabs until `clear`, so real heap can exceed the graph budget after recycle; trim empty slabs or account the free list. Class B. Found in PERF-03 review. Phase 1 done 2026-11-09 (recommend (a) free empty slabs; constructed worst case 1.008 x graph limit). User chose (a) 2026-11-09; phase 2 in progress.
+- [PERF-04 — MCTS retained slab pool after recycle](docs/todo/PERF-04-mcts-slab-pool-trim.md) — PERF-03 keeps freed node slabs until `clear`, so real heap can exceed the graph budget after recycle; trim empty slabs or account the free list. Class B. Found in PERF-03 review. Phase 1 done 2026-11-09 (recommend (a) free empty slabs; constructed worst case 1.008 x graph limit). User chose (a) 2026-11-09; phase 2 core done (428956b: empty slabs freed after recycle; 238/238 tests, ASan clean, bench and golden unchanged), verification runs pending.
 
 ## Done
 
