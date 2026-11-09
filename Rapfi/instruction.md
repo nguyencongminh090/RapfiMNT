@@ -6,6 +6,7 @@ to a detail file under `docs/instruction/`. Read the matching entry here before 
 
 ## Active
 
+- [PERF-03 — MCTS node table footprint](docs/instruction/PERF-03-mcts-node-table-footprint.md) — phase 1 measure real bytes/node + lock cost, report candidates, stop for user choice; phase 2 implement with pointer stability, golden-identical
 
 ## Done
 
