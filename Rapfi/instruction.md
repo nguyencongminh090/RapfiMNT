@@ -6,6 +6,7 @@ to a detail file under `docs/instruction/`. Read the matching entry here before 
 
 ## Active
 
+- [PERF-04 — MCTS retained slab pool after recycle](docs/instruction/PERF-04-mcts-slab-pool-trim.md) — phase 1 measure what each candidate reclaims (free empty slabs / honest accounting / hybrid), stop for user choice; phase 2 implement, stale-pointer audit, golden-identical
 
 ## Done
 
