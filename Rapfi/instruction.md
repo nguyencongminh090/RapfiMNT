@@ -6,10 +6,10 @@ to a detail file under `docs/instruction/`. Read the matching entry here before 
 
 ## Active
 
-- [SEARCH-12 — MCTS root with a five or flex four aborts in assert builds](docs/instruction/SEARCH-12-mcts-forced-root-policy-assert.md) — set `hasPolicy` in the ROOT picker's one-hot branches; tests first
 
 ## Done
 
+- [SEARCH-12 — MCTS root with a five or flex four aborts in assert builds](docs/instruction/SEARCH-12-mcts-forced-root-policy-assert.md) — done 2026-11-09 (see todo results)
 - [VCN-03 — VCN search mode under the MCTS searcher](docs/instruction/VCN-03-mcts-vcn.md) — slices 2–5 done 2026-11-09; slice 5: guard removed, PASS in PV like AB, Part C zero wrong answers (AB 27/27 proven, MCTS 23/27), default pass prior kept
 - [SEARCH-10 — MCTS: add the cut moves back when every kept reply is lost](docs/instruction/SEARCH-10-mcts-readd-cut-moves.md) — done 2026-11-09 (see todo results)
 - [SEARCH-09 — MCTS mate bound unsound under the policy-mass edge cut](docs/instruction/SEARCH-09-mcts-bound-under-edge-cut.md) — done 2026-11-09 (see todo results)
