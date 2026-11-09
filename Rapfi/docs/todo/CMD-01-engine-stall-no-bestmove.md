@@ -158,7 +158,8 @@ gcc 15.2 AVX512/VNNI; `fixed/pbrain-fixed` same config with the fix; `stress.py`
 **Failing test first.** On HEAD source (fix not applied): `test_runProtocol_commandWhileThinking_isDropped`
 passes (existing contract); `test_think_moveFlushedToClient_thinkingAlreadyCleared` aborts at
 `assert(!sink.thinkingAtFirstMove())` (`build/cmd01/test_head_failfirst.log`);
-`test_runProtocol_boardSentRightAfterMove_isProcessed` (run alone, order swapped temporarily)
+`test_runProtocol_boardSentRightAfterMove_isProcessed` (rerun with the `RUN_TEST` of the first
+failing test temporarily disabled)
 aborts at `assert(l.find("Unknown command") == npos)`, i.e. the reply `BOARD` was dropped and its
 position lines became unknown commands (`test_head_failfirst_t2.log`). With the fix: all three
 pass; full suite **241/241** (`test_fixed.log`); `rapfi_tests --check-asserts-live` aborts on the
@@ -184,12 +185,21 @@ restart); the base binary stalls within the first few boards of nearly every eng
 2 engines per config (AB/MCTS x 1T/8T, 8 at once) plus 2 CPU hogs, 90 s, per-board timeout 60 s,
 PL1 24 W: 0 stalls (361 boards). No report touches `command/gomocup.cpp`, `thinking`,
 `protocolMutex` or the callback. 1T engines: 0 reports. 8T engines: reports only in the
-shared transposition table (`search/hashtable.cpp` `probe`/`store`/`TTEntry::key`, the racy
-lock-free TT by design, outside this change); every reported access frame `#0` is in
-`hashtable.cpp`.
+shared transposition table (`search/hashtable.cpp` `probe`/`store`/`TTEntry::key`); every
+reported access frame `#0` is in `hashtable.cpp`. These are pre-existing and not introduced here
+(the fix does not touch `hashtable.cpp`); PERF-03/PERF-04 TSan runs suppress exactly these with
+`build/perf04/phase2/verify/tsan.supp` (`race:Search::HashTable::`, `race:Search::TTEntry::`).
+This run used no suppressions. TSan cannot see the CMD-01 race itself (the flag is atomic; the
+bug is an ordering bug), so the deterministic test and the stress counts are the evidence; TSan
+only shows the fix adds no data race. Coverage was small (361 boards).
 
 **Bench** (`build/cmd01/rel`, gcc 15.2 Release AVX512/VNNI, fixed source, built-in config):
 Nodes `17621937`, Hash `8c1f72e5`, unchanged.
+
+**Behaviour change (intended):** a command that arrives after the move is printed but while the
+callback is still running (board update, time accounting, ponder startup) is now processed once
+the callback releases `protocolMutex`, instead of being dropped. Commands read before the result
+is published are still dropped as before.
 
 **Not done (reduced scope):** no multi-hour stress and no gdb backtraces of stalled processes
 (replaced by the deterministic test and the stall fingerprint, see the deviation above). No
