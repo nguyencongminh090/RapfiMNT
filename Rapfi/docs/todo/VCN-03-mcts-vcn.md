@@ -1,9 +1,11 @@
 # VCN-03 — VCN search mode under the MCTS searcher (research report)
 
-**Status:** option B chosen (2026-11-08, user). Slice 0 (guard) done 2026-11-08; slice 1 is
+**Status:** **done 2026-11-09.** Option B chosen (2026-11-08, user). Slice 0 (guard) done 2026-11-08; slice 1 is
 SEARCH-09/10 (done 2026-11-09); slice 2 (node key and root identity) done 2026-11-09; slice 3
 (defender pass edge and its prior) done 2026-11-09; slice 4 (VC4/VC5 terminals; AB primitives
-reused instead of factoring AB, a deviation from §8.1) done 2026-11-09, see §9; slice 5 not started. The protocol guard stays until slice 5. Depended on [SEARCH-09](SEARCH-09-mcts-bound-under-edge-cut.md), done 2026-11-09
+reused instead of factoring AB, a deviation from §8.1) done 2026-11-09; slice 5 (guard removed,
+PV/PASS output, end-to-end measurement on the real network: zero wrong answers) done 2026-11-09,
+see §9. Measured answer to "is MCTS-VCN worth it vs AB": no, see §6. Depended on [SEARCH-09](SEARCH-09-mcts-bound-under-edge-cut.md), done 2026-11-09
 (option (a); `EdgeArray::numMoves` / `edgesCut()` available), and on
 [SEARCH-10](SEARCH-10-mcts-readd-cut-moves.md), done 2026-11-09 (option (b)): when every kept reply of
 a cut node is proven lost, the node's edge array is replaced by the full move list, so the edge cut
@@ -174,6 +176,10 @@ much faster to a proof. MCTS could be better at deep VC2 positions where AB's ho
 limit (VCN: "VC2 is depth-limited ... no proof"), because its estimate improves with time — this
 is the only case where MCTS-VCN has a clear reason to exist, and it is unmeasured.
 
+**Measured (slice 5, 2026-11-09, real network, §9).** The deep-VC2 case does not favour MCTS on
+this set: AB proves P3 and P5 at VC2 (`-M10`) in about 0.4–1.3 s, MCTS proves neither, even at 30 s
+with 8 threads. Where both prove (23 of 27 cells), both do it within the first 100 ms.
+
 ### 4.3 Silent wrong answer today
 
 With `searcher = mcts`, `YXVCN` / `INFO VCTHREAD` silently run ordinary MCTS. This is a surface
@@ -198,6 +204,15 @@ bug regardless of what is chosen below.
    a measurement shows MCTS finding VC2 wins AB misses at the same time budget — that measurement
    can be done cheaply with an AB-vs-"MCTS ordinary search on the post-pass position" comparison
    before any MCTS-VCN code exists.
+
+**Measured answer (slice 5, 2026-11-09): MCTS-VCN is not worth it over AB on the measured set.**
+On the 9 positions × 3 levels at 5 s and 30 s, 1 and 8 threads (§9 slice 5), AB proves 27/27 cells
+at every budget, MCTS 23/27, and MCTS proves nothing AB does not. MCTS misses the two deep VC2
+losses (P3, P5; AB about 0.4–1.3 s) and both non-VC4 levels of P4 (a forced root, where MCTS's
+singular-root stop ends the search after about 100 visits). On the acceptance position `h8j9f6i10`
+(Standard, `YXVCN 2`) AB plays G5 from 30 s on (8 threads, 60 s: `587`, G5), MCTS never does (G7
+or H7). MCTS-VCN is sound (zero wrong answers in all runs) and stays available, but for VCN
+queries alpha-beta is the searcher to use. No case was found where MCTS proves a cell AB does not.
 
 ## 7. Draft slices and test list (if B or C is chosen)
 
@@ -277,9 +292,8 @@ so also an MCTS fixed-node golden output with VCN off); AB vs MCTS on the VCN-02
   not fire under AB), `infoSearchType_mctsWithVcnLevelSet_warns`. `rapfi_tests` 140/140 pass.
 - Bench (gcc 15.2.0, Release, AVX512+VNNI, built-in config): Nodes `17621937`, Hash `8c1f72e5`,
   unchanged (protocol-only change).
-- Known gap: a config reload (`reloadConfigEachMove`) or a config file that selects MCTS does
-  not go through the `SEARCH_TYPE` handler, so it does not warn; the search is still ordinary
-  MCTS, as before this slice.
+- (The slice-0 "known gap" about a config reload or a config file selecting MCTS without a warning
+  was removed in slice 5: VCN now runs under MCTS, so there is nothing to warn about.)
 
 ### Slice 2 — node key and root identity, done 2026-11-09 (class B, bit-identical with VCN off)
 
@@ -591,3 +605,207 @@ Instruction: [`../instruction/VCN-03-mcts-vcn.md`](../instruction/VCN-03-mcts-vc
   bit-identical, and VCN on is not reachable from the protocol.
 - Not in this slice: the protocol guard and PV printing of PASS (slice 5), measuring the pass
   prior (slice 5), and the TSan races in the lockless TT (§8.4).
+
+### Slice 5 — enable under MCTS, output, end-to-end measurement, done 2026-11-09 (class C + measurement)
+
+Instruction: [`../instruction/VCN-03-mcts-vcn.md`](../instruction/VCN-03-mcts-vcn.md) "Slice 5".
+Artifacts: `build/vcn03s5/` (baselines, fail-first, tests, golden) and `build/vcn03s5/partc/`
+(harness `run_vcn.py`, `positions.py`, `matrix.sh`, `mt.sh`; `results.tsv`, `mt_results.tsv`,
+`vc4_cost.txt`, `nps_pairs.tsv`, `ab_confirm.tsv`, per-run logs in `logs/`).
+
+**Part A (enable).** `command/gomocup.cpp`: `searcherSupportsVcn()`, `VcnUnsupportedMessage`, the
+two warning sites (`INFO VCTHREAD`, `INFO SEARCH_TYPE`), the `YXVCN` refusal and the
+`search/ab/searcher.h` include (only used by the helper) are removed. `think()` already sets
+`vcnMode.attacker`, so a persistent `INFO VCTHREAD` level under MCTS now runs MCTS-VCN on `TURN`,
+as under AB. Nothing else changed in the engine.
+
+- **Root reuse after `YXVCN`: kept as is** (default of the instruction). Cost: a `YXVCN` on the
+  same moves as the previous ordinary search rebuilds the root and recycles from the VCN root, so
+  the ordinary graph of that position is erased; the next ordinary search starts that position
+  from scratch. Not measured (no measurement asked for it, and a `YXVCN` is a one-shot query).
+  Skipping `recycleOldNodes` when only the root key changed stays the cheap alternative if it
+  ever matters.
+
+**Part B (output).** No code change needed. `extractPVOfChildNode` can yield `Pos::PASS`; every
+printer goes through `MovesText` / `CoordText` (`core/iohelper.cpp`), which print a pass as `Pass`
+(move text) or the pass coordinate (raw coords), exactly as AB's VCN PV. `pv[0]` (the only PV
+entry used for a board move: `ctx.bestMove`, `Move2`, root-move matching) is a root move and the
+ROOT picker never yields PASS. Mate scores come from `updateRootMovesData` (`+M`/`-M`); a
+non-proven line prints a win-rate value (both seen in `logs/`, for example `P3-quiet` VC3 `-M4`
+vs VC2 `-215`).
+
+- Finding (pre-existing, not changed): in the built-in `BRIEF` message mode MCTS prints no
+  result line at all (`printSearchEnds` is called by AB only, `printRootMoves` prints in
+  `NORMAL`/`UCILIKE` only); AB prints `Speed … Eval … | Bestline`. A GUI gets `NORMAL`
+  (`setGUIMode`), and configs use `ucilike`, so only a bare `BRIEF` session is affected. Changing
+  it would change VCN-off output, so it is left alone.
+
+**Tests** (asserts live; red before the code). `tests/vcn_tests.cpp`: the slice-0 tests
+`yxvcn_mctsSearcher_errorsAndDoesNotSearchAsVcn`, `infoVcthread_mctsSearcher_warns`,
+`infoVcthread_alphabetaSearcher_noMctsWarning`, `infoSearchType_mctsWithVcnLevelSet_warns` are
+replaced by `infoVcthread_mctsSearcher_noWarning`, `infoVcthread_alphabetaSearcher_noWarning`,
+`infoSearchType_mctsWithVcnLevelSet_noWarningAndKeepsLevel`. `tests/mcts_vcn_tests.cpp` (YXVCN
+through the protocol under MCTS needs an evaluator, which that file's fixture provides; one thread,
+stand-in evaluator, 20K nodes): `yxvcn_mctsSearcher_runsVcnSearchAndRestoresLevel` (VC4 query on
+a VC2 persistent level: no error, VCN-keyed root, VC4 loss, level restored),
+`mctsVcn_vc2Vc3Vc4_farVcfAttacker_mates`, `mctsVcn_doubleThreeAfterForcedPair_vc3WinsVc4Loses`,
+`yxvcn_mctsSearcher_vc4FarVcf_printsMateAndBestmoveNotPass` (prints `+M`, `pv[0]`, `ctx.bestMove`
+and the move played on the protocol board are not PASS, no pass coordinate sent),
+`mctsVcn_vc4_attackerWithoutVcf_loses`, `mctsVcn_vc3_attackerWithoutThreat_defenderPassRefutes`
+(the PV's second move is PASS), `extractPV_mctsVcnPassInLine_printsPassLikeAb` (AB's and MCTS's PV
+both contain PASS; MCTS's root-move line contains the `MovesText` of its PV, with `Pass`; every PV
+entry is PASS or an on-board cell).
+
+- **Deviation (instruction test names).** The instruction's `yxvcn_mctsSearcher_vc4OpenThree_…`
+  and the §7 `mctsVcn_vc2/vc3/vc4_openThreeAttacker_mates` cannot run in an assert build: the
+  open-three root has a flex-four move, so the ROOT picker takes its one-hot own-flex-four branch
+  and `Node::createEdges` asserts (SEARCH-12). They are replaced by the far-VCF and double-three
+  roots after the forced pair (same positions as the slice-4 smoke run). The open three itself is
+  covered by Part C on the release build (P2, all levels `+M3`). Consequence worth noting:
+  **SEARCH-12 is now reachable from an ordinary `YXVCN` query in an assert build** (any root where
+  the attacker can make a flex four). Release is unaffected.
+- The output tests set `MsgMode::NORMAL` for their scope (the built-in default is `BRIEF`, see the
+  finding above).
+- Fail-first (`build/vcn03s5/tests_failing_first.txt`, driver `failfirst.sh`, binary =
+  final tests against HEAD's `command/gomocup.cpp`, with a temporary skip hook in
+  `vcn_tests.cpp` that is not kept): 9 of the 10 new tests fail. 4 abort on the `ERROR` assert;
+  the other 5 end in SIGSEGV, not an assert message: the refused `YXVCN` leaves `rootMoves` empty
+  and the test reads `rootMoves[0]`. `infoVcthread_alphabetaSearcher_noWarning` passes before and
+  after (the guard never fired under AB).
+- Results: `rapfi_tests` 198/198 (192 − 4 + 10), asserts live (`--check-asserts-live` aborts,
+  `build/vcn03s5/asserts_live.txt`).
+
+**Bit-identity.** Bench (gcc 15.2.0, Release, AVX512+VNNI, built-in config): Nodes `17621937`,
+Hash `8c1f72e5`, at HEAD and after (`bench_base_gcc.txt`, `bench_s5_gcc.txt`). MCTS fixed-node
+golden with VCN off (4 Standard positions, 300K nodes, 1 thread, harness from `build/vcn03s4/`):
+after = HEAD `a77d3f4` for `cfg_off` and `cfg_on`, 8/8 (`golden_diff.txt`); the HEAD baseline also
+equals the slice-4 golden 8/8.
+
+**Part C — end-to-end measurement.** Release PGO build (`scripts/pgo_build.sh
+x64-clang-AVX512VNNI`, built from the slice-5 sources), real network (the user's Yixin config:
+`mix9svq` NNUE for AB, `model260809.bin` for MCTS, `coord_conversion_mode = none`, plus
+`time_to_print_mcts_rootmoves = 100` so the MCTS time to proof has 100 ms resolution). One process
+per run, `INFO SEARCH_TYPE` selects the searcher, `TIMEOUT_TURN` is the budget, all runs
+sequential.
+
+Position set (`partc/positions.py`): `tests/vcn_measure.sh` P1–P8, P9 = the `vcn_tests.cpp`
+position `vcnSearch_vc3_forcedRootMoveWithTimeLimit_winFound` (the other `vcn_tests.cpp` e2e
+positions are P1, P2, P3, P7), at `YXVCN 4/3/2`, and `h8j9f6i10` (Standard, `YXVCN 2`).
+
+Classification rule (written before reading the results): a cell's reference is the expected
+answer in `vcn_measure.sh` (22 cells; "no attacker win" for P5 VC4/VC3 and P6), else AB's proven
+class over all budgets and thread counts (5 cells: P3 VC2, P4 VC3, P4 VC2, P5 VC2, P9 VC4; AB gave
+the same class in every run). An MCTS `+M` counts as a proof (one proven-winning child is a valid
+proof). An MCTS `-M` is the best root move's proven loss; it is counted as a loss claim. **Wrong** =
+a claim whose class differs from the reference. A claim on a cell AB never proved would be
+"unconfirmed" until a longer AB run proves it; none occurred. A non-proven value is never wrong.
+
+Proven / correct / wrong per searcher, budget and thread count (27 cells each):
+
+| Budget | Threads | AB proven / correct / wrong | MCTS proven / correct / wrong |
+|---|---|---|---|
+| 5 s | 1 | 27 / 27 / 0 | 23 / 23 / 0 |
+| 5 s | 8 | 27 / 27 / 0 | 23 / 23 / 0 |
+| 30 s | 1 | 27 / 27 / 0 | 23 / 23 / 0 |
+| 30 s | 8 | 27 / 27 / 0 | 23 / 23 / 0 |
+
+Per cell (the same class in all four budgets; mate distances can differ, e.g. P1 VC4 AB `+M7`,
+MCTS `+M11`):
+
+| Position | VC4 AB / MCTS | VC3 AB / MCTS | VC2 AB / MCTS |
+|---|---|---|---|
+| P1 far VCF after forced block | `+M7` / `+M11` | `+M7` / `+M7` | `+M7` / `+M7` |
+| P2 open three | `+M3` / `+M3` | `+M3` / `+M3` | `+M3` / `+M3` |
+| P3 quiet | `-M2` / `-M2` | `-M4` / `-M4` | `-M10` / not proven (`-215`; 8 threads 30 s: `246`) |
+| P4 counter four, block without four | `-M2` / `-M2` | `-M8` / not proven (`-67`) | `+M13` / not proven (`610`) |
+| P5 defender counter open three | `-M2` / `-M2` | `-M4` / `-M4` | `-M10` / not proven (`-635`) |
+| P6 defender faster VCF | `-M2` / `-M2` | `-M4` / `-M4` | `-M8` / `-M8` |
+| P7 double three after forced block | `-M4` / `-M4` | `+M7` / `+M7` | `+M7` / `+M7` |
+| P8 = P1 in Renju, white attacks | `+M7` / `+M7` | `+M7` / `+M7` | `+M7` / `+M7` |
+| P9 forced root, time limit | `-M2` / `-M2` | `+M9` / `+M9` | `+M9` / `+M9` |
+
+Time to proof (first root line from which the final mate class holds; `results.tsv` column 9):
+AB ≤ 3 ms on every cell except P3 VC2 (904 ms at 1 thread, 484/398 ms at 8 threads), P5 VC2
+(1264/1206 ms; 717/792 ms) and P4 VC2 (60 ms; 77/91 ms). MCTS: every proof is in the first root
+print (≤ 100 ms; forced roots end after about 60–110 ms wall with the result in the final print).
+
+- **Finding: MCTS's singular-root stop blocks VCN proofs at a forced root.** P1, P4, P7, P8, P9
+  have one legal root move (the block of a five). MCTS stops after `num_nodes_after_singular_root`
+  (100) visits (`search.cpp`, `rootMoves.size() == 1`), whatever the budget, so P4 VC3 / VC2 stay
+  unproven (`-67`, `610`) where AB proves `-M8` / `+M13`. AB had the same problem under a time
+  limit and was exempted for VCN in VCN-02 item 4 (`search/ab/search.cpp:462`, `sd.singularRoot && !options.vcnMode.enabled()`; test `vcnSearch_vc3_forcedRootMoveWithTimeLimit_winFound`). §3.5's "singular-root early stop is
+  fine" is therefore wrong for VCN. Not changed (slice 5 may not touch the slice 2–4 rules for a
+  non-wrong answer); a follow-up todo if MCTS-VCN is ever to be used.
+
+Acceptance position `h8j9f6i10` (Standard, `YXVCN 2`; correct move G5 = `6,4`):
+
+| Budget | Threads | AB eval / move | MCTS eval / move |
+|---|---|---|---|
+| 5 s | 1 | `5` / J8 ✗ | `483` / G7 ✗ |
+| 5 s | 8 | `74` / J8 ✗ | `442` / G7 ✗ |
+| 30 s | 1 | `-39` / G5 ✓ | `486` / G7 ✗ |
+| 30 s | 8 | `316` / G5 ✓ | `476` / G7 ✗ |
+| 60 s | 8 | `587` / G5 ✓ | `104` / H7 ✗ |
+
+One run each (8-thread runs are not reproducible). MCTS's high values are its win-rate scale on its
+own (wrong) move, not comparable to AB's eval.
+
+Pass-prior sweep (`mcts_vcn_pass_prior`, MCTS only, 5 s, 1 thread, same 27 cells + acceptance; 0.25
+= the main rows):
+
+| Prior | Proven / correct / wrong | P3 VC2 (AB `-M10`) | P4 VC2 (AB `+M13`) | P5 VC2 (AB `-M10`) | `h8j9f6i10` |
+|---|---|---|---|---|---|
+| 0.1 | 23 / 23 / 0 | `445` (sign ✗) | `555` | `-454` | `42` / I7 |
+| 0.25 | 23 / 23 / 0 | `-215` | `610` | `-635` | `483` / G7 |
+| 0.5 | 23 / 23 / 0 | `-269` | `630` | `-606` | `154` / F5 |
+
+Times to proof are the same (first print) at every prior. **Recommendation: keep 0.25** (default
+unchanged; the user decides). The prior changes no proof on this set. 0.1 is the only value whose
+non-proven estimate has the wrong sign against AB's proof (P3 VC2). 0.25 and 0.5 agree in sign on
+all three non-proven cells, so the data give no reason to move.
+
+VC4 VCF cost and NPS. Temporary counters (`#ifdef VCN03S5_STATS`, steady-clock time inside
+`SimpleVCF::vcf` per mode, plus a widen counter; built only into `build/vcn03s5/{stats-rel,assert,
+asan}`, removed from the source afterwards; `git diff search/` is empty). `perf` call graphs are
+not allowed on this machine (`perf_event_paranoid = 2`), hence the counter. gcc Release, 5 s,
+1 thread (`vc4_cost.txt`):
+
+| Root | VC4 VCF time (calls) | other VCN-mode VCF time | plain VCF time (VCN off) |
+|---|---|---|---|
+| P3 VC4, P5 VC4, P6 VC4, `h8j9f6i10` VC4 | 0 ms (0) | 0 ms | — |
+| P3 VC3 | 15 ms (14558), 0.3 % | 19 ms | — |
+| P3 VC2 | 5 ms (4056), 0.1 % | 18 ms | — |
+| `h8j9f6i10` VC2 | 32 ms (1213), 0.7 % | 248 ms, 5.5 % | — |
+| P3 / `h8j9f6i10` VCN off | — | — | 66 ms, 1.5 % / 263 ms, 5.8 % |
+
+At a VC4 root every attacker move without a five threat ends at the defender's rule 4 terminal, so
+the whole-board fours-only VCF runs only at VC4 nodes reached through defender passes from VC3/VC2
+roots, and costs under 1 % of the search time there (about 1 µs per call). Not a concern.
+
+MCTS NPS (visits/ms, 5 s, 1 thread, release PGO, VCN on then off back to back, `nps_pairs.tsv`):
+P3 VC2 11504 vs 10061 (×1.14), P5 VC2 21992 vs 17468 (×1.26), `h8j9f6i10` VC2 7925 vs 2698
+(×2.94), P3 VC3 8553 vs 8871 (×0.96). VCN on is not slower; it is faster where many leaves are
+terminals (pass refutations, VC4 rule-4 terminals) and the network is not called. Visits include
+re-visits of terminal nodes, so proven roots (VC4 rows of `results.tsv`, up to 400K visits/ms) are
+not comparable. Drift check: the three 3 s runs made before the matrix, repeated after it, gave
++12 %, +7 % and +76 % (the last, VCN off at `h8j9f6i10`, is noisy run to run), so the matrix NPS
+columns are indicative only; the pairs above are the comparison.
+
+Multi-thread and sanitizers (`mt_results.tsv`). 8 threads, 10 s, MCTS, levels 4/3/2, on the
+non-forced roots P1b / P7b (P1 / P7 after the forced pair), P3, P5, P6 and `h8j9f6i10` (P5/P6 take
+the ROOT picker's opponent-flex-four branch, which sets the policy flag). `FORCE_ASSERTION=ON`
+(RelWithDebInfo) and ASan (`USE_ASAN=ON`, asserts on): 18 + 18 runs, all exit 0, 0 `Assertion`,
+0 sanitizer reports. Classes agree with AB (`ab_confirm.tsv`: P1b VC4 `+M5`, P7b VC4 `-M2` /
+VC3 `+M5`, `h8j9f6i10` VC4 `-M2`; MCTS `h8j9f6i10` VC3 is not proven, AB `-M8`). TSan not run
+(optional; lockless-TT races pre-existing, §8.4).
+
+- **Slice-3 gap closed:** the widen counter saw widenings with a kept PASS edge in the assert build
+  (P1b VC3 29/29, P1b VC2 31/31, P7b VC3 2/2, P7b VC2 2/2) and in ASan (28, 39, 2), so
+  `widenNode`'s debug assert "every kept move is regenerated" ran with a kept PASS edge, under 8
+  threads, without firing.
+
+**Result: zero wrong answers** in every run (main matrix 224 runs: 28 rows × 2 searchers × 4 budgets; sweep 56, assert/ASan 36,
+confirmations). VCN-03 is done. §6 has the measured answer.
+
+Not in this slice: TSan; the singular-root stop at forced roots and the `BRIEF`-mode silence
+(findings above, not fixed); SEARCH-12 (its own todo, not edited here; now reachable by `YXVCN` in assert builds — worth adding to that todo).

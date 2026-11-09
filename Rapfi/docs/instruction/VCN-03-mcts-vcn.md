@@ -2,8 +2,10 @@
 
 Task: [`../todo/VCN-03-mcts-vcn.md`](../todo/VCN-03-mcts-vcn.md). Option B (native MCTS-VCN), done in
 slices (§8.1). Slice 0 (guard) and the bound work it depended on (SEARCH-09, SEARCH-10) are done.
-Slices 2 (key and root identity) and 3 (pass edge and prior) are done (2026-11-09). **The active slice
-is slice 4 (VC4/VC5 terminals).** Slice 5 gets its own section here before it starts.
+Slices 2 (key and root identity), 3 (pass edge and prior) and 4 (VC4/VC5 terminals) are done
+(2026-11-09). Slice 5 (enable, output, end-to-end measurement), the last slice, is done
+(2026-11-09, todo §9): **VCN-03 is done.** Deviation from the slice-5 test list: the open-three
+protocol tests hit SEARCH-12 in assert builds and were replaced by after-forced-pair roots (todo §9).
 
 ## Slice 2 — key and root identity
 
@@ -325,4 +327,125 @@ Write this deviation in todo §8 or §9, so the user can overrule it.
   `+M` (a mate AB refutes) is a failure.
 - Todo §9 has a "Slice 4" entry: the deviation from §8.1, the rule order, the TT-key change, the
   numbers, and the AB cross-check table. The status line is updated. VCN-03 stays Active.
+- Do not commit unless the user asks.
+
+## Slice 5 — enable under MCTS, output, end-to-end measurement
+
+### Goal
+
+`YXVCN` and `INFO VCTHREAD` really run a VCN search when `SEARCH_TYPE mcts` is used. The output
+(PV containing `PASS`, mate scores) reads like AB's. Correctness is then measured end to end
+against AB on the real network, with the pass prior and the VC4 VCF cost measured. If it is
+correct, VCN-03 is closed.
+
+### Part A — enable (class C)
+
+- Remove the MCTS refusal and the warnings: `searcherSupportsVcn()` and `VcnUnsupportedMessage`
+  (`command/gomocup.cpp:72-79`), the warning sites at `:303-304` and `:437-438`, and the `YXVCN`
+  refusal at `:791-795`. Remove the helper too, if nothing else uses it.
+- Update the slice-0 tests in `tests/vcn_tests.cpp`:
+  - `yxvcn_mctsSearcher_errorsAndDoesNotSearchAsVcn`, `infoVcthread_mctsSearcher_warns` and
+    `infoSearchType_mctsWithVcnLevelSet_warns` now describe removed behaviour.
+  - Replace them with tests of the new behaviour. Keep the names in the
+    `<function>_<scenario>_<expectedBehavior>` form, for example
+    `yxvcn_mctsSearcher_runsVcnSearchAndRestoresLevel` and `infoVcthread_mctsSearcher_noWarning`.
+  - The existing AB-side guarantees keep holding under MCTS: the one-shot `YXVCN` level is not
+    left set afterwards (see `vcnSearch_levelIsNotLeftSetAfterYxvcn_nextSearchIsOrdinary`), and
+    the level range checks.
+- **Root reuse after a `YXVCN`:** slice 2 left recycling unchanged. The ordinary graph on the same
+  position is lost after a VCN query. Decide whether that is acceptable for `YXVCN` (a one-shot
+  query). The cheap alternative is to skip `recycleOldNodes` when only the root key changed. Write
+  the decision down. Default to *keep as is* unless a measurement shows a real cost.
+
+### Part B — output
+
+- **PV with `PASS`:** `extractPVOfChildNode` can now yield `Pos::PASS`. Check how
+  `search/searchoutput.cpp` prints a PASS for MCTS: the realtime PV, the root-move lines and
+  `bestmove`.
+  - It must print the same way as AB's VCN PV. AB does not format it specially (VCN
+    §Deliberately not done).
+  - It must not crash, assert, or print garbage. `Pos::PASS` is `_pos == -1` (`core/pos.h:94`);
+    watch any code that indexes a board array with it.
+  - `bestmove` can never be PASS, because the root is the attacker and the ROOT picker never
+    passes. Assert that in a test.
+- Mate scores come from `updateRootMovesData` (`search.cpp`, `mate_in`/`mated_in` from bounds),
+  as `+M`/`-M`. A non-proven result prints a win-rate value. Check one line of each.
+
+### Part C — end-to-end measurement (rule 9)
+
+Use the release PGO build (`scripts/pgo_build.sh x64-clang-AVX512VNNI`) with the real network.
+SEARCH-12 means a root with a five or flex four aborts in assert builds, so run the measurement on
+release, and keep to roots without forced moves in assert builds.
+
+1. **Position set:**
+   - the `tests/vcn_measure.sh` set (P1–P5 and the rest), at `YXVCN 2/3/4`;
+   - the `tests/vcn_tests.cpp` end-to-end positions;
+   - the acceptance position `h8j9f6i10` (Standard, `YXVCN 2`, tracked by the move G5; see
+     VCN-02 §Acceptance).
+   
+   Extend `vcn_measure.sh` with a searcher argument (an `INFO SEARCH_TYPE` line), or write a copy
+   under `build/vcn03s5/`.
+2. **AB vs MCTS at equal time** (for example 5 s and 30 s, 1 thread and 8 threads). Per
+   (position, level), record: AB result, MCTS result (proven `+M`/`-M`, or value), best move, and
+   time to proof. Summarise as **proven / correct / wrong** counts per searcher.
+   - "Correct" means it agrees with the expected answer in `vcn_measure.sh` or AB's proven answer.
+   - **"Wrong" means a proven `+M`/`-M` that AB refutes, or one that contradicts the expected
+     answer. Any wrong answer is a failure to investigate.** A non-proven MCTS answer is not
+     wrong.
+3. **Pass prior:** sweep `mcts_vcn_pass_prior` over 0.1 / 0.25 / 0.5 on the same set, MCTS only,
+   one time budget. Report proven/correct counts and time to proof. **Do not change the default.**
+   Recommend a value with the numbers; the user decides.
+4. **VC4 VCF cost:** on VC4-heavy runs, measure the share of time or nodes spent in the VCN-mode
+   `SimpleVCF` (the whole-board fours-only VCF at each VC4 attacker leaf). Use a temporary counter
+   or `perf`, and do not commit the counter. Also report MCTS NPS with VCN on vs off on the same
+   positions.
+5. **Multi-thread:** 8-thread VCN runs on an assert build (`FORCE_ASSERTION=ON`) over the set,
+   avoiding forced roots, with no assert and a clean exit. Also run ASan. TSan is optional; the
+   lockless-TT races are pre-existing (§8.4).
+
+### Tests (write first, Parts A and B)
+
+- The replacement slice-0 tests above.
+- `yxvcn_mctsSearcher_vc4OpenThree_printsMateAndBestmoveNotPass` (end to end through the protocol,
+  small node limit, deterministic).
+- `extractPV_mctsVcnPassInLine_printsPassLikeAb`
+- `mctsVcn_vc3_attackerWithoutThreat_defenderPassRefutes` and
+  `mctsVcn_vc4_attackerWithoutVcf_loses` (§7 slice 5), if not already covered by slice 4.
+  Otherwise point to the covering test.
+
+### Pitfalls
+
+- **With VCN off, everything must stay identical** (bench, MCTS golden, cut on and off). Removing
+  the guard touches only the protocol paths for VCN.
+- **`INFO VCTHREAD` is persistent:** a `TURN` under MCTS with a level set now runs MCTS-VCN. That
+  is the intended behaviour, the same as AB. Make sure `think()` sets `vcnMode.attacker` (it does,
+  `command/gomocup.cpp:127`).
+- **Config reload** (`reloadConfigEachMove`) and a config that selects MCTS: the slice-0 "known
+  gap" disappears once VCN is supported. Remove that note.
+- **Real network vs test evaluator:** the slice-4 smoke used the stand-in evaluator. Results on
+  the real network can differ. Treat Part C as the real check.
+- When killing background processes, kill by PID; never use `pkill -f` / `pgrep -f` with patterns
+  that match your own shell.
+- `real_test`, `test_mcts.txt`: do not edit or commit.
+
+### Don't touch (slice 5)
+
+- AB search, `MovePicker` rules, the slice 2–4 MCTS-VCN rules (unless Part C finds a wrong answer;
+  then stop, report, and fix only with a failing test first), SEARCH-09/10/11/12, the
+  `Edge`/`Node`/`EdgeArray` sizes, and all `mcts_*` defaults (including `mcts_vcn_pass_prior`).
+
+### Definition of done (slice 5, and VCN-03)
+
+- Part A/B tests pass with asserts live, the full suite is green, and the fail-first state is
+  recorded.
+- Bench `17621937 / 8c1f72e5`. The MCTS golden with VCN off is identical to branch HEAD.
+- Part C tables are in todo §9 "Slice 5": AB vs MCTS proven/correct/wrong per time budget and
+  thread count, time to proof, `h8j9f6i10` best move, the pass-prior sweep with a recommendation,
+  the VC4 VCF cost and NPS, and the multi-thread and ASan results.
+- **Zero wrong answers.** If there are none, VCN-03 is done:
+  - move it to `## Done` in `TODO.md` and `instruction.md`, with the date and a one-line result;
+  - in todo §6/§4.2, write the measured answer to "is MCTS-VCN worth it vs AB", based on the
+    numbers, not an opinion.
+  
+  If any wrong answer remains, VCN-03 stays Active, with the failing case recorded.
 - Do not commit unless the user asks.
