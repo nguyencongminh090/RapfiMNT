@@ -1,7 +1,8 @@
 # VCN-03 — VCN search mode under the MCTS searcher (research report)
 
-**Status:** option B chosen (2026-11-08, user). Slice 0 (guard) done 2026-11-08, see §9; slices
-1–5 not started. Depended on [SEARCH-09](SEARCH-09-mcts-bound-under-edge-cut.md), done 2026-11-09
+**Status:** option B chosen (2026-11-08, user). Slice 0 (guard) done 2026-11-08; slice 1 is
+SEARCH-09/10 (done 2026-11-09); slice 2 (node key and root identity) done 2026-11-09, see §9;
+slices 3–5 not started. The protocol guard stays until slice 5. Depended on [SEARCH-09](SEARCH-09-mcts-bound-under-edge-cut.md), done 2026-11-09
 (option (a); `EdgeArray::numMoves` / `edgesCut()` available), and on
 [SEARCH-10](SEARCH-10-mcts-readd-cut-moves.md), done 2026-11-09 (option (b)): when every kept reply of
 a cut node is proven lost, the node's edge array is replaced by the full move list, so the edge cut
@@ -278,3 +279,72 @@ so also an MCTS fixed-node golden output with VCN off); AB vs MCTS on the VCN-02
 - Known gap: a config reload (`reloadConfigEachMove`) or a config file that selects MCTS does
   not go through the `SEARCH_TYPE` handler, so it does not warn; the search is still ordinary
   MCTS, as before this slice.
+
+### Slice 2 — node key and root identity, done 2026-11-09 (class B, bit-identical with VCN off)
+
+Instruction: [`../instruction/VCN-03-mcts-vcn.md`](../instruction/VCN-03-mcts-vcn.md) "Slice 2".
+
+- `search/vcn.h` (new): `namespace Vcn` (`levelIncrement`, `childLevel`, `vc5AttackerLoses`,
+  `hashXor`) moved verbatim out of the anonymous namespace of `search/ab/search.cpp`, now
+  `Search::Vcn`; the AB call sites are unchanged (found through `using namespace Search`). Added
+  to `HEADERS`.
+- `search/mcts/searcher.h`: `mctsNodeVcnLevel(board, options, rootDefenderPasses)` =
+  `min(VC5, n + passMoveCountOfSide(~attacker) - rootDefenderPasses)` and
+  `mctsNodeKey(board, options, rootDefenderPasses)` = `zobristKey()` when VCN is off (early
+  return, so the identity is structural), else `zobristKey() ^ Vcn::hashXor(options, level)`.
+  `MCTSSearcher::scratch.rootDefenderPasses` (set in `searchMain` before `setupRootNode` and before
+  `runOnAllThreads`) and `graph.previousRootKey` (next to `previousPosition`). `Node` stays 56
+  bytes; no recursion parameter.
+- `search/mcts/search.cpp`: the helper at every key site — child allocation in `searchNode`, root
+  allocation in `setupRootNode`, the `node.getHash()` assert in `searchNode` (moved below the
+  `options`/`searcher` locals it now needs). The root-reuse early return also requires
+  `rootKey == graph.previousRootKey`. Re-grep: no other `zobristKey()` / `allocateOrFindNode(`
+  key site under `search/mcts/`; the remaining `zobristKey()` uses (`SimpleVCF`, `search.cpp:115`
+  and the prefetch at 220) are the VCF TT, see below.
+- Decision, recycle condition: **unchanged** (no key test). A VCN search on the same moves as the
+  previous ordinary search rebuilds the root and, since `rootPosition.size() >=
+  previousPosition.size()`, recycles from the VCN root: the ordinary graph is unreachable and is
+  erased at once (not aged out later). Toggling back rebuilds the ordinary root from scratch.
+  Correct in both directions (keys never mix); the cost is lost ordinary work after a VCN query on
+  the same position. Skipping the recycle when only the key changed would keep that work; it is a
+  behaviour change, to be weighed in slice 5 when YXVCN under MCTS is reachable. With VCN off the
+  condition is untouched, so bit-identity holds by construction.
+- Finding, PASS and zobrist (verified in `game/board.cpp` `Board::move`): a pass leaves
+  `currentZobristKey` unchanged and only flips `currentSide`; `zobristKey()` =
+  `currentZobristKey ^ zobristSide[currentSide]`, so a pass changes the key only through the
+  side-to-move term. Same stones + same side to move with different pass counts collide on the
+  zobrist key alone; in VCN mode the per-node level in the XOR separates them (the level comes from
+  the defender pass count, not from the key).
+- Deferred to slice 4: the `SimpleVCF` VCF TT key (`search/mcts/search.cpp:115`,
+  `board.zobristKey()`) is **not** VCN-keyed in slice 2. Its VCN semantics (`vcfOnly`) belong to
+  slice 4; until then a VCN search under MCTS (unreachable through the protocol) shares VCF TT
+  entries with ordinary search.
+- Tests (names from the instruction file, which refine the §7 draft names
+  `mctsVcnKey_vcnOff_equalsZobrist` / `mctsVcn_afterYxvcn_...`; `tests/mcts_vcn_tests.cpp`, new, registered in `TEST_DRIVER_SOURCES` and
+  `tests/testmain.cpp`): `mctsNodeKey_vcnOff_equalsZobrist`,
+  `mctsNodeKey_vcnOn_differsByLevelAndAttacker`, `mctsNodeKey_defenderPassRaisesLevel_cappedAtVc5`,
+  `setupRootNode_samePositionVcnToggled_rebuildsRoot` (root compared by key only: the recycled
+  ordinary root may be reallocated at the same address),
+  `mctsVcn_afterVcnSearch_nextOrdinarySearchReusesNoVcnNode` (walks the VCN graph right after the
+  VCN search, then the ordinary graph after the next ordinary search, replaying edge moves on a
+  `Board`). `vcnHelpers_movedToSharedHeader_abBehaviourUnchanged` is covered by
+  `tests/vcn_tests.cpp`: 38/38 pass.
+- Fail-first (`build/vcn03s2/tests_failing_first_stub.txt`): against HEAD the file would not
+  compile (`mctsNodeKey`, `search/vcn.h` absent; shown by inspection, not built). With the helpers stubbed (key = zobrist, level =
+  root level) and not applied at the sites: `vcnOff` passes (expected), `differsByLevelAndAttacker`,
+  `defenderPassRaisesLevel`, `samePositionVcnToggled` (VCN root hash == zobrist) and
+  `afterVcnSearch` (VCN root hash == zobrist) fail. The ordinary-graph half of the last test passes
+  vacuously before the change; its VCN-graph half is the real check.
+- Results: `rapfi_tests` 166/166 (161 before + 5 new), asserts live (`--check-asserts-live`
+  aborts). Bench (gcc 15.2.0, Release, AVX512+VNNI, built-in config): Nodes `17621937`, Hash
+  `8c1f72e5`, unchanged. MCTS fixed-node golden with VCN off (4 Standard positions, 300K nodes, 1
+  thread, final root block, harness copied from `build/search10/`): identical to the HEAD baseline
+  (`bce9ffa`) for both `cfg_off` (cut off, the SEARCH-09/10 golden; the baseline also matches
+  `build/search10/golden_ab_*`) and `cfg_on` (default 0.99 cut). Outputs in `build/vcn03s2/`.
+  No self-play (VCN off is bit-identical; the golden is the guard).
+- The in-engine assert `node.getHash() == mctsNodeKey(...)` in `searchNode` is live in
+  `rapfi_tests` and ran on every playout of the two VCN searches in the engine tests. Only single
+  thread is exercised; worker visibility of `rootDefenderPasses` rests on the `runOnAllThreads`
+  happens-before.
+- The protocol guard `searcherSupportsVcn()` is unchanged; tests drive the searcher directly with
+  `SearchOptions::vcnMode` and set the attacker themselves.

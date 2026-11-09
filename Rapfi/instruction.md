@@ -6,7 +6,7 @@ to a detail file under `docs/instruction/`. Read the matching entry here before 
 
 ## Active
 
-(none)
+- [VCN-03 — VCN search mode under the MCTS searcher](docs/instruction/VCN-03-mcts-vcn.md) — slice 2 (key and root identity): per-node level from defender pass count, key = zobrist ^ Vcn::hashXor, root reuse compares the key; guard stays until slice 5. Slice 2 done 2026-11-09 (todo §9); slices 3–5 sections to be written before they start
 
 ## Done
 
