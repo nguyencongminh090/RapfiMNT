@@ -6,6 +6,8 @@ to a detail file under `docs/instruction/`. Read the matching entry here before 
 
 ## Active
 
+- [CMD-01 — Engine stalls without sending a best move under a pipe harness](docs/instruction/CMD-01-engine-stall-no-bestmove.md) — reproduce with backtraces first, rule out the harness, fix the ordering (no sleeps or retries)
+
 ## Done
 
 - [PERF-04 — MCTS retained slab pool after recycle](docs/instruction/PERF-04-mcts-slab-pool-trim.md) — done 2026-11-09 (see todo results)

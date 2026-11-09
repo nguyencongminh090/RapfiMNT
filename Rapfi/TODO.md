@@ -6,6 +6,8 @@ a matching `instruction.md` line when execution guidance exists. See
 
 ## Active
 
+- [CMD-01 — Engine stalls without sending a best move under a pipe harness](docs/todo/CMD-01-engine-stall-no-bestmove.md) — engine goes idle on stdin with no move printed, on base and new binaries alike (3 of 6 per binary under load). Class C provisional. Found in PERF-04 verification.
+
 ## Done
 
 - [PERF-04 — MCTS retained slab pool after recycle](docs/todo/PERF-04-mcts-slab-pool-trim.md) — PERF-03 kept freed node slabs until `clear`, so real heap could exceed the graph budget after recycle. Class B. Done 2026-11-09 (branch `perf-04-slab-pool`, 1b6370a..ee7c674 + review docs, not merged): option (a), slabs without a live node are freed after every erase; `graphMemoryUsed` unchanged; §8 worst case real/graph limit 1.008 → 0.853, 13-move game final table heap 11.94 → 5.78 MB; cycles/visit no regression (PGO, 0.990 1T / 0.933 8T); recycle erase +3 ms per recycle (170 → 244 ms over 25 recycles, 1T); 238/238 tests, TSan/ASan clean (suite and engine game sequences), bench `17621937 / 8c1f72e5`, golden and A/B recycle sequence (unbounded and budget-limited) byte-identical, budget closure counts equal.
