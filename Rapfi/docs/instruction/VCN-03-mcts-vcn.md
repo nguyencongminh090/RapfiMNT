@@ -2,8 +2,8 @@
 
 Task: [`../todo/VCN-03-mcts-vcn.md`](../todo/VCN-03-mcts-vcn.md). Option B (native MCTS-VCN), done in
 slices (§8.1). Slice 0 (guard) and the bound work it depended on (SEARCH-09, SEARCH-10) are done.
-**This file covers slice 2, key and root identity, only.** Slices 3–5 get their own sections here
-before they start.
+Slice 2 (key and root identity) is done (2026-11-09). **The active slice is slice 3 (pass edge and
+prior).** Slices 4–5 get their own sections here before they start.
 
 ## Slice 2 — key and root identity
 
@@ -110,3 +110,98 @@ Each test builds its own `Board`, is deterministic, and has asserts live (`rapfi
   guard.
 - Commit on branch `search-09-10-mcts-bound`, in conventional style (`test:`, `search:`,
   `docs:`), only if the user asked.
+
+## Slice 3 — pass edge and prior
+
+### Goal
+
+In VCN mode, a non-root MCTS node where the defender is to move gets a `Pos::PASS` edge under the
+same rule as AB, with a real prior. Edges stay sorted by policy, and the pass survives the cut and
+the SEARCH-10 widening. With VCN off nothing changes. No terminals: VC4/VC5 rules and `vcfOnly`
+come in slice 4. The protocol guard stays until slice 5.
+
+### Design (fixed)
+
+- **When a pass edge exists.** It follows AB's rule (`search/ab/search.cpp:1450`):
+  `vcnDefenderPass = vcn enabled && side to move != attacker && !board.p4Count(attacker, A_FIVE)`.
+  It is non-root only (the root is the attacker, and the `ROOT` picker never passes). The picker's
+  own checks stay as they are (`search/movepick.cpp:578-590`): there is no pass stage against a
+  five, and no pass right after a pass.
+- **One move-generation helper** shared by `expandNode<false>` (`search/mcts/search.cpp:430-441`)
+  and `widenNode` (`search.cpp:512-539`). It builds the `MAIN` picker with
+  `generatePassMove = vcnDefenderPass`, collects moves and normalised policies, applies the pass
+  prior, and returns them sorted. **The `widenNode` part is mandatory.** Today `widenNode`
+  regenerates without a pass. A kept pass edge would then be "missing": the debug assert at
+  `search.cpp:543-545` fires, and in release `replaceEdgesWithFull` gives up, so a defender node
+  could never be proven lost again. That would undo SEARCH-10 in VCN.
+- **Pass prior.**
+  - Add a config value `mcts_vcn_pass_prior`: `SearchCfg.mctsVcnPassPrior` in
+    `search/searchconfig.h`, parsed next to `mcts_edge_policy_mass` in `config.cpp:377`, clamped to
+    `[0, 1)`, default **0.25**. The default is not measured; slice 5 measures it and may tune it.
+    Write that down in the todo.
+  - When the pass is generated: `P(pass) = prior`, and every board move's normalised policy is
+    multiplied by `1 - prior`, so the sum stays about 1.
+- **Order.** `createEdgesFrom`, `selectEdgeCount` and `selectChild` (the first unexplored edge has
+  the highest remaining policy, `search.cpp:351`/`378`) all need the list in descending policy
+  order. The picker returns PASS first with policy 0, so re-place it by its prior. A stable
+  insertion of the single pass entry into the already-sorted board moves is enough. Check first
+  that the picker's board moves really come out sorted by normalised policy in the `DEFENDFOUR` /
+  `DEFENDB4F3` stages; if not, sort the whole list stably.
+- **Defender passes and the key.** The pass child's key already carries the raised level (slice 2:
+  `passMoveCountOfSide(defender)`). `board.move(rule, Pos::PASS)` and the evaluator hooks already
+  support a pass, because AB uses them.
+- **`vcnAttackOrder`** (an AB-only ordering) is **not** used. MCTS orders by policy.
+
+### Tests (write first)
+
+`expandNode`/`widenNode` live in an anonymous namespace. Expose the shared move-generation helper
+through a small internal header, or test it through the searcher the way `tests/mcts_vcn_tests.cpp`
+(slice 2) does. Pick one and write it down. Use the todo §7 names plus these:
+
+- `expandNode_vcnDefender_hasPassEdgeWithConfiguredPrior`
+- `expandNode_vcnDefender_edgesSortedByPolicyDescendingAndSumToOne`
+- `expandNode_vcnDefenderFacingFive_noPassEdge`
+- `expandNode_vcnAttacker_noPassEdge`
+- `expandNode_vcnOff_edgesUnchanged` (same moves, policies and order as before the change)
+- `expandNode_vcnDefenderPassPriorZero_passLastOrAbsentAndBoardPoliciesUnscaled` (pins the edge
+  case; choose and document whether prior 0 means "no pass edge" or "pass last")
+- `widenNode_vcnDefenderCutNodeWithPassEdge_widensAndKeepsPass`: build a cut defender node whose
+  kept edges, including the pass, are all proven lost. The widen must succeed, and the node then
+  proves lost.
+- `config_mctsVcnPassPrior_parsedAndClamped`
+- `searchNode_vcnDefenderPass_childKeyHasRaisedLevel`: a short fixed-node VCN search. The PASS
+  child's hash equals `mctsNodeKey` at the raised level.
+
+### Pitfalls
+
+- **Policy 0 for PASS from the picker** (`movepick.cpp:586`). Never let a zero-policy edge sit
+  ahead of positive ones. That breaks the "first unexplored = highest remaining prior" invariant.
+- **The cut runs after the prior.** Apply prior and order first, then `selectEdgeCount` /
+  `createEdgesFrom`. With prior 0.25 the pass is always kept; do not special-case the cut.
+- **`expandNode` is the hot path.** With VCN off the helper must do exactly today's work. The
+  bit-identity guard is the MCTS golden output with VCN off (cut on and off), and the bench.
+- **Renju:** check that a pass does not trip the forbidden-move or `validateOpponentCMove`
+  logic in the picker for the defender, as AB already runs it. Cover Renju in at least one test if
+  cheap.
+- **SEARCH-10 retire/widen code** is not to be changed beyond calling the shared helper.
+- `real_test`, `test_mcts.txt`: do not edit or commit.
+
+### Don't touch (slice 3)
+
+- `evaluateNode`, terminals, `SimpleVCF`, `wincheck.h`, the VCF TT key (slice 4).
+- The protocol guard in `command/gomocup.cpp` and PV/printer handling of PASS (slice 5).
+- AB search and `MovePicker`'s pass rules. MCTS adapts to the picker, not the other way round.
+- `Edge`/`Node`/`EdgeArray` sizes, the SEARCH-09/10 bound logic, and the defaults of the other
+  `mcts_*` options.
+
+### Definition of done (slice 3)
+
+- The tests above pass with asserts live, the full suite is green (including
+  `tests/vcn_tests.cpp`), and the fail-first state is recorded.
+- Bench `17621937 / 8c1f72e5`. The MCTS golden output with VCN off (cut on and off) is identical
+  to branch HEAD `4149332`.
+- Todo §9 has a "Slice 3" entry recording: the prior default and that it is unmeasured, the
+  ordering check result, how prior 0 behaves, and the test-exposure choice. The status line is
+  updated. VCN-03 stays Active.
+- No self-play: VCN-off is bit-identical and VCN-on is not reachable from the protocol yet.
+- Do not commit unless the user asks.

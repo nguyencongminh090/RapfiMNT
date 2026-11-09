@@ -6,7 +6,7 @@ to a detail file under `docs/instruction/`. Read the matching entry here before 
 
 ## Active
 
-- [VCN-03 — VCN search mode under the MCTS searcher](docs/instruction/VCN-03-mcts-vcn.md) — slice 2 (key and root identity): per-node level from defender pass count, key = zobrist ^ Vcn::hashXor, root reuse compares the key; guard stays until slice 5. Slice 2 done 2026-11-09 (todo §9); slices 3–5 sections to be written before they start
+- [VCN-03 — VCN search mode under the MCTS searcher](docs/instruction/VCN-03-mcts-vcn.md) — slice 2 done; slice 3 (pass edge): AB's pass rule, `mcts_vcn_pass_prior` (0.25), edges re-sorted by prior, shared move generation for expandNode and widenNode; slice 3 done 2026-11-09 (todo §9); guard stays until slice 5
 
 ## Done
 
