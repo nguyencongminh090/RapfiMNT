@@ -2,8 +2,8 @@
 
 Task: [`../todo/VCN-03-mcts-vcn.md`](../todo/VCN-03-mcts-vcn.md). Option B (native MCTS-VCN), done in
 slices (§8.1). Slice 0 (guard) and the bound work it depended on (SEARCH-09, SEARCH-10) are done.
-Slice 2 (key and root identity) is done (2026-11-09). **The active slice is slice 3 (pass edge and
-prior).** Slices 4–5 get their own sections here before they start.
+Slices 2 (key and root identity) and 3 (pass edge and prior) are done (2026-11-09). **The active slice
+is slice 4 (VC4/VC5 terminals).** Slice 5 gets its own section here before it starts.
 
 ## Slice 2 — key and root identity
 
@@ -204,4 +204,125 @@ through a small internal header, or test it through the searcher the way `tests/
   ordering check result, how prior 0 behaves, and the test-exposure choice. The status line is
   updated. VCN-03 stays Active.
 - No self-play: VCN-off is bit-identical and VCN-on is not reachable from the protocol yet.
+- Do not commit unless the user asks.
+
+## Slice 4 — VC4 / VC5 terminals
+
+### Goal
+
+`evaluateNode` (`search/mcts/search.cpp:548`) applies the VCN leaf rules of todo §3.3, with the same
+values as AB. A VC4 attacker node is always solved at evaluation: either it has a VCF that is made
+only of fours, or it loses. A VC4 defender node wins at once when the attacker made no five threat.
+A VC5 attacker without a five loses. With VCN off, nothing changes (bit-identical). The protocol
+guard and PV printing stay for slice 5.
+
+### Deviation from §8.1, decided here: share the VC4 rules, not the AB function
+
+§8.1 said the VC4 solver would be "shared with AB (factored out of `search/ab/search.cpp`)". AB's
+`vcfsearch`/`vcfdefend` (`search/ab/search.cpp:2064`, `:2347`) is tied to AB's `SearchStack`,
+`NodeType`, PV, eval stand-pat, policy tracing and timing. Factoring it out would put the AB bench
+at risk for no gain in correctness.
+
+Instead, MCTS reuses **the same primitives with the same flags**, and `search/ab/search.cpp` is not
+edited:
+
+- `quickWinCheck<R>(board, ply, beta, vcfOnly)` (`game/wincheck.h:38`). Give the runtime wrapper
+  `quickWinCheck(Rule, ...)` (`wincheck.h:118`) a defaulted `vcfOnly = false` parameter. This is
+  additive; existing calls are unchanged.
+- The QVCF picker with `forceAllowB4InVCF = fullBoardVCF = true`, exactly as AB passes `vcfOnly`
+  twice at `search/ab/search.cpp:2224-2228`.
+- The VC4 values AB uses:
+  - attacker with no VCF: `mated_in(ply + 2)` (AB: "refuted by a defender pass");
+  - defender with no five threat from the attacker: `mate_in(ply + 1)` (`search/ab/search.cpp:2372-2377`);
+  - VC5 attacker without a five: `mated_in(ply)`, checked **before** the draw check (§8.3).
+
+Write this deviation in todo §8 or §9, so the user can overrule it.
+
+### Design
+
+- **Level.** `mctsNodeVcnLevel(board, options, searcher.scratch.rootDefenderPasses)` (slice 2), only
+  when VCN is enabled. `ply` / mate values use `board.ply()`, as MCTS does today.
+- **`evaluateNode`, non-root, VCN on.** Order, with `attacker = options.vcnMode.attacker`:
+  1. VC5, attacker to move, `Vcn::vc5AttackerLoses(board, attacker)`: terminal
+     `mated_in(board.ply())`.
+  2. Board full / maxMoves: draw (unchanged).
+  3. Immediate win: `quickWinCheck(rule, board, ply, beta, vcfOnly)`, with
+     `vcfOnly = attacker to move && level == VC4`. Then the maxMoves clamp, as today.
+  4. VC4, defender to move, `!board.p4Count(attacker, A_FIVE)`: terminal `mate_in(board.ply() + 1)`
+     (the defender wins by passing).
+  5. VC4, attacker to move: run the VC4 VCF (below). On a win, terminal with that mate value.
+     Otherwise terminal `mated_in(board.ply() + 2)`. **Never** fall through to the NN value.
+  6. Otherwise (VC2/VC3, either side; VC4 defender facing a five; VC5 defender): the existing
+     `SimpleVCF::vcf`, then the NN value.
+- **VC4 VCF in `SimpleVCF`.** Add a `vcfOnly` mode to `SimpleVCF::vcf`/`vcfsearch`/`vcfdefend`:
+  - **Attacker nodes:** `quickWinCheck(..., vcfOnly)`; QVCF picker with
+    `forceAllowB4InVCF = fullBoardVCF = true`; no stand-pat (the start value is
+    `mated_in(ply + 2)`, as in AB; a missing VCF returns it).
+  - **Defender nodes:** unchanged. They block the five; a forbidden block in Renju still loses.
+  - **The mode is a parameter, not a global.** The default path (`vcfOnly = false`) must run exactly
+    today's code.
+- **VCF TT key.** In VCN mode, `SimpleVCF` stores and probes under
+  `board.zobristKey() ^ Vcn::hashXor(options, level)`, where `level` is the level at the
+  `SimpleVCF` entry (AB: "the level stays constant along a vcf chain"). VCF-only results must never
+  meet plain VCF results in the shared `TT`. With VCN off, the key is exactly `zobristKey()`.
+- **Root.** `evaluateNode<true>` skips terminal checks today; keep it so. At a VC4 root the
+  attacker's children (defender, VC4) resolve by rule 4, or by the five-block line.
+
+### Tests (write first; todo §7 slice-4 names plus these)
+
+- `evaluateNode_vc4AttackerDoubleThreeOnly_attackerLoses` (VCN-02 1b)
+- `evaluateNode_vc4AttackerFarVcf_attackerWins` (VCN-02 1: the full-board picker finds a far VCF.
+  Reuse the `farVcfAfterForcedPairBoard` fixture in `tests/vcn_tests.cpp`)
+- `evaluateNode_vc4AttackerNoVcf_attackerLosesNotNnValue`
+- `evaluateNode_vc4DefenderNoFiveThreat_defenderWins`
+- `evaluateNode_vc4DefenderFacingFive_notTerminalByPassRule`
+- `evaluateNode_vc5AttackerNoFive_attackerLoses`
+- `evaluateNode_vcnBoardFull_returnsDrawLikeAb`
+- `evaluateNode_vc5AttackerNoFiveOnFullBoard_attackerLosesNotDraw`
+- `evaluateNode_vc3_unchangedFromOrdinaryRules` (VC2/VC3 behave as VCN-off except for the key)
+- `evaluateNode_vcnOff_unchanged` (VCN off: same terminal and value as before)
+- `simpleVcf_vcfOnlyMode_ttKeySeparatedFromPlain`: a plain VCF result in the TT for a position
+  does not satisfy a VC4 probe, and the reverse.
+- `quickWinCheckRuntime_vcfOnlyFlag_matchesTemplate` (the wrapper passes the flag through)
+- **Cross-check against AB:** on each `tests/vcn_tests.cpp` VC4/VC5 leaf position, the terminal
+  value MCTS `evaluateNode` gives has the **same sign and mate class** (win / loss / draw / none) as
+  AB's `vcfsearch` result at that node. Plies may differ by the stack convention; state which.
+
+`evaluateNode` is internal. Expose it through `search/mcts/searchtesting.h` as slice 3 did.
+
+### Pitfalls
+
+- **Bit-identity with VCN off** covers `evaluateNode`, `SimpleVCF`, the `quickWinCheck` wrapper and
+  the VCF TT key. Guards: bench, and the MCTS golden with VCN off (cut on and off).
+- **The order of rules matters:** VC5 loss before the draw; `vcfOnly` win check before the VC4 VCF.
+  AB's order is the reference (`search/ab/search.cpp:1251-1306`, `:2104-2122`).
+- **No stand-pat in VC4 mode.** A `VALUE_ZERO` start in `vcfsearch` makes a missing VCF look like
+  "no result", and the node would fall through to the NN value. That is wrong: in VC4 it is a loss.
+- **The level inside `SimpleVCF` is constant** (no passes inside a VCF chain). Compute it once at
+  entry.
+- **Mate plies and maxMoves:** keep the existing `mate_step(value, 0) > options.maxMoves` clamp
+  where `evaluateNode` has it. Use `nonPassMoveCount` consistently, as AB does.
+- **The TSan reports in the lockless TT are pre-existing** (VCN-03 §8.4). Do not try to fix them
+  here.
+- `real_test`, `test_mcts.txt`: do not edit or commit.
+
+### Don't touch (slice 4)
+
+- `search/ab/search.cpp` (no factoring; AB bit-identical), and the `MovePicker` rules.
+- The slice 2/3 key and pass-edge code, except to read the level. The SEARCH-09/10/11 code and
+  docs. The `Edge`/`Node`/`EdgeArray` sizes. The `mcts_*` defaults.
+- The protocol guard in `command/gomocup.cpp` and PV printing (slice 5).
+
+### Definition of done (slice 4)
+
+- The tests above pass with asserts live, the full suite is green (including `tests/vcn_tests.cpp`),
+  and the fail-first state is recorded.
+- Bench `17621937 / 8c1f72e5`. The MCTS golden with VCN off (cut on and off) is identical to branch
+  HEAD.
+- A small VCN-on smoke run through the searcher, not the protocol: VC4 and VC3 searches on 2–3
+  `vcn_tests.cpp` positions, 1 thread, fixed nodes. Report the root result next to AB's answer for
+  the same position and level. This is information for slice 5, not a pass/fail gate, but a wrong
+  `+M` (a mate AB refutes) is a failure.
+- Todo §9 has a "Slice 4" entry: the deviation from §8.1, the rule order, the TT-key change, the
+  numbers, and the AB cross-check table. The status line is updated. VCN-03 stays Active.
 - Do not commit unless the user asks.
