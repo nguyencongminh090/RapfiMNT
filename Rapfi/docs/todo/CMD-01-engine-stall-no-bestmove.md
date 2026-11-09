@@ -1,6 +1,6 @@
 # CMD-01 — Engine stalls without sending a best move under a pipe harness
 
-**Status:** open (recorded 2026-11-09, not started). Seen during PERF-04 phase 2 verification.
+**Status:** in progress (recorded 2026-11-09; resumed 2026-11-09 with reduced scope, see below). Seen during PERF-04 phase 2 verification.
 **Progress (paused 2026-11-09):** branch `cmd-01-stall` (from `fe37c22`), still active, no code
 changed. Done: read the evidence. No reproduction has been run yet (0 stress runs, so no stall
 count and no power-state record of our own; the PERF-04 run recorded PL1 24 W). The RelWithDebInfo
@@ -76,9 +76,70 @@ would time the engine out. That makes this worth a root cause, not a harness wor
    deterministic (for example by forcing the ordering with a hook); otherwise a stress test with a
    pass criterion, kept out of the default `rapfi_tests` run if it is slow.
 
+## Resumed 2026-11-09: reduced scope, root cause, class
+
+**Deviation from the instruction (hard rule 6), approved by the user 2026-11-09:** the 4 to 6 hour
+stress reproduction with gdb backtraces (instruction step 1) is replaced by (a) a static trace of
+the root cause, (b) a deterministic regression test that forces the ordering and fails on HEAD,
+and (c) a short targeted stress run (minutes per binary) of base vs fixed under the same load,
+both searchers, 1T and 8T, with PL1 recorded. No gdb backtraces of a stalled process are taken.
+
+**Root cause (static trace, confirmed in code):** `command/gomocup.cpp`, `think`'s completion
+callback. It holds `protocolMutex`, calls `sendActionAndUpdateBoard`, which prints the move with
+`std::endl` (flushed to the pipe), and only then sets `thinking = false`. `runProtocol` checks
+`thinking` without the lock and drops any non-STOP command (plus the rest of its line) while it is
+true. A client that answers the move at once with `BOARD` can have `BOARD` dropped in the window
+between the flush and the store; the following `x,y,c` and `DONE` lines then become unknown
+commands, the engine waits on stdin and the client waits for a move. This is hypothesis 1/2 of
+neither kind: the callback runs and the move is delivered; the *next* command is lost. Load widens
+the window (the pipe write wakes the reader before the callback thread stores the flag). It is
+generic to every searcher (AB, MCTS), to trivial best moves (opening DB, `tryTrivialBestmove`)
+and to every `think` caller (`BEGIN`, `TURN`, `BOARD`, `YXNBEST`, `YXBALANCE*`, `SWAP2BOARD`).
+`build/perf04/multi4.py` sends `BOARD` right after reading the move line, which is exactly this
+pattern (hypothesis 3, a harness bug, is ruled out: the harness behaves as a fast GUI may).
+
+**Class: C** (protocol layer, `command/gomocup.cpp`). No search-thread signalling
+(`startThinking`, `runTask`, `waitForIdle`) changes, search output is unchanged.
+
+**Fix (root-cause layer):** in the callback, clear `thinking` *before* the move is printed, still
+inside `protocolMutex`. The flag is the engine's "result published" state; it must change before
+the externally visible effect that lets the client send its next command. A protocol thread that
+sees `false` early then blocks on `protocolMutex` until the callback (board update, time
+accounting, ponder startup) is complete, so the ordering documented in the callback and in the
+STOP handler is kept. Rejected alternative: re-check `thinking` under the lock in `runProtocol`.
+It also closes the window, but it fixes the reader instead of the writer that publishes out of
+order, and adds a mutex acquisition to the drop path. Knowledge lookup (hard rule 10):
+`SKILLS_TREE/tools/find -k knowledge "publish completion signal after state update race
+condition flag ordering concurrency"` returned no matching note (only PostgreSQL locking and GoF
+State); the choice rests on the trace above.
+
+**Second suspect, `Swap2PutTwo` (checked, different defect, follow-up CMD-02):** the
+`Swap2PutTwo` branch of `sendActionAndUpdateBoard` starts a second (`BALANCE_TWO`) search from
+inside the callback on the main search thread (`waitForIdle` skips the calling thread, so it does
+not deadlock). `thinking` is then cleared while that second search runs, and its own callback
+prints the two moves without `protocolMutex` and without any `thinking` coverage. That is the
+flag being cleared too *early* for a nested search (commands are accepted and can stop it or
+reallocate `board` mid-search), not the print-before-clear ordering fixed here, and it cannot cause
+the BOARD-after-move stall. Recorded as CMD-02, not fixed here (hard rule 5).
+
 ## Test list
 
-To be written once the root cause is known.
+Written before code. File `tests/gomocup_tests.cpp`, driver `runGomocupTests()`. Seam: the test
+installs a `std::streambuf` on `std::cout`; its `sync()` (called by the move's `std::endl` on the
+main search thread, inside `protocolMutex`) is the deterministic interleaving point. No engine hook,
+no sleeps, no timeouts; positions are immediate fives so `tryTrivialBestmove` answers without a
+search (no PRNG involved).
+
+| Function | Test | Partition |
+|---|---|---|
+| `think` (callback) | `think_moveFlushedToClient_thinkingAlreadyCleared` | flag state at the moment the move line is flushed: must be `false` |
+| `runProtocol` | `runProtocol_boardSentRightAfterMove_isProcessed` | a `BOARD ... DONE` that arrives after the move is flushed and before the callback returns: must be processed (second move printed, no `Unknown command`) |
+| `runProtocol` | `runProtocol_commandWhileThinking_isDropped` | boundary on the other side: a command read while `thinking` is true (before the result is published) is still dropped with the rest of its line (existing behaviour kept) |
+
+The `runProtocol_boardSentRightAfterMove_isProcessed` test forces the HEAD interleaving: in
+`sync()`, if `thinking` is still true, the stream blocks until the test thread's `runProtocol()`
+has returned (on HEAD that is the lock-free drop path, so it cannot deadlock); if `thinking` is
+already false it returns at once and the test thread's `runProtocol()` waits on the mutex.
 
 ## Verification
 
