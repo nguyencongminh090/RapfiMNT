@@ -35,18 +35,42 @@ You can download a pre-built package of the Rapfi engine and the Yixinboard GUI 
 
 
 
-## About this fork
+## About this repository
 
-This repository is a derivative of upstream [Rapfi](https://github.com/dhbloo/rapfi) (engine sources synced from upstream v0.44.1) supporting **Freestyle, Standard and Renju** rules on a rectangular board. On top of upstream it adds:
+This repository builds on upstream [Rapfi](https://github.com/dhbloo/rapfi) (engine sources synced from v0.44.1) and plays **Freestyle, Standard and Renju** rules. It keeps the upstream engine, protocol and network formats, and extends them with attack-oriented search, analysis commands, faster search internals and a test suite. Every change is checked against the built-in `BENCH` (node count and hash) and the unit tests before it is merged.
 
-+ **VCN attack-search mode** (`INFO VCTHREAD`, `YXVCN`, VC2..VC4 search modes).
-+ **`YXANALZ`**: analyze an explicit, user-supplied list of root candidate moves. See [`Rapfi/docs/rules/YXANALZ-user-root-candidates.md`](Rapfi/docs/rules/YXANALZ-user-root-candidates.md).
-+ **VNNI signed-input affine layer** for NNUE evaluation (EVAL-01).
-+ **Move-ordering speedups**: LSD radix sort in the middle branch and a branchless AVX-512 insertion branch of `fastPartialSort` (PERF-01/PERF-02), about +17% nodes per second on the built-in benchmark.
-+ **PGO build support** via the `PGO_MODE` CMake option and `Rapfi/scripts/pgo_build.sh`.
-+ **Unit tests** (`BUILD_TESTS`) covering root-move generation, move analysis, SIMD linear layers, VCN and move sorting.
 
-This fork has no WALL, Portal, torus or Caro rules. Contribution rules, risk classes and task tracking are described in [`Rapfi/CLAUDE.md`](Rapfi/CLAUDE.md) and [`Rapfi/docs/`](Rapfi/docs/README.md).
+
+## Contributions
+
+The work below is merged into this repository. Each item links to its task document, which records the design, the tests and the measurements.
+
+### Search features
+
++ **VCN attack-search mode** ([VCN](Rapfi/docs/todo/VCN-search-mode.md), [VCN-02](Rapfi/docs/todo/VCN-02-attack-search-quality.md)). Victory by Continuous N-level attack: the attacker must win while the defender may pass. Enabled with `INFO VCTHREAD 0..3` (Yixin GUI option) or the one-shot `YXVCN <2..4>`. VC4 searches full-board fours, and threat ordering cuts nodes by about 32%.
++ **VCN under the MCTS searcher** ([VCN-03](Rapfi/docs/todo/VCN-03-mcts-vcn.md)). Native VCN in MCTS: a defender pass edge, VC4/VC5 terminal rules and VCN-aware node keys. On a 27-position test set, alpha-beta proves 27 and MCTS proves 23, with no wrong answers from either.
++ **`YXANALZ` command** ([YXANALZ](Rapfi/docs/todo/YXANALZ-user-root-candidates.md)). Analyzes an explicit, user-supplied list of root moves instead of engine-generated candidates. Protocol details in [`Rapfi/docs/rules/YXANALZ-user-root-candidates.md`](Rapfi/docs/rules/YXANALZ-user-root-candidates.md).
++ **Explicit flex-four threat handling** ([SEARCH-01](Rapfi/docs/todo/SEARCH-01-oppo4-explicit-threat-node.md)). Razoring and futility rules for nodes facing a flex four are written out explicitly instead of depending on a sentinel value. Search output is unchanged.
+
+### MCTS memory and correctness
+
++ **Graph memory reduction** ([SEARCH-02](Rapfi/docs/todo/SEARCH-02-mcts-memory-growth.md), [SEARCH-03](Rapfi/docs/todo/SEARCH-03-mcts-default-memory-budget.md), [SEARCH-05](Rapfi/docs/todo/SEARCH-05-mcts-memory-config-validation.md)). Policy-mass edge cut, expansion delay and a default graph memory budget. The new default `mcts_edge_policy_mass = 0.99` lowers peak RSS from 431 MB to 195 MB at 2M nodes and plays at least as well as before on Standard and Renju.
++ **64-bit visit counters** ([SEARCH-08](Rapfi/docs/todo/SEARCH-08-mcts-64bit-visits.md)). 48-bit visits are packed into the existing 16-byte `Edge`. Long searches now run past 2^32 visits (tested to 1.8e10) with no change in memory size.
++ **Sound mate bounds under the edge cut** ([SEARCH-09](Rapfi/docs/todo/SEARCH-09-mcts-bound-under-edge-cut.md), [SEARCH-10](Rapfi/docs/todo/SEARCH-10-mcts-readd-cut-moves.md)). A node with cut moves is never proven lost from its kept children alone, and the cut moves are added back when every kept reply loses. A scan of 6084 positions found no false mates.
++ **Fixes** ([SEARCH-12](Rapfi/docs/todo/SEARCH-12-mcts-forced-root-policy-assert.md), [SEARCH-13](Rapfi/docs/todo/SEARCH-13-mcts-vcn-singular-root-stop.md), [SEARCH-14](Rapfi/docs/todo/SEARCH-14-mcts-brief-mode-result-line.md)). Fixed an assert abort when the root has a five or flex four. The singular-root early stop is skipped in VCN mode. MCTS now prints a result line in BRIEF message mode.
++ **Compact node table** ([PERF-03](Rapfi/docs/todo/PERF-03-mcts-node-table-footprint.md)). The `std::set` shards are replaced with tagged-pointer open addressing and a slab pool. Each node takes 75 bytes instead of 96, peak RSS drops 5.9%, and each visit costs 4-5% fewer cycles.
+
+### Performance
+
++ **Move-ordering speedups** ([PERF-01](Rapfi/docs/todo/PERF-01-movepick-branch-miss.md), [PERF-02](Rapfi/docs/todo/PERF-02-insertion-branch-sort.md)). An LSD radix sort in the middle branch and a branchless AVX-512 insertion branch of `fastPartialSort` give about +17% nodes per second on the built-in benchmark, with bit-identical results.
++ **VNNI signed-input affine layer** ([EVAL-01](Rapfi/docs/todo/EVAL-01-vnni-i8i8-input-bias.md)). NNUE evaluation uses a +128 input-bias trick, so one `vpdpbusd` replaces a sign-split sequence on VNNI builds.
++ **PGO builds** ([BUILD-01](Rapfi/docs/todo/BUILD-01-pgo-build.md)). Adds the `PGO_MODE` CMake option and `Rapfi/scripts/pgo_build.sh`, which give about +3.6% nodes per second over a plain release build.
+
+### Testing
+
++ **Unit tests** (`BUILD_TESTS`) covering root-move generation, move analysis, SIMD linear layers, VCN, move sorting, razoring and the MCTS node, edge and table code (228 tests at the time of writing).
+
+Task status and planned work are listed in [`Rapfi/TODO.md`](Rapfi/TODO.md). Process and design notes are in [`Rapfi/docs/`](Rapfi/docs/README.md).
 
 
 
