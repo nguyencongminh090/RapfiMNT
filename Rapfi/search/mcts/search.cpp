@@ -19,6 +19,7 @@
 #include "../../core/iohelper.h"
 #include "../../eval/eval.h"
 #include "../../eval/evaluator.h"
+#include "../../game/movegen.h"
 #include "../../game/wincheck.h"
 #include "../hashtable.h"
 #include "../opening.h"
@@ -29,6 +30,7 @@
 #include "searchtesting.h"
 
 #include <algorithm>
+#include <atomic>
 #include <limits>
 
 using namespace Search;
@@ -48,6 +50,9 @@ struct VcnContext
     VCNLevel level;     ///< The VCN level of every node of the chain
     Color    attacker;  ///< The VCN attacker
     HashKey  keyXor;    ///< Vcn::hashXor(options, level): VCF TT entries of this level only
+    /// When set, every attack-side node of the chain adds one here (the work measure of the
+    /// VCN pass-test solver, VCN-04). The search itself does not read it.
+    uint32_t *nodeCounter = nullptr;
 };
 
 // forward declaration
@@ -146,6 +151,9 @@ Value vcfsearch(Board            &board,
     // VCN: decided per node from the side to move (the level is constant along the chain)
     bool vcfOnly = false;
     if constexpr (VcnOn) {
+        if (vcn.nodeCounter)
+            ++*vcn.nodeCounter;
+
         const bool isAttacker = self == vcn.attacker;
         vcfOnly               = isAttacker && vcn.level == VCNLevel::VC4;
 
@@ -324,6 +332,503 @@ Value vcfdefend(Board            &board,
 
 }  // namespace SimpleVCF
 
+/// The VCN pass test (VCN-04, option G). Under MCTS the VCN defender has no pass edge: a pass is
+/// the statement "the attacker's last move carries no threat one level up", so it is answered
+/// here, when a defender leaf is first evaluated, by a solver on a position with a null move
+/// instead of by the network on a position where the attacker has moved twice.
+///
+/// Root level VC3: the question is the exact fours-only VCF (SimpleVCF at VC4).
+/// Root level VC2: the question is a VC3 (VCT) win of the attacker. Three answers; only NoThreat
+/// ends a node (in the defender's favour). Threat and Unknown leave an ordinary node, so a wrong
+/// or missing Threat can never create an attacker win.
+///
+/// No static or shared mutable state except the TT: evaluateNode runs on several threads.
+namespace VcnPassTest {
+
+using Search::MCTS::Testing::PassTestResult;
+
+/// Recursion limit of the solver (plies below its root); a line that reaches it is undecided.
+constexpr int MaxSolverDepth = 48;
+
+/// Last iteration of the solver: the largest number of quiet (non-four) attacker moves in a line.
+constexpr int MaxQuietMoves = 8;
+
+/// TT signature of a cached solver answer. The key is the VC3 key of the position XORed with a
+/// salt, so an entry of the VCF search (same TT) lives under another key; the fixed bound, depth
+/// and eval tag make an aliased entry of another kind fail the check instead of reading as a
+/// proof. Only proven answers are stored, never Unknown.
+constexpr HashKey CacheSalt     = 0x6A09E667F3BCC909ULL;
+constexpr Value   CacheTag      = Value(0x5A3C);
+constexpr int     CacheDepth    = 8;
+constexpr Value   CacheThreat   = Value(1);
+constexpr Value   CacheNoThreat = Value(-1);
+
+/// Number of cells where `side` makes a four or a five.
+inline int fourCellCount(const Board &board, Color side)
+{
+    return board.p4Count(side, E_BLOCK4) + board.p4Count(side, D_BLOCK4_PLUS)
+           + board.p4Count(side, C_BLOCK4_FLEX3) + board.p4Count(side, B_FLEX4)
+           + board.p4Count(side, A_FIVE);
+}
+
+/// Whether a stone on a cell of class `p4` makes a three (open or blocked) or a four on some
+/// line. Classes from K_BLOCK3 up hold a three or a four, except J_FLEX2_2X (two open twos, no
+/// three), which sits between them in the enum.
+constexpr bool makesThreeOrFour(Pattern4 p4)
+{
+    return p4 >= K_BLOCK3 && p4 != J_FLEX2_2X;
+}
+
+/// Number of cells where `side` makes a three (open or blocked) or a four.
+inline int threeOrFourCellCount(const Board &board, Color side)
+{
+    return board.p4Count(side, K_BLOCK3) + board.p4Count(side, I_BLOCK3_PLUS)
+           + board.p4Count(side, H_FLEX3) + board.p4Count(side, G_FLEX3_PLUS)
+           + board.p4Count(side, F_FLEX3_2X) + fourCellCount(board, side);
+}
+
+/// Renju black: a cell the pattern table marks FORBID may be a legal move that makes a three or
+/// a four (a false forbidden point), and whether it is legal can depend on stones elsewhere. The
+/// pattern-count shortcuts below are therefore not used while such a cell exists.
+inline bool hasPatternForbidCell(const Board &board, Rule rule, Color side)
+{
+    return rule == Rule::RENJU && side == BLACK && board.p4Count(BLACK, FORBID) > 0;
+}
+
+/// Stage 1, the static necessary condition. A VC3 win starts with a move after which the attacker
+/// has a four available (a four, or the first move of the VCF the move threatens). That four cell
+/// either exists now (class >= E_BLOCK4) or is made by the move, which then puts a third stone
+/// into a five-window of that line: a three (makesThreeOrFour). No such cell: no VC3 win.
+PassTestResult staticRule(const Board &board, Rule rule, Color attacker)
+{
+    if (threeOrFourCellCount(board, attacker) > 0 || hasPatternForbidCell(board, rule, attacker))
+        return PassTestResult::Unknown;
+    return PassTestResult::NoThreat;
+}
+
+struct Context
+{
+    const SearchOptions  &options;
+    Color                 attacker;
+    SimpleVCF::VcnContext vc3;       ///< VCF of either side inside the solver (level VC3)
+    SimpleVCF::VcnContext vc4;       ///< The exact fours-only VCF after a null move
+    HashKey               cacheXor;  ///< XORed into the zobrist key of a cached attacker node
+    int                   ply;       ///< Tree ply of the leaf (only indexes the VCF stack)
+    uint32_t              budget;    ///< Work the solver may do: stones placed plus VCF nodes
+    uint32_t              nodes    = 0;
+    uint32_t              vcfNodes = 0;      ///< Written by the VCF searches (nodeCounter)
+    bool                  aborted  = false;  ///< The budget ran out: the answer is Unknown
+    bool                  depthCut = false;  ///< This iteration left a line undecided
+
+    Context(const SearchOptions &options, int ply, uint32_t budget)
+        : options(options)
+        , attacker(options.vcnMode.attacker)
+        , vc3 {VCNLevel::VC3, attacker, Vcn::hashXor(options, VCNLevel::VC3), &vcfNodes}
+        , vc4 {VCNLevel::VC4, attacker, Vcn::hashXor(options, VCNLevel::VC4), &vcfNodes}
+        , cacheXor(vc3.keyXor ^ CacheSalt)
+        , ply(ply)
+        , budget(budget)
+    {}
+    Context(const Context &)            = delete;  // vc3 / vc4 point into this object
+    Context &operator=(const Context &) = delete;
+
+    /// Accounts for one stone; false (and aborted) when the budget is used up.
+    bool takeNode()
+    {
+        if (nodes >= budget) {
+            aborted = true;
+            return false;
+        }
+        nodes++;
+        return true;
+    }
+
+    /// Moves the nodes of the VCF searches run since the last call into the work count. A VCF
+    /// is never cut short (its result is exact and goes to the TT), so the count can pass the
+    /// budget by one VCF search; the next takeNode() then ends the solver.
+    void chargeVcf()
+    {
+        nodes += vcfNodes;
+        vcfNodes = 0;
+    }
+};
+
+inline bool cacheProbe(HashKey key, bool &attackerWins)
+{
+    Value value, eval;
+    bool  isPv;
+    Bound bound;
+    Pos   move;
+    int   depth;
+    if (!TT.probe(key, value, eval, isPv, bound, move, depth, 0))
+        return false;
+    if (bound != BOUND_EXACT || eval != CacheTag || depth != CacheDepth)
+        return false;
+    if (value != CacheThreat && value != CacheNoThreat)
+        return false;
+    attackerWins = value == CacheThreat;
+    return true;
+}
+
+inline void cacheStore(HashKey key, bool attackerWins)
+{
+    TT.store(key,
+             attackerWins ? CacheThreat : CacheNoThreat,
+             CacheTag,
+             false,
+             BOUND_EXACT,
+             Pos::NONE,
+             CacheDepth,
+             0);
+}
+
+/// Whether the board is at a point where the game is drawn (no win can be claimed either way).
+inline bool drawReached(const Board &board, const SearchOptions &options)
+{
+    return board.movesLeft() == 0 || board.nonPassMoveCount() >= options.maxMoves;
+}
+
+/// The exact answer to "after a null move of the defender (to move), does the attacker have a
+/// VCF?": the fours-only, whole-board VCF of the VC4 attacker, which has no stand-pat.
+/// @return The VCF value from the attacker's view on the board after the null move (absolute
+///     ply): a mate_in() value when the VCF exists, a mated_in() value when it does not.
+template <Rule R>
+Value vcfAfterNull(Board &board, Context &ctx)
+{
+    assert(board.sideToMove() != ctx.attacker);
+    board.move<R, Board::MoveType::NO_EVAL>(Pos::PASS);
+    Value value = SimpleVCF::vcf(R, board, ctx.ply + 1, ctx.vc4);
+    board.undo<R, Board::MoveType::NO_EVAL>();
+    ctx.chargeVcf();
+    return value;
+}
+
+/// The attacker moves that have to be looked at, written to `out` (room for MAX_MOVES): a
+/// superset of the admissible moves, cut only by conditions that are necessary for admissibility.
+///  - The defender threatens a five: only its block (any other move loses to the five).
+///  - The attacker has no four cell: a move that threatens a VCF must make the first four of
+///    that VCF possible, so it makes a three (makesThreeOrFour).
+///  - Otherwise every legal move: a quiet move can make an existing four work.
+/// Cells of the whole board are scanned, not only the candidate range.
+template <Rule R>
+uint32_t collectAttackerMoves(const Board &board, const Context &ctx, Pos *out)
+{
+    const Color attacker = ctx.attacker, defender = ~attacker;
+    const bool  renjuBlack    = R == Rule::RENJU && attacker == BLACK;
+    const bool  mustBlockFive = board.p4Count(defender, A_FIVE) > 0;
+    const bool  anyMove =
+        fourCellCount(board, attacker) > 0 || hasPatternForbidCell(board, R, attacker);
+
+    uint32_t n = 0;
+    FOR_EVERY_EMPTY_POS(&board, pos)
+    {
+        const Pattern4 p4 = board.pattern4(pos, attacker);
+        if (mustBlockFive) {
+            if (board.pattern4(pos, defender) != A_FIVE)
+                continue;
+        }
+        else if (!anyMove && !makesThreeOrFour(p4))
+            continue;
+        if (renjuBlack && p4 == FORBID && board.checkForbiddenPoint(pos))
+            continue;
+        out[n++] = pos;
+    }
+    return n;
+}
+
+/// Whether the attacker's last move (already on the board, defender to move) is admissible at
+/// VC3: it is a four, or the attacker has a VCF once the defender passes. Exact.
+template <Rule R>
+bool lastMoveAdmissible(Board &board, Context &ctx)
+{
+    const Color attacker = ctx.attacker, defender = ~attacker;
+    if (board.p4Count(attacker, A_FIVE))
+        return true;  // a four: the defender has to block
+    if (board.p4Count(defender, A_FIVE))
+        return false;  // the defender's five was not blocked
+    // A VCF starts with a four (cheap filter; not usable next to a pattern-forbidden cell)
+    if (fourCellCount(board, attacker) == 0 && !hasPatternForbidCell(board, R, attacker))
+        return false;
+    return vcfAfterNull<R>(board, ctx) >= VALUE_MATE_IN_MAX_PLY;
+}
+
+/// Result of a solver node, from the attacker's view.
+enum class Outcome : uint8_t {
+    NoWin,    ///< Proven: the attacker has no forced win here
+    Win,      ///< Proven: the attacker has a forced win here
+    Unknown,  ///< Not decided at this depth (ctx.depthCut) or the budget ran out (ctx.aborted)
+};
+
+template <Rule R>
+Outcome defenderLoses(Board &board, Context &ctx, int quietLeft, int depth);
+
+/// Attacker to move at VC3: is there a forced win? Each attacker move must be admissible, and
+/// every defender reply to it must lose. NoWin is a proof, so the move loop looks at every move
+/// of collectAttackerMoves().
+/// @param quietLeft How many more non-four attacker moves this line may hold (the iteration
+///     depth). Fours are always followed: their reply is forced.
+/// @param depth Plies below the solver root (bounds the recursion).
+template <Rule R>
+Outcome attackerWins(Board &board, Context &ctx, int quietLeft, int depth)
+{
+    assert(board.sideToMove() == ctx.attacker);
+
+    if (depth >= MaxSolverDepth || drawReached(board, ctx.options)) {
+        ctx.depthCut = true;
+        return Outcome::Unknown;
+    }
+
+    const HashKey key = board.zobristKey() ^ ctx.cacheXor;
+    if (bool cached; cacheProbe(key, cached))
+        return cached ? Outcome::Win : Outcome::NoWin;
+
+    // Immediate wins and losses. A double three is a win at VC3 (the defender's pass leaves a
+    // straight four one level up), so the full check is used, with the beta that admits the
+    // four-three and double-three rules under Renju.
+    if (Value value = quickWinCheck<R>(board, board.ply(), VALUE_MATE_IN_MAX_PLY, false);
+        value != VALUE_ZERO) {
+        const bool wins = value > VALUE_ZERO;
+        cacheStore(key, wins);
+        return wins ? Outcome::Win : Outcome::NoWin;
+    }
+
+    // A VCF is a win at every level. When the defender has a five this runs the forced block and
+    // the defender's own VCF after it: negative when the block is forbidden or that VCF wins.
+    const Value vcfValue = SimpleVCF::vcf(R, board, ctx.ply, ctx.vc3);
+    ctx.chargeVcf();
+    if (vcfValue >= VALUE_MATE_IN_MAX_PLY || vcfValue <= VALUE_MATED_IN_MAX_PLY) {
+        const bool wins = vcfValue > VALUE_ZERO;
+        cacheStore(key, wins);
+        return wins ? Outcome::Win : Outcome::NoWin;
+    }
+
+    Pos            moves[MAX_MOVES];
+    const uint32_t numMoves = collectAttackerMoves<R>(board, ctx, moves);
+    bool           unknown  = false;
+    for (uint32_t i = 0; i < numMoves; i++) {
+        if (!ctx.takeNode())
+            return Outcome::Unknown;
+
+        board.move<R, Board::MoveType::NO_EVAL>(moves[i]);
+        Outcome outcome = Outcome::NoWin;
+        if (lastMoveAdmissible<R>(board, ctx)) {
+            const bool isFour = board.p4Count(ctx.attacker, A_FIVE) > 0;
+            if (isFour)
+                outcome = defenderLoses<R>(board, ctx, quietLeft, depth + 1);
+            else if (quietLeft > 0)
+                outcome = defenderLoses<R>(board, ctx, quietLeft - 1, depth + 1);
+            else {
+                // An admissible quiet move beyond the iteration depth: not decided here
+                ctx.depthCut = true;
+                outcome      = Outcome::Unknown;
+            }
+        }
+        board.undo<R, Board::MoveType::NO_EVAL>();
+
+        if (ctx.aborted)
+            return Outcome::Unknown;
+        if (outcome == Outcome::Win) {
+            cacheStore(key, true);
+            return Outcome::Win;
+        }
+        unknown |= outcome == Outcome::Unknown;
+    }
+
+    if (unknown)
+        return Outcome::Unknown;
+    cacheStore(key, false);
+    return Outcome::NoWin;
+}
+
+/// Defender to move after an admissible attacker move: does every reply lose (Win), or does one
+/// reply leave the attacker without a win (NoWin)? A pass loses by admissibility, so only stones
+/// are tried. The reply lists are the ones the MCTS graph uses for this position (the only block
+/// of a five; the defences of an open three plus the defender's own fours; every candidate
+/// otherwise), generated without the picker, which would ask the evaluator for a policy on a
+/// board it was not told about. A reply list that misses a defence can only turn the answer into
+/// Win, which ends no node.
+template <Rule R>
+Outcome defenderLoses(Board &board, Context &ctx, int quietLeft, int depth)
+{
+    const Color attacker = ctx.attacker, defender = ~attacker;
+    assert(board.sideToMove() == defender);
+
+    if (depth >= MaxSolverDepth || drawReached(board, ctx.options)) {
+        ctx.depthCut = true;
+        return Outcome::Unknown;
+    }
+
+    // The defender's own immediate win refutes the attack; two attacker fives end it
+    if (Value value = quickWinCheck<R>(board, board.ply(), VALUE_MATE_IN_MAX_PLY, false);
+        value != VALUE_ZERO)
+        return value < VALUE_ZERO ? Outcome::Win : Outcome::NoWin;
+
+    ScoredMove  replies[MAX_MOVES];
+    ScoredMove *end;
+    if (board.p4Count(attacker, A_FIVE)) {
+        // One five to block (two or more were handled above)
+        end = generate<DEFEND_FIVE>(board, replies);
+    }
+    else {
+        // The defender's VCF wins the game
+        const Value vcfValue = SimpleVCF::vcf(R, board, ctx.ply, ctx.vc3);
+        ctx.chargeVcf();
+        if (vcfValue >= VALUE_MATE_IN_MAX_PLY)
+            return Outcome::NoWin;
+
+        if (board.p4Count(attacker, B_FLEX4)) {
+            end = generate<DEFEND_FOUR>(board, replies);
+            end = (R == Rule::RENJU ? generate<VCF | RULE_RENJU> : generate<VCF>)(board, end);
+        }
+        else {
+            // Blocks of the attacker's strongest cells first: a refutation is found sooner
+            end = generate<ALL>(board, replies);
+            for (ScoredMove *m = replies; m != end; m++)
+                m->score = Score(int(board.pattern4(m->pos, attacker)) * PATTERN4_NB
+                                 + int(board.pattern4(m->pos, defender)));
+            std::sort(replies, end, ScoredMove::ScoreComparator {});
+        }
+    }
+
+    bool unknown = false;
+    for (ScoredMove *m = replies; m != end; m++) {
+        if (R == Rule::RENJU && defender == BLACK && board.checkForbiddenPoint(m->pos))
+            continue;
+        if (!ctx.takeNode())
+            return Outcome::Unknown;
+
+        board.move<R, Board::MoveType::NO_EVAL>(m->pos);
+        const Outcome outcome = attackerWins<R>(board, ctx, quietLeft, depth + 1);
+        board.undo<R, Board::MoveType::NO_EVAL>();
+
+        if (ctx.aborted)
+            return Outcome::Unknown;
+        if (outcome == Outcome::NoWin)
+            return Outcome::NoWin;  // this reply holds
+        unknown |= outcome == Outcome::Unknown;
+    }
+
+    // Every reply loses (or there is no legal reply), unless one of them is not decided
+    return unknown ? Outcome::Unknown : Outcome::Win;
+}
+
+/// Stage 2, the bounded solver: the attacker is to move on `board` at VC3. Iterative deepening
+/// on the number of quiet attacker moves per line, so the budget goes to the short refutations
+/// first; proven nodes of one iteration are read from the cache by the next.
+template <Rule R>
+PassTestResult solve(Board &board, Context &ctx)
+{
+    if (ctx.budget == 0)
+        return PassTestResult::Unknown;
+
+    for (int quietMoves = 0; quietMoves <= MaxQuietMoves; quietMoves++) {
+        ctx.depthCut          = false;
+        const Outcome outcome = attackerWins<R>(board, ctx, quietMoves, 0);
+        if (ctx.aborted)
+            break;
+        if (outcome == Outcome::Win)
+            return PassTestResult::Threat;
+        if (outcome == Outcome::NoWin)
+            return PassTestResult::NoThreat;
+        if (!ctx.depthCut)
+            break;  // undecided for a reason more depth does not remove
+    }
+    return PassTestResult::Unknown;
+}
+
+PassTestResult
+solve(Board &board, const SearchOptions &options, int ply, uint32_t budget, uint32_t *nodesUsed)
+{
+    Context        ctx(options, ply, budget);
+    PassTestResult result = PassTestResult::Unknown;
+    switch (options.rule) {
+    case FREESTYLE: result = solve<FREESTYLE>(board, ctx); break;
+    case STANDARD: result = solve<STANDARD>(board, ctx); break;
+    case RENJU: result = solve<RENJU>(board, ctx); break;
+    default: break;
+    }
+    if (nodesUsed)
+        *nodesUsed = ctx.nodes;
+    return result;
+}
+
+#ifdef VCN_PASS_TEST_STATS
+/// Diagnostic build only (measurement of the stage 2 budget, VCN-04): outcome counters of the
+/// pass test, printed at the end of each search. Not compiled into a normal build.
+struct Stats
+{
+    std::atomic<uint64_t> vc3Tests {0}, vc3NoThreat {0};
+    std::atomic<uint64_t> vc2Tests {0}, vc2StaticNoThreat {0};
+    std::atomic<uint64_t> solverRuns {0}, solverNoThreat {0}, solverThreat {0}, solverNodes {0};
+
+    void print()
+    {
+        MESSAGEL("PassTest VC3 tests " << vc3Tests << " noThreat " << vc3NoThreat << " | VC2 tests "
+                                       << vc2Tests << " staticNoThreat " << vc2StaticNoThreat
+                                       << " | solver runs " << solverRuns << " noThreat "
+                                       << solverNoThreat << " threat " << solverThreat
+                                       << " unknown " << (solverRuns - solverNoThreat - solverThreat)
+                                       << " nodes " << solverNodes);
+        vc3Tests = vc3NoThreat = vc2Tests = vc2StaticNoThreat = 0;
+        solverRuns = solverNoThreat = solverThreat = solverNodes = 0;
+    }
+} stats;
+    #define PASS_TEST_STAT(statement) statement
+#else
+    #define PASS_TEST_STAT(statement)
+#endif
+
+/// The pass test of a defender leaf: defender to move, no attacker five, `level` the node level.
+/// @return The terminal value of the node (the defender, to move, wins by passing) when the
+///     attacker has no win one level up after a null move; VALUE_NONE when the node stays an
+///     ordinary node (a pass loses, or the answer is unknown).
+template <Rule R>
+Value defenderPassValue(Board &board, const SearchOptions &options, int ply, VCNLevel level)
+{
+    assert(board.sideToMove() != options.vcnMode.attacker);
+    assert(!board.p4Count(options.vcnMode.attacker, A_FIVE));
+
+    if (level == VCNLevel::VC3) {
+        // Exact: the value the pass child had as a VC4 attacker node, negated
+        Context ctx(options, ply, 0);
+        Value   value = vcfAfterNull<R>(board, ctx);
+        PASS_TEST_STAT(stats.vc3Tests++; stats.vc3NoThreat += value <= VALUE_MATED_IN_MAX_PLY);
+        return value <= VALUE_MATED_IN_MAX_PLY ? -value : VALUE_NONE;
+    }
+
+    if (level == VCNLevel::VC2) {
+        PassTestResult result = staticRule(board, R, options.vcnMode.attacker);
+        PASS_TEST_STAT(stats.vc2Tests++;
+                       stats.vc2StaticNoThreat += result == PassTestResult::NoThreat);
+        if (result == PassTestResult::Unknown && SearchCfg.mctsVcnPassTestNodes > 0) {
+            Context ctx(options, ply + 1, uint32_t(SearchCfg.mctsVcnPassTestNodes));
+            board.move<R, Board::MoveType::NO_EVAL>(Pos::PASS);
+            result = solve<R>(board, ctx);
+            board.undo<R, Board::MoveType::NO_EVAL>();
+            PASS_TEST_STAT(stats.solverRuns++; stats.solverNodes += ctx.nodes;
+                           stats.solverNoThreat += result == PassTestResult::NoThreat;
+                           stats.solverThreat += result == PassTestResult::Threat);
+        }
+        // The shortest line of a pass refutation at VC2: pass, a move without a threat, pass,
+        // and the VC4 attacker without a four is lost two plies later.
+        return result == PassTestResult::NoThreat ? mate_in(board.ply() + 5) : VALUE_NONE;
+    }
+
+    return VALUE_NONE;
+}
+
+Value defenderPassValue(Board &board, const SearchOptions &options, int ply, VCNLevel level)
+{
+    switch (options.rule) {
+    case FREESTYLE: return defenderPassValue<FREESTYLE>(board, options, ply, level);
+    case STANDARD: return defenderPassValue<STANDARD>(board, options, ply, level);
+    case RENJU: return defenderPassValue<RENJU>(board, options, ply, level);
+    default: return VALUE_NONE;
+    }
+}
+
+}  // namespace VcnPassTest
+
 namespace {
 
 /// Compute the Cpuct exploration factor for the given parent node visits.
@@ -498,51 +1003,15 @@ std::pair<Edge *, Node *> selectChild(Node &node, const Board &board, bool graph
     return {bestEdge, bestNode};
 }
 
-/// Puts the VCN defender's pass at its prior: P(pass) = SearchCfg.mctsVcnPassPrior, every board
-/// move's policy is scaled by (1 - prior), and the list is stably re-sorted by descending policy.
-/// The whole list is sorted, not only the pass placed: the picker sorts only its moves with a
-/// non-negative score, so the tail of its list is in no particular order (VCN-03 slice 3). The
-/// pass goes in after the board moves, so on a tie (prior 0) it sorts behind them.
-void applyVcnPassPrior(Pos *moveList, float *policyList, uint32_t numMoves, uint32_t passIndex)
-{
-    struct Entry
-    {
-        Pos   move;
-        float policy;
-    };
-    const float prior      = SearchCfg.mctsVcnPassPrior;
-    const float boardScale = 1.0f - prior;
-    Entry       entries[MAX_MOVES];
-    uint32_t    n = 0;
-    for (uint32_t i = 0; i < numMoves; i++)
-        if (i != passIndex)
-            entries[n++] = {moveList[i], policyList[i] * boardScale};
-    entries[n++] = {Pos::PASS, prior};
-    assert(n == numMoves);
-
-    std::stable_sort(entries, entries + n, [](const Entry &a, const Entry &b) {
-        return a.policy > b.policy;
-    });
-    for (uint32_t i = 0; i < n; i++) {
-        moveList[i]   = entries[i].move;
-        policyList[i] = entries[i].policy;
-    }
-}
-
 /// Generates the moves of a non-root node with their normalised policies, before the edge cut.
 /// Shared by expandNode<false> and widenNode, so a widen regenerates every kept edge (SEARCH-10).
-/// In VCN mode the defender may pass, under AB's rule: VCN on, the defender to move, and no
-/// attacker five (the picker itself never passes against a five or right after a pass). The pass
-/// gets its configured prior and the list is re-sorted (applyVcnPassPrior). With VCN off, and at
-/// VCN attacker nodes, the list is the picker's, exactly as before.
+/// The list is the picker's in every mode. In VCN mode the defender has no pass edge (VCN-04):
+/// its pass is a test made when the node is first evaluated (VcnPassTest), so every node of the
+/// graph is reached by stones only and no leaf is valued with an extra attacker move.
 /// @return The number of moves written to moveList / policyList.
 uint32_t
 generateNodeMoves(const Board &board, const SearchOptions &options, Pos *moveList, float *policyList)
 {
-    const bool vcnDefenderPass = options.vcnMode.enabled()
-                                 && board.sideToMove() != options.vcnMode.attacker
-                                 && !board.p4Count(options.vcnMode.attacker, A_FIVE);
-
     MovePicker mp(options.rule,
                   board,
                   MovePicker::ExtraArgs<MovePicker::MAIN> {
@@ -550,36 +1019,17 @@ generateNodeMoves(const Board &board, const SearchOptions &options, Pos *moveLis
                       {},
                       true,
                       PolicyTemperature,
-                      vcnDefenderPass,
                   });
 
     uint32_t numMoves = 0;
-    if (!vcnDefenderPass) {
-        while (Pos move = mp()) {
-            assert(mp.hasPolicyScore());
-            assert(mp.hasNormalizedPolicy());
-            moveList[numMoves]   = move;
-            policyList[numMoves] = mp.curMoveNormalizePolicy();
-            numMoves++;
-        }
-        return numMoves;
-    }
-
-    // The pass comes before any board move is scored, so it has no policy score of its own.
-    uint32_t passIndex = MAX_MOVES;
     while (Pos move = mp()) {
-        if (move == Pos::PASS)
-            passIndex = numMoves;
-        else {
-            assert(mp.hasPolicyScore());
-            assert(mp.hasNormalizedPolicy());
-        }
+        assert(move != Pos::PASS);
+        assert(mp.hasPolicyScore());
+        assert(mp.hasNormalizedPolicy());
         moveList[numMoves]   = move;
-        policyList[numMoves] = move == Pos::PASS ? 0.0f : mp.curMoveNormalizePolicy();
+        policyList[numMoves] = mp.curMoveNormalizePolicy();
         numMoves++;
     }
-    if (passIndex != MAX_MOVES)
-        applyVcnPassPrior(moveList, policyList, numMoves, passIndex);
     return numMoves;
 }
 
@@ -645,7 +1095,8 @@ void evaluateNode(Node &node, const SearchOptions &options, Board &board, int pl
             thisThread->selDepth = ply;
 
         // VCN mode (VCN-03 slice 4): the leaf rules of AB, in AB's order. The level comes from the
-        // defender passes since the root (slice 2); VCN off reads nothing here.
+        // defender passes since the root (slice 2); the graph holds no pass (VCN-04), so it is
+        // the root level at every node. VCN off reads nothing here.
         const bool vcnOn             = options.vcnMode.enabled();
         const Color vcnAttacker      = options.vcnMode.attacker;
         VCNLevel   vcnLevel          = VCNLevel::None;
@@ -712,6 +1163,23 @@ void evaluateNode(Node &node, const SearchOptions &options, Board &board, int pl
                 node.setTerminal(value);
                 return;
             }
+
+            // 7. The pass test (VCN-04): a VC2 / VC3 defender who faces no five and has no win
+            // of its own. There is no pass edge; instead, after a null move, does the attacker
+            // win one level up? If not, the defender wins by passing and the node ends here.
+            // Otherwise (a pass loses, or the VC2 answer is unknown) it is an ordinary node.
+            if (!vcnAttackerToMove && !board.p4Count(vcnAttacker, A_FIVE)
+                && (vcnLevel == VCNLevel::VC2 || vcnLevel == VCNLevel::VC3)) {
+                if (Value value = VcnPassTest::defenderPassValue(board, options, ply, vcnLevel);
+                    value != VALUE_NONE) {
+                    // Do not return mate that longer than maxMoves option
+                    if (mate_step(value, 0) > options.maxMoves)
+                        value = getDrawValue(board, options, board.ply());
+
+                    node.setTerminal(value);
+                    return;
+                }
+            }
         }
         // Search VCF
         else if (Value value = SimpleVCF::vcf(options.rule, board, ply); value != VALUE_ZERO) {
@@ -742,7 +1210,7 @@ void widenNode(Node &node, const SearchOptions &options, const Board &board)
     if (!oldEdges || !oldEdges->edgesCut() || searcher.graphClosed())
         return;
 
-    // The same move generation as expandNode<false> (the VCN pass included), without the cut
+    // The same move generation as expandNode<false>, without the cut
     Pos      moveList[MAX_MOVES];
     float    policyList[MAX_MOVES];
     uint32_t numMoves = generateNodeMoves(board, options, moveList, policyList);
@@ -1416,6 +1884,11 @@ const RootMove *MCTSSearcher::searchMain(SearchThread &th)
     // holds a pointer into a replaced edge array any more (SEARCH-10).
     freeRetiredEdgeArrays();
 
+#ifdef VCN_PASS_TEST_STATS
+    if (th.options().vcnMode.enabled())
+        VcnPassTest::stats.print();
+#endif
+
     // Rank root moves and record best move
     updateRootMovesData(th);
     ctx.printer.printRootMoves(th, ctx.timectl, scratch.numSelectableRootMoves);
@@ -1718,4 +2191,55 @@ Value Search::MCTS::Testing::simpleVcf(Board               &board,
         board,
         ply,
         SimpleVCF::VcnContext {level, options.vcnMode.attacker, Vcn::hashXor(options, level)});
+}
+
+Search::MCTS::Testing::PassTestResult
+Search::MCTS::Testing::vcnPassTestStatic(const Board &board, const SearchOptions &options)
+{
+    return VcnPassTest::staticRule(board, options.rule, options.vcnMode.attacker);
+}
+
+Search::MCTS::Testing::PassTestResult Search::MCTS::Testing::vctSolve(Board               &board,
+                                                                      const SearchOptions &options,
+                                                                      uint32_t  nodeBudget,
+                                                                      uint32_t *nodesUsed)
+{
+    return VcnPassTest::solve(board, options, 1, nodeBudget, nodesUsed);
+}
+
+namespace {
+
+template <Rule R>
+uint32_t vctAdmissibleMovesOf(Board &board, const SearchOptions &options, Pos *moveList)
+{
+    VcnPassTest::Context ctx(options, 1, 0);
+    Pos                  moves[MAX_MOVES];
+    const uint32_t       numMoves = VcnPassTest::collectAttackerMoves<R>(board, ctx, moves);
+    uint32_t             n        = 0;
+    for (uint32_t i = 0; i < numMoves; i++) {
+        board.move<R, Board::MoveType::NO_EVAL>(moves[i]);
+        if (VcnPassTest::lastMoveAdmissible<R>(board, ctx))
+            moveList[n++] = moves[i];
+        board.undo<R, Board::MoveType::NO_EVAL>();
+    }
+    return n;
+}
+
+}  // namespace
+
+uint32_t Search::MCTS::Testing::vctAdmissibleMoves(Board               &board,
+                                                   const SearchOptions &options,
+                                                   Pos                 *moveList)
+{
+    switch (options.rule) {
+    case FREESTYLE: return vctAdmissibleMovesOf<FREESTYLE>(board, options, moveList);
+    case STANDARD: return vctAdmissibleMovesOf<STANDARD>(board, options, moveList);
+    case RENJU: return vctAdmissibleMovesOf<RENJU>(board, options, moveList);
+    default: return 0;
+    }
+}
+
+HashKey Search::MCTS::Testing::vctCacheKey(const Board &board, const SearchOptions &options)
+{
+    return board.zobristKey() ^ VcnPassTest::Context(options, 0, 0).cacheXor;
 }

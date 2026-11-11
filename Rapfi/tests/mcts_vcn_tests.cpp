@@ -20,9 +20,13 @@
 // key at every key site, so VCN nodes never mix with ordinary nodes, other levels or the other
 // attacker, also across searches through graph reuse; with VCN off the key is the zobrist key.
 //
-// Slice 3 (pass edge and prior): the shared move generation of a non-root node is reached through
+// Slice 3 (move generation): the shared move generation of a non-root node is reached through
 // Search::MCTS::Testing::generateNodeMoves (search/mcts/searchtesting.h), on a board bound to the
-// engine's main thread with a stand-in evaluator.
+// engine's main thread with a stand-in evaluator. Slice 3 added a pass edge for the VCN defender;
+// VCN-04 removed it again, so these tests now pin "no pass edge, the ordinary list".
+//
+// VCN-04 (the pass is a test, not an edge): the pass test in evaluateNode (VC3 exact, VC2 static
+// rule and bounded VCT solver) and the solver itself, through the Testing forwarders.
 //
 // Slice 4 (VC4 / VC5 terminals): evaluateNode and SimpleVCF are reached through the Testing
 // forwarders; the AB cross-check and the smoke run drive both searchers directly.
@@ -366,9 +370,10 @@ void mctsVcn_afterVcnSearch_nextOrdinarySearchReusesNoVcnNode()
 }
 
 // ----------------------------------------------------------------------------------------------
-// VCN-03 slice 3: the defender's pass edge and its prior. The move generation of a non-root node
-// (expandNode<false> and widenNode share it) is reached through Testing::generateNodeMoves on a
-// board bound to the engine's main search thread, which holds a deterministic stand-in evaluator.
+// Move generation of a non-root node (expandNode<false> and widenNode share it), reached through
+// Testing::generateNodeMoves on a board bound to the engine's main search thread, which holds a
+// deterministic stand-in evaluator. VCN-03 slice 3 gave the VCN defender a pass edge here; VCN-04
+// removed it (the pass is a test in evaluateNode), so the list is the ordinary one in every mode.
 
 /// Stand-in policy with negative logits for part of the moves: the picker's insertion sort only
 /// orders moves with a score >= 0, so the list it returns has an unsorted tail.
@@ -453,6 +458,9 @@ std::unique_ptr<Board> boundBoard(SearchThread *th)
     return std::make_unique<Board>(*src, th);
 }
 
+/// The default of SearchConfig::mctsVcnPassTestNodes (VCN-04 stage 2, chosen by measurement).
+constexpr int DefaultPassTestNodes = 0;
+
 /// Restores SearchCfg on scope exit.
 struct ScopedSearchCfg
 {
@@ -460,57 +468,37 @@ struct ScopedSearchCfg
     ~ScopedSearchCfg() { SearchCfg = saved; }
 };
 
-void expandNode_vcnDefender_hasPassEdgeWithConfiguredPrior()
+/// Asserts that `l` holds no pass and is the VCN-off generation `plain`, move for move.
+void assertNoPassAndEqual(const MoveList &l, const MoveList &plain)
 {
-    // Arrange: white attacks, black (to move) defends; no five on the board.
-    MctsEngineFixture fx;
-    ScopedSearchCfg   cfg;
-    SearchCfg.mctsVcnPassPrior = 0.25f;
-    auto          board        = boundBoard(threadWithEvaluator(FREESTYLE));
-    SearchOptions opts         = vcnOptions(VCNLevel::VC3, WHITE);
-    assert(board->sideToMove() == BLACK);
-    MoveList plain = referenceMoves(*board, FREESTYLE);
-
-    // Act
-    MoveList l = nodeMoves(*board, opts);
-
-    // Assert: one pass edge with the configured prior; every board move is kept, scaled by 0.75.
-    int pass = l.indexOf(Pos::PASS);
-    assert(pass >= 0);
-    assert(l.policy[pass] == 0.25f);
-    assert(l.moves.size() == plain.moves.size() + 1);
-    for (size_t i = 0; i < plain.moves.size(); i++) {
-        int j = l.indexOf(plain.moves[i]);
-        assert(j >= 0 && j != pass);
-        assert(l.policy[j] == plain.policy[i] * (1.0f - 0.25f));
-    }
+    assert(l.indexOf(Pos::PASS) < 0);
+    assert(!l.moves.empty());
+    assert(l.moves == plain.moves);
+    assert(l.policy == plain.policy);
 }
 
-void expandNode_vcnDefender_edgesSortedByPolicyDescendingAndSumToOne()
+void expandNode_vcnDefender_noPassEdge()
 {
-    // Arrange: a policy with negative logits, so the picker's own list is not fully sorted.
+    // Arrange: white attacks, black (to move) defends; no five on the board. Both stand-in
+    // policies (the second leaves the picker's list with an unsorted tail), every root level.
     MctsEngineFixture fx;
-    ScopedSearchCfg   cfg;
-    SearchCfg.mctsVcnPassPrior = 0.25f;
-    auto          board        = boundBoard(threadWithEvaluator<SignedPolicyEvaluator>(FREESTYLE));
-    SearchOptions opts         = vcnOptions(VCNLevel::VC2, WHITE);
-    MoveList      plain        = referenceMoves(*board, FREESTYLE);
-    assert(!plain.sortedDescending());  // precondition: the unsorted tail exists
+    for (int k = 0; k < 2; k++) {
+        SearchThread *th = k == 0 ? threadWithEvaluator(FREESTYLE)
+                                  : threadWithEvaluator<SignedPolicyEvaluator>(FREESTYLE);
+        auto          board = boundBoard(th);
+        assert(board->sideToMove() == BLACK);
+        assert(!board->p4Count(WHITE, A_FIVE));
+        MoveList plain = referenceMoves(*board, FREESTYLE);
 
-    // Act
-    MoveList l = nodeMoves(*board, opts);
+        for (VCNLevel level : {VCNLevel::VC2, VCNLevel::VC3, VCNLevel::VC4}) {
+            SearchOptions opts = vcnOptions(level, WHITE);
 
-    // Assert
-    assert(l.indexOf(Pos::PASS) >= 0);
-    assert(l.sortedDescending());
-    assert(std::abs(l.sum() - 1.0f) < 1e-3f);
-    // The pass is not ahead of a board move with a higher policy, nor behind one with a lower.
-    int pass = l.indexOf(Pos::PASS);
-    for (int i = 0; i < int(l.moves.size()); i++) {
-        if (i < pass)
-            assert(l.policy[i] >= 0.25f);
-        if (i > pass)
-            assert(l.policy[i] <= 0.25f);
+            // Act
+            MoveList l = nodeMoves(*board, opts);
+
+            // Assert: the defender's list is the ordinary list (VCN-04: the pass is a test)
+            assertNoPassAndEqual(l, plain);
+        }
     }
 }
 
@@ -533,20 +521,16 @@ void expandNode_vcnDefenderFacingFive_noPassEdge()
     MoveList l = nodeMoves(board, opts);
 
     // Assert: no pass; the list is exactly the ordinary one.
-    assert(l.indexOf(Pos::PASS) < 0);
-    assert(l.moves == plain.moves);
-    assert(l.policy == plain.policy);
+    assertNoPassAndEqual(l, plain);
 }
 
-void expandNode_vcnDefenderFacingOpenThree_passEdgeAndSortedDefendList()
+void expandNode_vcnDefenderFacingOpenThree_noPassEdgeAndFullDefendList()
 {
     // Arrange: black (attacker) has an open three, so white (defender, to move) gets the picker's
     // DEFENDFOUR stage; the negative-logit policy exercises the unsorted-tail case there.
     MctsEngineFixture fx;
-    ScopedSearchCfg   cfg;
-    SearchCfg.mctsVcnPassPrior = 0.25f;
-    SearchThread *th  = threadWithEvaluator<SignedPolicyEvaluator>(FREESTYLE);
-    auto          src = std::make_unique<Board>(15, CandidateRange::SQUARE3_LINE4);
+    SearchThread     *th  = threadWithEvaluator<SignedPolicyEvaluator>(FREESTYLE);
+    auto              src = std::make_unique<Board>(15, CandidateRange::SQUARE3_LINE4);
     src->newGame(FREESTYLE);
     for (Pos p : {Pos(7, 6), Pos(0, 0), Pos(7, 7), Pos(0, 3), Pos(7, 8)})
         src->move(FREESTYLE, p);
@@ -554,17 +538,17 @@ void expandNode_vcnDefenderFacingOpenThree_passEdgeAndSortedDefendList()
     assert(board.sideToMove() == WHITE);
     assert(!board.p4Count(BLACK, A_FIVE));
     assert(board.p4Count(BLACK, B_FLEX4));
-    SearchOptions opts  = vcnOptions(VCNLevel::VC3, BLACK);
-    MoveList      plain = referenceMoves(board, FREESTYLE);
+    MoveList plain = referenceMoves(board, FREESTYLE);
 
-    // Act
-    MoveList l = nodeMoves(board, opts);
+    for (VCNLevel level : {VCNLevel::VC2, VCNLevel::VC3}) {
+        SearchOptions opts = vcnOptions(level, BLACK);
 
-    // Assert: the pass is offered against an open three; the list is sorted and sums to 1.
-    assert(l.indexOf(Pos::PASS) >= 0);
-    assert(l.moves.size() == plain.moves.size() + 1);
-    assert(l.sortedDescending());
-    assert(std::abs(l.sum() - 1.0f) < 1e-3f);
+        // Act
+        MoveList l = nodeMoves(board, opts);
+
+        // Assert: no pass against an open three; every defence of the ordinary list is there.
+        assertNoPassAndEqual(l, plain);
+    }
 }
 
 void expandNode_vcnAttacker_noPassEdge()
@@ -579,9 +563,7 @@ void expandNode_vcnAttacker_noPassEdge()
     MoveList l = nodeMoves(*board, opts);
 
     // Assert
-    assert(l.indexOf(Pos::PASS) < 0);
-    assert(l.moves == plain.moves);
-    assert(l.policy == plain.policy);
+    assertNoPassAndEqual(l, plain);
 }
 
 void expandNode_vcnOff_edgesUnchanged()
@@ -601,88 +583,62 @@ void expandNode_vcnOff_edgesUnchanged()
         MoveList l = nodeMoves(*board, opts);
 
         // Assert: same moves, policies and order as the pre-slice generation.
-        assert(!l.moves.empty());
-        assert(l.moves == plain.moves);
-        assert(l.policy == plain.policy);
+        assertNoPassAndEqual(l, plain);
     }
 }
 
-void expandNode_vcnDefenderPassPriorZero_passLastOrAbsentAndBoardPoliciesUnscaled()
+/// Renju, black to move with a real forbidden 3x3 point at (7,7): black (7,5) (7,6) and
+/// (5,7) (6,7); the white stones are far away.
+std::vector<Pos> renjuBlackForbiddenMoves()
 {
-    // Arrange: prior 0 keeps the pass (the move set stays the AB one) but places it last.
-    MctsEngineFixture fx;
-    ScopedSearchCfg   cfg;
-    SearchCfg.mctsVcnPassPrior = 0.0f;
-    auto          board        = boundBoard(threadWithEvaluator(FREESTYLE));
-    SearchOptions opts         = vcnOptions(VCNLevel::VC3, WHITE);
-    MoveList      plain        = referenceMoves(*board, FREESTYLE);
-
-    // Act
-    MoveList l = nodeMoves(*board, opts);
-
-    // Assert: pass last with policy 0, board policies bit-equal to the ordinary ones.
-    assert(l.moves.size() == plain.moves.size() + 1);
-    assert(l.moves.back() == Pos::PASS);
-    assert(l.policy.back() == 0.0f);
-    for (size_t i = 0; i < plain.moves.size(); i++) {
-        int j = l.indexOf(plain.moves[i]);
-        assert(j >= 0);
-        assert(l.policy[j] == plain.policy[i]);
-    }
-    assert(l.sortedDescending());
+    return {Pos(7, 5), Pos(0, 0), Pos(7, 6), Pos(0, 3), Pos(5, 7), Pos(0, 6), Pos(6, 7), Pos(0, 9)};
 }
 
-void expandNode_vcnDefenderRenjuBlack_passEdgeAndNoForbiddenMove()
+void expandNode_vcnDefenderRenjuBlack_noPassEdgeAndNoForbiddenMove()
 {
     // Arrange: Renju, black (to move) defends against white. Black has a forbidden 3x3 point.
     MctsEngineFixture fx;
     SearchThread     *th  = threadWithEvaluator(RENJU);
     auto              src = std::make_unique<Board>(15, CandidateRange::SQUARE3_LINE4);
     src->newGame(RENJU);
-    // Black (7,5) (7,6) and (5,7) (6,7): (7,7) makes a double three for black.
-    for (Pos p : {Pos(7, 5), Pos(0, 0), Pos(7, 6), Pos(0, 3), Pos(5, 7), Pos(0, 6), Pos(6, 7),
-                  Pos(0, 9)})
+    for (Pos p : renjuBlackForbiddenMoves())
         src->move(RENJU, p);
     Board board(*src, th);
     assert(board.sideToMove() == BLACK);
     assert(board.checkForbiddenPoint(Pos(7, 7)));
-    SearchOptions opts;
-    opts.rule             = {RENJU, GameRule::FREEOPEN};
-    opts.vcnMode.n        = VCNLevel::VC3;
-    opts.vcnMode.attacker = WHITE;
+    MoveList plain = referenceMoves(board, RENJU);
 
-    // Act
-    MoveList l = nodeMoves(board, opts);
+    for (VCNLevel level : {VCNLevel::VC2, VCNLevel::VC3}) {
+        SearchOptions opts;
+        opts.rule             = {RENJU, GameRule::FREEOPEN};
+        opts.vcnMode.n        = level;
+        opts.vcnMode.attacker = WHITE;
 
-    // Assert
-    assert(l.indexOf(Pos::PASS) >= 0);
-    assert(l.indexOf(Pos(7, 7)) < 0);
-    assert(l.sortedDescending());
-    assert(std::abs(l.sum() - 1.0f) < 1e-2f);  // the forbidden point keeps a share of softmax
+        // Act
+        MoveList l = nodeMoves(board, opts);
+
+        // Assert
+        assertNoPassAndEqual(l, plain);
+        assert(l.indexOf(Pos(7, 7)) < 0);
+    }
 }
 
-void widenNode_vcnDefenderCutNodeWithPassEdge_widensAndKeepsPass()
+void widenNode_vcnDefenderCutNode_noPassEdgeAfterWiden()
 {
-    // Arrange: a cut defender node from the shared generation, the pass among the kept edges.
+    // Arrange: a cut defender node from the shared generation.
     MctsEngineFixture fx;
-    ScopedSearchCfg   cfg;
-    SearchCfg.mctsVcnPassPrior = 0.25f;
-    auto             board     = boundBoard(threadWithEvaluator(FREESTYLE));
-    SearchOptions    opts      = vcnOptions(VCNLevel::VC3, WHITE);
-    MoveList         gen       = nodeMoves(*board, opts);
-    const EdgeLimits limits {0.5f, 2};
-    Node             parent(HashKey(100), 0);
+    auto              board = boundBoard(threadWithEvaluator(FREESTYLE));
+    SearchOptions     opts  = vcnOptions(VCNLevel::VC3, WHITE);
+    MoveList          gen   = nodeMoves(*board, opts);
+    const EdgeLimits  limits {0.5f, 2};
+    Node              parent(HashKey(100), 0);
     parent.setNonTerminal(0.0f, 0.1f);
     parent.createEdgesFrom(gen.moves.data(), gen.policy.data(), uint32_t(gen.moves.size()), limits,
                            nullptr);
     EdgeArray *old = parent.getEdges();
     assert(old && old->edgesCut());
-    bool passKept = false;
-    for (uint32_t i = 0; i < old->numEdges; i++)
-        passKept |= (*old)[i].getMove() == Pos::PASS;
-    assert(passKept);
 
-    // Every kept reply (the pass too) is a proven win for the attacker.
+    // Every kept reply is a proven win for the attacker.
     std::vector<std::unique_ptr<Node>> children;
     auto attach = [&](EdgeArray &edges, uint32_t from, Value v) {
         for (uint32_t i = from; i < edges.numEdges; i++) {
@@ -694,6 +650,9 @@ void widenNode_vcnDefenderCutNodeWithPassEdge_widensAndKeepsPass()
     };
     attach(*old, 0, mate_in(3));
     const uint32_t numKept = old->numEdges;
+    bool           passInOld = false;
+    for (uint32_t i = 0; i < old->numEdges; i++)
+        passInOld |= (*old)[i].getMove() == Pos::PASS;
     assert(parent.updateStats());  // widen needed
 
     // Act: widenNode's step, on the same generation.
@@ -706,86 +665,125 @@ void widenNode_vcnDefenderCutNodeWithPassEdge_widensAndKeepsPass()
                                           nullptr,
                                           retired);
 
-    // Assert: widened, the pass kept, and the node proves lost once the cut replies lose too.
+    // Assert: widened, no pass before or after, and the node proves lost once the added replies
+    // lose too (no pass edge is left to hold the proof open).
     assert(ok);
+    assert(!passInOld);
     EdgeArray *wide = parent.getEdges();
     assert(!wide->edgesCut() && wide->numEdges == full.moves.size());
-    passKept = false;
-    for (uint32_t i = 0; i < numKept; i++)
-        passKept |= (*wide)[i].getMove() == Pos::PASS && (*wide)[i].getVisits() == 1;
-    assert(passKept);
+    for (uint32_t i = 0; i < wide->numEdges; i++)
+        assert((*wide)[i].getMove() != Pos::PASS);
     attach(*wide, numKept, mate_in(5));
     assert(!parent.updateStats());
     assert(parent.getBound().isTerminal());
     assert(parent.getBound().upper == mated_in(5));
 }
 
-void config_mctsVcnPassPrior_parsedAndClamped()
+void config_mctsVcnPassTestNodes_parsedAndClamped()
 {
     // Arrange
     ScopedSearchCfg cfg;
-    assert(SearchConfig {}.mctsVcnPassPrior == 0.25f);
     auto load = [](const char *value) {
-        std::istringstream in(std::string("[search]\nmcts_vcn_pass_prior = ") + value + "\n");
+        std::istringstream in(std::string("[search]\nmcts_vcn_pass_test_nodes = ") + value + "\n");
         ScopedCoutCapture  cap;
         bool               ok = Config::loadConfig(in);
         assert(ok);
-        return SearchCfg.mctsVcnPassPrior;
+        return SearchCfg.mctsVcnPassTestNodes;
     };
 
-    // Act / Assert
-    assert(load("0.4") == 0.4f);
-    assert(load("0.0") == 0.0f);
-    assert(load("-0.3") == 0.0f);
-    float one = load("1.0");
-    assert(one < 1.0f && one > 0.999f);
-    float big = load("7.5");
-    assert(big < 1.0f && big > 0.999f);
-    assert(load("nan") == 0.0f);
+    // Act / Assert: the documented default, plain values, negative to 0, capped above
+    assert(SearchConfig {}.mctsVcnPassTestNodes == DefaultPassTestNodes);
+    assert(load("0") == 0);
+    assert(load("500") == 500);
+    assert(load("-3") == 0);
+    assert(load("1000000") == 1000000);
+    assert(load("5000000") == 1000000);
 }
 
-void searchNode_vcnDefenderPass_childKeyHasRaisedLevel()
+void config_oldMctsVcnPassPriorKey_ignoredWithoutError()
 {
-    // Arrange: black attacks from VC3 (side to move at the root).
-    MctsEngineFixture fx;
-    auto              board = makeBoard();
-    SearchOptions     vcn   = searchOptions(*board, 2000, VCNLevel::VC3);
-    assert(vcn.vcnMode.attacker == BLACK);
+    // Arrange: a config written for the pass edge (the key was removed by VCN-04)
+    ScopedSearchCfg    cfg;
+    const SearchConfig before = SearchCfg;
+    std::istringstream in("[search]\nmcts_vcn_pass_prior = 0.25\nmcts_min_edges = 9\n");
 
     // Act
-    runMctsSearch(*board, vcn);
+    bool ok;
+    {
+        ScopedCoutCapture cap;
+        ok = Config::loadConfig(in);
+    }
 
-    // Assert: every PASS child found in the graph has the VC4 key of its board.
-    const int                rootPasses = fx.searcher().scratch.rootDefenderPasses;
-    int                      passChildren = 0;
-    std::unordered_set<Node *> visited;
-    auto                       replay = makeBoard();
-    std::function<void(Node &)> walk  = [&](Node &node) {
-        if (!visited.insert(&node).second)
-            return;
-        EdgeArray *edges = node.getEdges();
-        if (!edges)
-            return;
-        for (uint32_t i = 0; i < edges->numEdges; i++) {
-            Node *child = (*edges)[i].getChild();
-            if (!child)
-                continue;
-            Pos move = (*edges)[i].getMove();
-            replay->move(FREESTYLE, move);
-            if (move == Pos::PASS) {
-                passChildren++;
-                assert(mctsNodeVcnLevel(*replay, vcn, rootPasses) > VCNLevel::VC3);
-                assert(child->getHash() == mctsNodeKey(*replay, vcn, rootPasses));
-                if (replay->passMoveCountOfSide(WHITE) == 1)
-                    assert(child->getHash()
-                           == (replay->zobristKey() ^ Vcn::hashXor(vcn, VCNLevel::VC4)));
-            }
-            walk(*child);
-            replay->undo(FREESTYLE);
+    // Assert: loads; the removed key changes nothing, the known key next to it is read
+    assert(ok);
+    assert(SearchCfg.mctsMinEdges == 9);
+    assert(SearchCfg.mctsVcnPassTestNodes == before.mctsVcnPassTestNodes);
+}
+
+/// Walks the graph below `node`, replaying the moves on `board`: counts the nodes and the edges
+/// that hold a pass, and asserts every node key is the key of its board at the root level.
+struct GraphWalk
+{
+    size_t nodes     = 0;
+    size_t passEdges = 0;
+};
+
+void walkGraph(Node                       &node,
+               Board                      &board,
+               const SearchOptions        &opts,
+               int                         rootDefenderPasses,
+               std::unordered_set<Node *> &visited,
+               GraphWalk                  &out)
+{
+    if (!visited.insert(&node).second)
+        return;
+    out.nodes++;
+    assert(node.getHash() == mctsNodeKey(board, opts, rootDefenderPasses));
+    assert(node.getHash() == (board.zobristKey() ^ Vcn::hashXor(opts, opts.vcnMode.n)));
+    EdgeArray *edges = node.getEdges();
+    if (!edges)
+        return;
+    for (uint32_t i = 0; i < edges->numEdges; i++) {
+        Pos move = (*edges)[i].getMove();
+        if (move == Pos::PASS) {
+            out.passEdges++;
+            continue;
         }
-    };
-    walk(*fx.searcher().graph.root);
-    assert(passChildren > 0);
+        Node *child = (*edges)[i].getChild();
+        if (!child)
+            continue;
+        board.move(FREESTYLE, move);
+        walkGraph(*child, board, opts, rootDefenderPasses, visited, out);
+        board.undo(FREESTYLE);
+    }
+}
+
+void mctsVcn_graphNeverContainsPassEdge()
+{
+    MctsEngineFixture fx;
+    for (VCNLevel level : {VCNLevel::VC2, VCNLevel::VC3}) {
+        // Arrange: black attacks from `level` (side to move at the root).
+        Search::Engine.clear(true);
+        auto          board = makeBoard();
+        SearchOptions vcn   = searchOptions(*board, 3000, level);
+        assert(vcn.vcnMode.attacker == BLACK);
+
+        // Act
+        runMctsSearch(*board, vcn);
+
+        // Assert: no pass edge anywhere; every node is at the root level.
+        auto                       replay = makeBoard();
+        std::unordered_set<Node *> visited;
+        GraphWalk                  walk;
+        walkGraph(*fx.searcher().graph.root,
+                  *replay,
+                  vcn,
+                  fx.searcher().scratch.rootDefenderPasses,
+                  visited,
+                  walk);
+        assert(walk.nodes > 10);
+        assert(walk.passEdges == 0);
+    }
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -1360,6 +1358,739 @@ void evaluateNode_vcnLeaves_matchAbSignAndMateClass()
     }
 }
 
+// ----------------------------------------------------------------------------------------------
+// VCN-04 (option G): the defender's pass is a test at defender leaves, not an edge. Root level
+// VC3: exact (null move, then the fours-only VCF). Root level VC2: the static rule (stage 1) and
+// the bounded VCT solver (stage 2, SearchCfg.mctsVcnPassTestNodes). Only "no threat" ends a node.
+
+using Testing::PassTestResult;
+
+/// quietMoves() plus a black stone that is on no common line with (7,7): black has no cell that
+/// makes a three or a four (it has cells that make two open twos, class J_FLEX2_2X, which is
+/// above K_BLOCK3 in the enum and holds no three). White (defender) to move.
+std::vector<Pos> quietDefenderMoves()
+{
+    return {Pos(7, 7), Pos(3, 3), Pos(10, 2)};
+}
+
+/// Black has two in a row on row 7; white stones are far away. White to move.
+std::vector<Pos> twoInRowDefenderMoves()
+{
+    return {Pos(7, 7), Pos(3, 3), Pos(8, 7)};
+}
+
+/// The same two in a row with black to move (the position after white's null move, with one more
+/// far white stone to keep the stone counts legal).
+std::vector<Pos> twoInRowAttackerMoves()
+{
+    return {Pos(7, 7), Pos(3, 3), Pos(8, 7), Pos(3, 12)};
+}
+
+/// Black has an open three on row 7, white (defender) to move.
+std::vector<Pos> openThreeDefenderMoves()
+{
+    return {Pos(7, 7), Pos(3, 3), Pos(8, 7), Pos(3, 12), Pos(9, 7)};
+}
+
+/// White (defender, to move) has an open three on row 3; the four black stones share no line.
+std::vector<Pos> defenderOpenThreeMoves()
+{
+    return alternateMoves({Pos(7, 7), Pos(10, 12), Pos(13, 5), Pos(0, 9)},
+                          {Pos(3, 3), Pos(4, 3), Pos(5, 3)});
+}
+
+/// Black to move with a double three at (5,5). White's three on the diagonal (7,6)-(9,8) is
+/// closed by black (11,10) and (5,4), so white (6,5) is a block four that also closes black's
+/// row three: the defender's refutation of the double three is a counter four.
+std::vector<Pos> doubleThreeCounterFourMoves()
+{
+    return alternateMoves({Pos(3, 5), Pos(4, 5), Pos(5, 3), Pos(5, 4), Pos(11, 10)},
+                          {Pos(7, 6), Pos(8, 7), Pos(9, 8), Pos(0, 14), Pos(14, 0)});
+}
+
+/// The control of the position above: the same black stones, white without the three.
+std::vector<Pos> doubleThreeNoCounterMoves()
+{
+    return alternateMoves({Pos(3, 5), Pos(4, 5), Pos(5, 3), Pos(5, 4), Pos(11, 10)},
+                          {Pos(14, 7), Pos(0, 0), Pos(14, 14), Pos(0, 14), Pos(14, 0)});
+}
+
+/// Black to move. Row 7: black (5,7) (6,7) (8,7) closed by white (4,7), so (7,7) is a block four
+/// and black has no VCF. Black (7,9) is alone on column 7: the quiet move (7,10) makes only a two
+/// there, yet after it the four at (7,7) also makes an open three on the column (a four-three).
+std::vector<Pos> quietMoveEnablesVcfMoves()
+{
+    return alternateMoves({Pos(5, 7), Pos(6, 7), Pos(8, 7), Pos(7, 9)},
+                          {Pos(4, 7), Pos(0, 0), Pos(14, 0), Pos(0, 14)});
+}
+
+struct BoardSnapshot
+{
+    HashKey  key;
+    int      ply;
+    Color    side;
+    int      passes[SIDE_NB];
+    Pos      lastMove;
+    uint16_t p4[SIDE_NB][PATTERN4_NB];
+
+    explicit BoardSnapshot(const Board &b)
+        : key(b.zobristKey())
+        , ply(b.ply())
+        , side(b.sideToMove())
+        , passes {b.passMoveCountOfSide(BLACK), b.passMoveCountOfSide(WHITE)}
+        , lastMove(b.getLastMove())
+    {
+        for (Color c : {BLACK, WHITE})
+            for (int p = 0; p < PATTERN4_NB; p++)
+                p4[c][p] = b.p4Count(c, Pattern4(p));
+    }
+
+    bool operator==(const BoardSnapshot &o) const
+    {
+        return key == o.key && ply == o.ply && side == o.side && passes[BLACK] == o.passes[BLACK]
+               && passes[WHITE] == o.passes[WHITE] && lastMove == o.lastMove
+               && std::memcmp(p4, o.p4, sizeof(p4)) == 0;
+    }
+};
+
+/// evaluateLeaf with the stage 2 budget set to `passTestNodes` for the call.
+LeafResult evaluateLeafWithBudget(MctsEngineFixture   &fx,
+                                  Board               &board,
+                                  const SearchOptions &opts,
+                                  int                  passTestNodes)
+{
+    ScopedSearchCfg cfg;
+    SearchCfg.mctsVcnPassTestNodes = passTestNodes;
+    return evaluateLeaf(fx, board, opts);
+}
+
+constexpr int LargeBudget = 200000;
+
+std::vector<Pos> admissibleMoves(Board &board, const SearchOptions &opts)
+{
+    Pos      moves[MAX_MOVES];
+    uint32_t n = Testing::vctAdmissibleMoves(board, opts, moves);
+    return std::vector<Pos>(moves, moves + n);
+}
+
+bool contains(const std::vector<Pos> &v, Pos p)
+{
+    return std::find(v.begin(), v.end(), p) != v.end();
+}
+
+// --- evaluateNode, root level VC3 (exact) --------------------------------------------------------
+
+void evaluateNode_vc3DefenderAttackerHasNoVcfAfterNull_defenderWinsTerminal()
+{
+    // Arrange: black (attacker) made a quiet move; white (defender) is to move at VC3.
+    MctsEngineFixture fx;
+    TT.clear();
+    auto board = leafBoard(FREESTYLE, quietDefenderMoves());
+    assert(board->sideToMove() == WHITE);
+    assert(!board->p4Count(BLACK, A_FIVE));
+    SearchOptions opts = leafOptions(FREESTYLE, VCNLevel::VC3, BLACK);
+
+    // The value of the old pass child: the VC4 VCF of the attacker after the defender's pass.
+    auto passed = leafBoard(FREESTYLE, quietDefenderMoves());
+    passed->move(FREESTYLE, Pos::PASS);
+    Value passChild = Testing::simpleVcf(*passed, opts, VCNLevel::VC4, 2);
+    assert(passChild <= VALUE_MATED_IN_MAX_PLY && "fixture: no VCF after the null move");
+    TT.clear();
+
+    // Act
+    LeafResult r = evaluateLeaf(fx, *board, opts);
+
+    // Assert: the defender wins by the pass test, with the negated value of the old pass child.
+    assert(r.terminal);
+    assert(r.value == -passChild);
+    assert(r.value == mate_in(board->ply() + 3));
+}
+
+void evaluateNode_vc3DefenderAttackerHasVcfAfterNull_notTerminal()
+{
+    // Arrange: black (attacker) has an open three; white (defender) is to move at VC3.
+    MctsEngineFixture fx;
+    TT.clear();
+    auto board = leafBoard(FREESTYLE, openThreeDefenderMoves());
+    assert(board->sideToMove() == WHITE);
+    assert(board->p4Count(BLACK, B_FLEX4));
+    SearchOptions opts = leafOptions(FREESTYLE, VCNLevel::VC3, BLACK);
+
+    // Act
+    LeafResult r = evaluateLeaf(fx, *board, opts);
+
+    // Assert: a pass loses to the open four, so the defender must answer: an ordinary node.
+    assert(!r.terminal);
+    assert(r.utility == Evaluation::computeEvaluatorValue(*board).winLossRate());
+}
+
+void evaluateNode_vc3DefenderFacingFive_noPassTest()
+{
+    // Arrange: black (attacker) has a four, white (defender) to move must block; VCN off is the
+    // reference (after the block black has no VCF, so the node takes the network value).
+    MctsEngineFixture fx;
+    for (VCNLevel level : {VCNLevel::VC2, VCNLevel::VC3}) {
+        TT.clear();
+        auto board = leafBoard(FREESTYLE, blackFourWhiteToMoveMoves());
+        assert(board->sideToMove() == WHITE);
+        assert(board->p4Count(BLACK, A_FIVE) == 1);
+        SearchOptions off = leafOptions(FREESTYLE, VCNLevel::None, BLACK);
+        SearchOptions vcn = leafOptions(FREESTYLE, level, BLACK);
+
+        // Act
+        LeafResult a = evaluateLeaf(fx, *board, off);
+        LeafResult b = evaluateLeafWithBudget(fx, *board, vcn, LargeBudget);
+
+        // Assert: a pass is no answer to a five, so the pass test does not run.
+        assert(!a.terminal && !b.terminal);
+        assert(a.utility == b.utility);
+    }
+}
+
+void evaluateNode_vc2DefenderHasOwnFlexFour_defenderWinStaysFromQuickWin()
+{
+    // Arrange: white (defender, to move) has an open three; black has nothing.
+    MctsEngineFixture fx;
+    TT.clear();
+    auto board = leafBoard(FREESTYLE, defenderOpenThreeMoves());
+    assert(board->sideToMove() == WHITE);
+    assert(board->p4Count(WHITE, B_FLEX4));
+    SearchOptions opts = leafOptions(FREESTYLE, VCNLevel::VC2, BLACK);
+
+    // Act
+    LeafResult r = evaluateLeafWithBudget(fx, *board, opts, 0);
+
+    // Assert: the defender's own win (rule 3) decides, with its value, not the pass-test value.
+    assert(r.terminal);
+    assert(r.value == mate_in(board->ply() + 3));
+}
+
+void evaluateNode_vc3AttackerToMove_noPassTest()
+{
+    // Arrange: quiet attacker leaves at VC2 and VC3: the test is for defender leaves only.
+    MctsEngineFixture fx;
+    for (VCNLevel level : {VCNLevel::VC2, VCNLevel::VC3}) {
+        TT.clear();
+        auto          board = leafBoard(FREESTYLE, quietMoves());
+        SearchOptions opts  = leafOptions(FREESTYLE, level, BLACK);
+        assert(board->sideToMove() == BLACK);
+
+        // Act
+        LeafResult r = evaluateLeafWithBudget(fx, *board, opts, LargeBudget);
+
+        // Assert
+        assert(!r.terminal);
+        assert(r.utility == Evaluation::computeEvaluatorValue(*board).winLossRate());
+    }
+}
+
+void evaluateNode_vc3PassTestMateBeyondMaxMoves_draw()
+{
+    // Arrange: the pass-test win would end after maxMoves (one stone is left to play).
+    MctsEngineFixture fx;
+    TT.clear();
+    auto          board = leafBoard(FREESTYLE, quietDefenderMoves());
+    SearchOptions opts  = leafOptions(FREESTYLE, VCNLevel::VC3, BLACK);
+    opts.maxMoves       = board->nonPassMoveCount() + 1;
+
+    // Act
+    LeafResult r = evaluateLeaf(fx, *board, opts);
+
+    // Assert: a draw, as rule 3 does for a mate longer than maxMoves
+    assert(r.terminal);
+    assert(r.value == getDrawValue(*board, opts, board->ply()));
+}
+
+void evaluateNode_vc3DefenderPassTest_agreesWithAbRootLoss()
+{
+    // Arrange: AB's answer for the quiet root at VC3 (the attacker loses: every move is refuted
+    // by a pass), then the MCTS defender leaf below a sample of root moves.
+    const Value ab = abVcnValue(quietMoves(), VCNLevel::VC3);
+    assert(ab <= VALUE_MATED_IN_MAX_PLY && "precondition: AB says the VC3 attacker loses");
+
+    MctsEngineFixture fx;
+    for (Pos rootMove : {Pos(8, 8), Pos(7, 8), Pos(10, 10), Pos(1, 13)}) {
+        TT.clear();
+        std::vector<Pos> moves = quietMoves();
+        moves.push_back(rootMove);
+        auto          board = leafBoard(FREESTYLE, moves);
+        SearchOptions opts  = leafOptions(FREESTYLE, VCNLevel::VC3, BLACK);
+        assert(board->sideToMove() == WHITE);
+
+        // Act
+        LeafResult r = evaluateLeaf(fx, *board, opts);
+
+        // Assert: the defender wins at the leaf, so the root move loses, as in AB
+        assert(mateClass(r.terminal, r.value) == MateClass::Win);
+    }
+}
+
+// --- evaluateNode, root level VC2 (static rule, solver) ------------------------------------------
+
+void evaluateNode_vc2DefenderAttackerHasNoThreeOrFourMove_defenderWinsTerminal()
+{
+    // Arrange: black (attacker) has two stones on no common line; stage 2 is off (budget 0).
+    MctsEngineFixture fx;
+    TT.clear();
+    auto board = leafBoard(FREESTYLE, quietDefenderMoves());
+    assert(board->sideToMove() == WHITE);
+    SearchOptions opts = leafOptions(FREESTYLE, VCNLevel::VC2, BLACK);
+
+    // Act
+    LeafResult r = evaluateLeafWithBudget(fx, *board, opts, 0);
+
+    // Assert: no move of the attacker can threaten a VCF, so a pass refutes the last move
+    assert(r.terminal);
+    assert(r.value == mate_in(board->ply() + 5));
+}
+
+void evaluateNode_vc2DefenderAttackerHasThreeMove_notEndedByStaticRule()
+{
+    // Arrange: black has two in a row (a three-making move exists); stage 2 is off.
+    MctsEngineFixture fx;
+    TT.clear();
+    auto          board = leafBoard(FREESTYLE, twoInRowDefenderMoves());
+    SearchOptions opts  = leafOptions(FREESTYLE, VCNLevel::VC2, BLACK);
+    assert(board->sideToMove() == WHITE);
+
+    // Act
+    LeafResult r = evaluateLeafWithBudget(fx, *board, opts, 0);
+
+    // Assert: unknown, so an ordinary node with the network value
+    assert(!r.terminal);
+    assert(r.utility == Evaluation::computeEvaluatorValue(*board).winLossRate());
+}
+
+void evaluateNode_vc2DefenderSolverProvesNoThreat_defenderWinsTerminal()
+{
+    // Arrange: the same two in a row, with the solver on: two in a row and one free move do not
+    // make a VC3 win.
+    MctsEngineFixture fx;
+    TT.clear();
+    auto          board = leafBoard(FREESTYLE, twoInRowDefenderMoves());
+    SearchOptions opts  = leafOptions(FREESTYLE, VCNLevel::VC2, BLACK);
+
+    // Act
+    LeafResult r = evaluateLeafWithBudget(fx, *board, opts, LargeBudget);
+
+    // Assert
+    assert(r.terminal);
+    assert(r.value == mate_in(board->ply() + 5));
+}
+
+void evaluateNode_vc2DefenderSolverThreatOrUnknown_notTerminal()
+{
+    MctsEngineFixture fx;
+    {  // Threat: black has an open three, a pass loses
+        TT.clear();
+        auto          board = leafBoard(FREESTYLE, openThreeDefenderMoves());
+        SearchOptions opts  = leafOptions(FREESTYLE, VCNLevel::VC2, BLACK);
+        LeafResult    r     = evaluateLeafWithBudget(fx, *board, opts, LargeBudget);
+        assert(!r.terminal);
+        assert(r.utility == Evaluation::computeEvaluatorValue(*board).winLossRate());
+    }
+    {  // Unknown: the budget runs out before the two-in-a-row position is decided
+        TT.clear();
+        auto          board = leafBoard(FREESTYLE, twoInRowDefenderMoves());
+        SearchOptions opts  = leafOptions(FREESTYLE, VCNLevel::VC2, BLACK);
+        LeafResult    r     = evaluateLeafWithBudget(fx, *board, opts, 3);
+        assert(!r.terminal);
+        assert(r.utility == Evaluation::computeEvaluatorValue(*board).winLossRate());
+    }
+}
+
+void evaluateNode_passTest_boardUnchanged()
+{
+    MctsEngineFixture fx;
+    struct Case
+    {
+        std::vector<Pos> moves;
+        VCNLevel         level;
+        int              budget;
+    };
+    const std::vector<Case> cases = {
+        {quietDefenderMoves(), VCNLevel::VC3, 0},               // VC3 terminal
+        {openThreeDefenderMoves(), VCNLevel::VC3, 0},           // VC3 not terminal
+        {quietDefenderMoves(), VCNLevel::VC2, 0},               // VC2 static
+        {twoInRowDefenderMoves(), VCNLevel::VC2, LargeBudget},  // VC2 solver proof
+        {twoInRowDefenderMoves(), VCNLevel::VC2, 3},            // VC2 solver budget out
+        {openThreeDefenderMoves(), VCNLevel::VC2, LargeBudget}, // VC2 solver threat
+    };
+    for (const Case &c : cases) {
+        // Arrange
+        TT.clear();
+        auto                board = leafBoard(FREESTYLE, c.moves);
+        SearchOptions       opts  = leafOptions(FREESTYLE, c.level, BLACK);
+        const BoardSnapshot before(*board);
+
+        // Act
+        evaluateLeafWithBudget(fx, *board, opts, c.budget);
+
+        // Assert
+        assert(BoardSnapshot(*board) == before);
+    }
+}
+
+// --- the static rule ----------------------------------------------------------------------------
+
+void vcnPassTestStatic_noThreeOrFourCell_noThreat()
+{
+    // Arrange: two black stones on no common line; (10,4) makes two open twos, no three
+    auto          board = plainBoard(FREESTYLE, quietDefenderMoves());
+    assert(board->pattern4(Pos(10, 4), BLACK) == J_FLEX2_2X && "fixture: a double two exists");
+    SearchOptions opts  = leafOptions(FREESTYLE, VCNLevel::VC2, BLACK);
+
+    // Act
+    PassTestResult r = Testing::vcnPassTestStatic(*board, opts);
+
+    // Assert
+    assert(r == PassTestResult::NoThreat);
+}
+
+void vcnPassTestStatic_threeMakingCell_unknown()
+{
+    // Arrange: two in a row; (9,7) makes an open three
+    auto board = plainBoard(FREESTYLE, twoInRowDefenderMoves());
+    assert(board->pattern4(Pos(9, 7), BLACK) >= K_BLOCK3);
+    SearchOptions opts = leafOptions(FREESTYLE, VCNLevel::VC2, BLACK);
+
+    // Act
+    PassTestResult r = Testing::vcnPassTestStatic(*board, opts);
+
+    // Assert
+    assert(r == PassTestResult::Unknown);
+}
+
+void vcnPassTestStatic_renjuBlackAttackerForbidCell_unknown()
+{
+    // Arrange: Renju, black attacks and has a pattern-forbidden cell
+    auto board = plainBoard(RENJU, renjuBlackForbiddenMoves());
+    assert(board->p4Count(BLACK, FORBID) > 0);
+    SearchOptions opts = leafOptions(RENJU, VCNLevel::VC2, BLACK);
+
+    // Act
+    PassTestResult r = Testing::vcnPassTestStatic(*board, opts);
+
+    // Assert
+    assert(r == PassTestResult::Unknown);
+}
+
+// --- the bounded VCT solver ---------------------------------------------------------------------
+
+struct SolveResult
+{
+    PassTestResult result;
+    uint32_t       nodes;
+};
+
+SolveResult solve(Board &board, const SearchOptions &opts, uint32_t budget)
+{
+    uint32_t       nodes = 12345;
+    PassTestResult r     = Testing::vctSolve(board, opts, budget, &nodes);
+    return {r, nodes};
+}
+
+void vctSolve_openThreeAttacker_threat()
+{
+    // Arrange: black to move with an open three
+    MctsEngineFixture fx;
+    TT.clear();
+    auto          board = leafBoard(FREESTYLE, openThreeMoves());
+    SearchOptions opts  = leafOptions(FREESTYLE, VCNLevel::VC2, BLACK);
+
+    // Act
+    SolveResult r = solve(*board, opts, 100);
+
+    // Assert
+    assert(r.result == PassTestResult::Threat);
+}
+
+void vctSolve_doubleThreeAttacker_threat()
+{
+    // Arrange: black to move with a double three, white has no four
+    MctsEngineFixture fx;
+    TT.clear();
+    auto          board = leafBoard(FREESTYLE, doubleThreeNoCounterMoves());
+    SearchOptions opts  = leafOptions(FREESTYLE, VCNLevel::VC2, BLACK);
+    assert(board->pattern4(Pos(5, 5), BLACK) == F_FLEX3_2X);
+
+    // Act
+    SolveResult r = solve(*board, opts, 100);
+
+    // Assert
+    assert(r.result == PassTestResult::Threat);
+}
+
+void vctSolve_quietPosition_noThreat()
+{
+    // Arrange: one black stone
+    MctsEngineFixture fx;
+    TT.clear();
+    auto          board = leafBoard(FREESTYLE, quietMoves());
+    SearchOptions opts  = leafOptions(FREESTYLE, VCNLevel::VC2, BLACK);
+
+    // Act
+    SolveResult r = solve(*board, opts, 100);
+
+    // Assert: no move can threaten a VCF; decided without placing a stone (the only work is
+    // the VCF probe of the root)
+    assert(r.result == PassTestResult::NoThreat);
+    assert(r.nodes <= 2);
+}
+
+void vctSolve_twoInRow_noThreatWithinBudget()
+{
+    // Arrange: black to move with two in a row
+    MctsEngineFixture fx;
+    TT.clear();
+    auto          board = leafBoard(FREESTYLE, twoInRowAttackerMoves());
+    SearchOptions opts  = leafOptions(FREESTYLE, VCNLevel::VC2, BLACK);
+
+    // Act
+    SolveResult r = solve(*board, opts, LargeBudget);
+
+    // Assert
+    std::printf("  vctSolve two-in-a-row: %u nodes\n", r.nodes);
+    assert(r.result == PassTestResult::NoThreat);
+    assert(r.nodes > 0 && r.nodes < uint32_t(LargeBudget));
+}
+
+void vctSolve_budgetZero_unknown()
+{
+    // Arrange
+    MctsEngineFixture fx;
+    TT.clear();
+    auto          board = leafBoard(FREESTYLE, openThreeMoves());
+    SearchOptions opts  = leafOptions(FREESTYLE, VCNLevel::VC2, BLACK);
+
+    // Act
+    SolveResult r = solve(*board, opts, 0);
+
+    // Assert: stage 2 is off
+    assert(r.result == PassTestResult::Unknown);
+    assert(r.nodes == 0);
+}
+
+void vctSolve_budgetExhausted_unknown()
+{
+    // Arrange
+    MctsEngineFixture fx;
+    TT.clear();
+    auto          board = leafBoard(FREESTYLE, twoInRowAttackerMoves());
+    SearchOptions opts  = leafOptions(FREESTYLE, VCNLevel::VC2, BLACK);
+
+    // Act
+    SolveResult r = solve(*board, opts, 3);
+
+    // Assert: the work count stops at the budget, plus at most the last VCF search
+    assert(r.result == PassTestResult::Unknown);
+    assert(r.nodes >= 3 && r.nodes <= 3 + 16);
+}
+
+void vctSolve_defenderCounterFourRefutes_noThreatOrUnknownNeverThreat()
+{
+    // Arrange: the double three and the defender's counter four; the control has no counter
+    MctsEngineFixture fx;
+    TT.clear();
+    auto          board   = leafBoard(FREESTYLE, doubleThreeCounterFourMoves());
+    SearchOptions opts    = leafOptions(FREESTYLE, VCNLevel::VC2, BLACK);
+    assert(board->sideToMove() == BLACK);
+    assert(board->pattern4(Pos(5, 5), BLACK) == F_FLEX3_2X && "fixture: double three");
+    assert(board->pattern4(Pos(6, 5), WHITE) >= E_BLOCK4 && "fixture: counter four");
+    assert(!board->p4Count(WHITE, B_FLEX4) && "fixture: white's three is closed");
+
+    // Act
+    SolveResult r = solve(*board, opts, 3000);
+
+    // Assert: never a proven threat
+    std::printf("  vctSolve counter-four: result %d, %u nodes\n", int(r.result), r.nodes);
+    assert(r.result != PassTestResult::Threat);
+}
+
+void vctSolve_quietMoveEnablesVcf_isCandidate()
+{
+    // Arrange: black has a four cell and no VCF; (7,10) makes only a two
+    MctsEngineFixture fx;
+    TT.clear();
+    auto          board = leafBoard(FREESTYLE, quietMoveEnablesVcfMoves());
+    SearchOptions opts  = leafOptions(FREESTYLE, VCNLevel::VC2, BLACK);
+    SearchOptions vc4   = leafOptions(FREESTYLE, VCNLevel::VC4, BLACK);
+    assert(board->sideToMove() == BLACK);
+    assert(board->pattern4(Pos(7, 7), BLACK) >= E_BLOCK4 && "fixture: a four cell exists");
+    assert(board->pattern4(Pos(7, 10), BLACK) < K_BLOCK3 && "fixture: the move is quiet");
+    assert(Testing::simpleVcf(*board, vc4, VCNLevel::VC4, 1) <= VALUE_MATED_IN_MAX_PLY
+           && "fixture: no VCF yet");
+    TT.clear();
+
+    // Act
+    std::vector<Pos> admissible = admissibleMoves(*board, opts);
+    SolveResult      r          = solve(*board, opts, 2000);
+
+    // Assert: the quiet move is searched (candidates are every legal move that passes the exact
+    // test, not a pattern shortlist), so the position is not declared free of threats
+    assert(contains(admissible, Pos(7, 10)));
+    assert(r.result != PassTestResult::NoThreat);
+}
+
+void vctAdmissibleMoves_fourAndVcfThreatOnly()
+{
+    // Arrange: black to move with two in a row
+    MctsEngineFixture fx;
+    TT.clear();
+    auto                board = leafBoard(FREESTYLE, twoInRowAttackerMoves());
+    SearchOptions       opts  = leafOptions(FREESTYLE, VCNLevel::VC2, BLACK);
+    const BoardSnapshot before(*board);
+
+    // Act
+    std::vector<Pos> admissible = admissibleMoves(*board, opts);
+
+    // Assert: the moves that make an open three are in; quiet moves are out; all legal
+    assert(contains(admissible, Pos(9, 7)));
+    assert(contains(admissible, Pos(6, 7)));
+    assert(!contains(admissible, Pos(7, 8)));
+    assert(!contains(admissible, Pos(12, 3)));
+    for (Pos p : admissible)
+        assert(board->isInBoard(p) && board->isEmpty(p));
+    assert(BoardSnapshot(*board) == before);
+}
+
+void vctSolve_attackerMustBlockFive_onlyBlockConsidered()
+{
+    // Arrange: white (defender) has a four; black (attacker) must block at (6,2), which makes
+    // no threat
+    MctsEngineFixture fx;
+    TT.clear();
+    auto          board = leafBoard(FREESTYLE, whiteFourBlackToMoveMoves());
+    SearchOptions opts  = leafOptions(FREESTYLE, VCNLevel::VC2, BLACK);
+    assert(board->p4Count(WHITE, A_FIVE) == 1);
+
+    // Act
+    std::vector<Pos> admissible = admissibleMoves(*board, opts);
+    SolveResult      r          = solve(*board, opts, 1000);
+
+    // Assert: nothing but the block may be searched; the block is no threat, so no win
+    for (Pos p : admissible)
+        assert(p == Pos(6, 2));
+    assert(r.result == PassTestResult::NoThreat);
+    assert(r.nodes <= 8);
+}
+
+void vctSolve_provenResultCached_secondCallUsesNoNodes()
+{
+    // Arrange
+    MctsEngineFixture fx;
+    TT.clear();
+    auto          board = leafBoard(FREESTYLE, twoInRowAttackerMoves());
+    SearchOptions opts  = leafOptions(FREESTYLE, VCNLevel::VC2, BLACK);
+
+    // Act
+    SolveResult first  = solve(*board, opts, LargeBudget);
+    SolveResult second = solve(*board, opts, LargeBudget);
+
+    // Assert
+    assert(first.result == PassTestResult::NoThreat && first.nodes > 0);
+    assert(second.result == PassTestResult::NoThreat);
+    assert(second.nodes == 0);
+}
+
+void vctSolve_unknownNotCachedAsProof_largerBudgetStillProves()
+{
+    // Arrange
+    MctsEngineFixture fx;
+    TT.clear();
+    auto          board = leafBoard(FREESTYLE, twoInRowAttackerMoves());
+    SearchOptions opts  = leafOptions(FREESTYLE, VCNLevel::VC2, BLACK);
+
+    // Act
+    SolveResult small = solve(*board, opts, 3);
+    SolveResult again = solve(*board, opts, 3);
+    SolveResult large = solve(*board, opts, LargeBudget);
+
+    // Assert: an exhausted budget leaves no proof behind
+    assert(small.result == PassTestResult::Unknown);
+    assert(again.result == PassTestResult::Unknown);
+    assert(large.result == PassTestResult::NoThreat);
+}
+
+void vctSolve_foreignTtEntryUnderCacheKey_ignored()
+{
+    MctsEngineFixture fx;
+    {  // Arrange: a VCF-shaped "win" planted under the cache key of a quiet position
+        TT.clear();
+        auto          board = leafBoard(FREESTYLE, quietMoves());
+        SearchOptions opts  = leafOptions(FREESTYLE, VCNLevel::VC2, BLACK);
+        const HashKey key   = Testing::vctCacheKey(*board, opts);
+        assert(key != board->zobristKey());
+        assert(key != (board->zobristKey() ^ Vcn::hashXor(opts, VCNLevel::VC3)));
+        TT.store(key, mate_in(board->ply() + 9), VALUE_NONE, true, BOUND_EXACT, Pos::NONE,
+                 (int)DEPTH_QVCF, 0);
+
+        // Act
+        SolveResult r = solve(*board, opts, 100);
+
+        // Assert: computed, not read
+        assert(r.result == PassTestResult::NoThreat);
+    }
+    {  // A VCF-shaped "loss" under the cache key of a won position
+        TT.clear();
+        auto          board = leafBoard(FREESTYLE, openThreeMoves());
+        SearchOptions opts  = leafOptions(FREESTYLE, VCNLevel::VC2, BLACK);
+        TT.store(Testing::vctCacheKey(*board, opts), mated_in(board->ply() + 2), VALUE_NONE, true,
+                 BOUND_EXACT, Pos::NONE, (int)DEPTH_QVCF, 0);
+
+        SolveResult r = solve(*board, opts, 100);
+
+        assert(r.result == PassTestResult::Threat);
+    }
+    TT.clear();
+}
+
+void vctSolve_boardUnchanged()
+{
+    MctsEngineFixture fx;
+    struct Case
+    {
+        std::vector<Pos> moves;
+        uint32_t         budget;
+    };
+    const std::vector<Case> cases = {{twoInRowAttackerMoves(), uint32_t(LargeBudget)},
+                                     {twoInRowAttackerMoves(), 3},
+                                     {doubleThreeCounterFourMoves(), 500},
+                                     {quietMoveEnablesVcfMoves(), 50},
+                                     {openThreeMoves(), 100}};
+    for (const Case &c : cases) {
+        // Arrange
+        TT.clear();
+        auto                board = leafBoard(FREESTYLE, c.moves);
+        SearchOptions       opts  = leafOptions(FREESTYLE, VCNLevel::VC2, BLACK);
+        const BoardSnapshot before(*board);
+
+        // Act
+        solve(*board, opts, c.budget);
+
+        // Assert
+        assert(BoardSnapshot(*board) == before);
+    }
+}
+
+void vctSolve_renjuBlackAttacker_forbiddenMoveNotCandidate()
+{
+    // Arrange: Renju, black (attacker) to move; (7,7) is a real double-three forbidden point
+    MctsEngineFixture fx;
+    TT.clear();
+    auto          board = leafBoard(RENJU, renjuBlackForbiddenMoves());
+    SearchOptions opts  = leafOptions(RENJU, VCNLevel::VC2, BLACK);
+    assert(board->sideToMove() == BLACK);
+    assert(board->checkForbiddenPoint(Pos(7, 7)));
+
+    // Act
+    std::vector<Pos> admissible = admissibleMoves(*board, opts);
+
+    // Assert: the forbidden point is not a move; a legal three-making move is
+    assert(!contains(admissible, Pos(7, 7)));
+    assert(contains(admissible, Pos(7, 4)));
+}
+
 /// VCN-on smoke run through the searcher (not the protocol): root result of a fixed-node MCTS
 /// VCN search next to AB's answer. Informational, except that a proven MCTS win AB does not
 /// confirm is a failure. RAPFI_VCN_SMOKE_NODES overrides the node count.
@@ -1571,42 +2302,31 @@ void mctsVcn_vc4_attackerWithoutVcf_loses()
     assert(Search::Engine.main()->rootMoves[0].value <= VALUE_MATED_IN_MAX_PLY);
 }
 
-/// §7 slice 5: at VC3 a quiet attacker is refuted by a defender pass; the refutation is in the PV.
-void mctsVcn_vc3_attackerWithoutThreat_defenderPassRefutes()
+/// A VC3 attacker whose moves carry no VCF threat loses: the pass test ends every defender leaf
+/// (VCN-04). No pass is played in the graph, so no PV holds one.
+void mctsVcn_vc3_attackerWithoutThreat_losesByPassTestNoPassInPv()
 {
     MctsEngineFixture fx;
     resetProtocolForMcts(quietMoves(), ProtocolNodes);
     runYxvcnCaptured(3);
-    const auto &rm = Search::Engine.main()->rootMoves[0];
-    assert(rm.value <= VALUE_MATED_IN_MAX_PLY);
-    assert(rm.pv.size() >= 2 && rm.pv[1] == Pos::PASS);
+    const auto &rootMoves = Search::Engine.main()->rootMoves;
+    assert(rootMoves[0].value <= VALUE_MATED_IN_MAX_PLY);
+    for (const auto &rm : rootMoves)
+        assert(std::count(rm.pv.begin(), rm.pv.end(), Pos::PASS) == 0);
 }
 
-void extractPV_mctsVcnPassInLine_printsPassLikeAb()
+/// A quiet VC2 root: no pass in any PV and no proven attacker win.
+void mctsVcn_vc2_quietRoot_noPassInPvAndNoProvenWin()
 {
-    // Arrange: the AB answer to the same query, printed by the shared formatter
-    ScopedNormalMessages messages;
-    resetProtocolForMcts(quietMoves(), 0);
-    std::string abOut = runYxvcnCaptured(3);
-    std::vector<Pos> abPv = Search::Engine.main()->rootMoves[0].pv;
-    assert(std::count(abPv.begin(), abPv.end(), Pos::PASS) > 0 && "precondition: AB PV has a pass");
-    assert(abOut.find(movesText(abPv)) != std::string::npos);
-
     MctsEngineFixture fx;
     resetProtocolForMcts(quietMoves(), ProtocolNodes);
-
-    // Act
-    std::string out = runYxvcnCaptured(3);
-
-    // Assert: the MCTS PV holds a PASS, printed as AB prints it ("Pass" between moves), on the
-    // root-move line; no other move is garbage (every entry is PASS or an on-board cell)
-    std::vector<Pos> pv = Search::Engine.main()->rootMoves[0].pv;
-    assert(std::count(pv.begin(), pv.end(), Pos::PASS) > 0);
-    for (Pos p : pv)
-        assert(p == Pos::PASS || GP::board->isInBoard(p));
-    std::string text = movesText(pv);
-    assert(text.find("Pass") != std::string::npos);
-    assert(out.find("| " + text) != std::string::npos);
+    std::string out = runYxvcnCaptured(2);
+    const auto &rootMoves = Search::Engine.main()->rootMoves;
+    assert(out.find("ERROR") == std::string::npos);
+    assert(!rootMoves.empty());
+    assert(rootMoves[0].value < VALUE_MATE_IN_MAX_PLY);
+    for (const auto &rm : rootMoves)
+        assert(std::count(rm.pv.begin(), rm.pv.end(), Pos::PASS) == 0);
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -1988,18 +2708,17 @@ void runMctsVcnTests()
     RUN_ENGINE_TEST(setupRootNode_samePositionVcnToggled_rebuildsRoot);
     RUN_ENGINE_TEST(mctsVcn_afterVcnSearch_nextOrdinarySearchReusesNoVcnNode);
 
-    // VCN-03 slice 3: pass edge and prior
-    RUN_PURE_TEST(config_mctsVcnPassPrior_parsedAndClamped);
-    RUN_ENGINE_TEST(expandNode_vcnDefender_hasPassEdgeWithConfiguredPrior);
-    RUN_ENGINE_TEST(expandNode_vcnDefender_edgesSortedByPolicyDescendingAndSumToOne);
+    // Move generation of a non-root node: no pass edge in any mode (VCN-04)
+    RUN_PURE_TEST(config_mctsVcnPassTestNodes_parsedAndClamped);
+    RUN_PURE_TEST(config_oldMctsVcnPassPriorKey_ignoredWithoutError);
+    RUN_ENGINE_TEST(expandNode_vcnDefender_noPassEdge);
     RUN_ENGINE_TEST(expandNode_vcnDefenderFacingFive_noPassEdge);
-    RUN_ENGINE_TEST(expandNode_vcnDefenderFacingOpenThree_passEdgeAndSortedDefendList);
+    RUN_ENGINE_TEST(expandNode_vcnDefenderFacingOpenThree_noPassEdgeAndFullDefendList);
     RUN_ENGINE_TEST(expandNode_vcnAttacker_noPassEdge);
     RUN_ENGINE_TEST(expandNode_vcnOff_edgesUnchanged);
-    RUN_ENGINE_TEST(expandNode_vcnDefenderPassPriorZero_passLastOrAbsentAndBoardPoliciesUnscaled);
-    RUN_ENGINE_TEST(expandNode_vcnDefenderRenjuBlack_passEdgeAndNoForbiddenMove);
-    RUN_ENGINE_TEST(widenNode_vcnDefenderCutNodeWithPassEdge_widensAndKeepsPass);
-    RUN_ENGINE_TEST(searchNode_vcnDefenderPass_childKeyHasRaisedLevel);
+    RUN_ENGINE_TEST(expandNode_vcnDefenderRenjuBlack_noPassEdgeAndNoForbiddenMove);
+    RUN_ENGINE_TEST(widenNode_vcnDefenderCutNode_noPassEdgeAfterWiden);
+    RUN_ENGINE_TEST(mctsVcn_graphNeverContainsPassEdge);
 
     // VCN-03 slice 4: VC4 / VC5 terminals
     RUN_PURE_TEST(quickWinCheckRuntime_vcfOnlyFlag_matchesTemplate);
@@ -2018,14 +2737,46 @@ void runMctsVcnTests()
     RUN_ENGINE_TEST(evaluateNode_vcnLeaves_matchAbSignAndMateClass);
     RUN_ENGINE_TEST(mctsVcn_smokeVsAb_noMateAbRefutes);
 
-    // VCN-03 slice 5: YXVCN under MCTS through the protocol, PV with PASS
+    // VCN-04: the pass test at defender leaves (VC3 exact, VC2 static rule and solver)
+    RUN_ENGINE_TEST(evaluateNode_vc3DefenderAttackerHasNoVcfAfterNull_defenderWinsTerminal);
+    RUN_ENGINE_TEST(evaluateNode_vc3DefenderAttackerHasVcfAfterNull_notTerminal);
+    RUN_ENGINE_TEST(evaluateNode_vc3DefenderFacingFive_noPassTest);
+    RUN_ENGINE_TEST(evaluateNode_vc2DefenderHasOwnFlexFour_defenderWinStaysFromQuickWin);
+    RUN_ENGINE_TEST(evaluateNode_vc3AttackerToMove_noPassTest);
+    RUN_ENGINE_TEST(evaluateNode_vc3PassTestMateBeyondMaxMoves_draw);
+    RUN_ENGINE_TEST(evaluateNode_vc3DefenderPassTest_agreesWithAbRootLoss);
+    RUN_ENGINE_TEST(evaluateNode_vc2DefenderAttackerHasNoThreeOrFourMove_defenderWinsTerminal);
+    RUN_ENGINE_TEST(evaluateNode_vc2DefenderAttackerHasThreeMove_notEndedByStaticRule);
+    RUN_ENGINE_TEST(evaluateNode_vc2DefenderSolverProvesNoThreat_defenderWinsTerminal);
+    RUN_ENGINE_TEST(evaluateNode_vc2DefenderSolverThreatOrUnknown_notTerminal);
+    RUN_ENGINE_TEST(evaluateNode_passTest_boardUnchanged);
+    RUN_PURE_TEST(vcnPassTestStatic_noThreeOrFourCell_noThreat);
+    RUN_PURE_TEST(vcnPassTestStatic_threeMakingCell_unknown);
+    RUN_PURE_TEST(vcnPassTestStatic_renjuBlackAttackerForbidCell_unknown);
+    RUN_ENGINE_TEST(vctSolve_openThreeAttacker_threat);
+    RUN_ENGINE_TEST(vctSolve_doubleThreeAttacker_threat);
+    RUN_ENGINE_TEST(vctSolve_quietPosition_noThreat);
+    RUN_ENGINE_TEST(vctSolve_twoInRow_noThreatWithinBudget);
+    RUN_ENGINE_TEST(vctSolve_budgetZero_unknown);
+    RUN_ENGINE_TEST(vctSolve_budgetExhausted_unknown);
+    RUN_ENGINE_TEST(vctSolve_defenderCounterFourRefutes_noThreatOrUnknownNeverThreat);
+    RUN_ENGINE_TEST(vctSolve_quietMoveEnablesVcf_isCandidate);
+    RUN_ENGINE_TEST(vctAdmissibleMoves_fourAndVcfThreatOnly);
+    RUN_ENGINE_TEST(vctSolve_attackerMustBlockFive_onlyBlockConsidered);
+    RUN_ENGINE_TEST(vctSolve_provenResultCached_secondCallUsesNoNodes);
+    RUN_ENGINE_TEST(vctSolve_unknownNotCachedAsProof_largerBudgetStillProves);
+    RUN_ENGINE_TEST(vctSolve_foreignTtEntryUnderCacheKey_ignored);
+    RUN_ENGINE_TEST(vctSolve_boardUnchanged);
+    RUN_ENGINE_TEST(vctSolve_renjuBlackAttacker_forbiddenMoveNotCandidate);
+
+    // VCN-03 slice 5: YXVCN under MCTS through the protocol (VCN-04: no pass in the graph or PV)
     RUN_ENGINE_TEST(yxvcn_mctsSearcher_runsVcnSearchAndRestoresLevel);
     RUN_ENGINE_TEST(mctsVcn_vc2Vc3Vc4_farVcfAttacker_mates);
     RUN_ENGINE_TEST(mctsVcn_doubleThreeAfterForcedPair_vc3WinsVc4Loses);
     RUN_ENGINE_TEST(yxvcn_mctsSearcher_vc4FarVcf_printsMateAndBestmoveNotPass);
     RUN_ENGINE_TEST(mctsVcn_vc4_attackerWithoutVcf_loses);
-    RUN_ENGINE_TEST(mctsVcn_vc3_attackerWithoutThreat_defenderPassRefutes);
-    RUN_ENGINE_TEST(extractPV_mctsVcnPassInLine_printsPassLikeAb);
+    RUN_ENGINE_TEST(mctsVcn_vc3_attackerWithoutThreat_losesByPassTestNoPassInPv);
+    RUN_ENGINE_TEST(mctsVcn_vc2_quietRoot_noPassInPvAndNoProvenWin);
 
     // SEARCH-12: ROOT picker policy flag on forced roots
     RUN_PURE_TEST(movePickerRoot_opponentFive_normalizedPolicy_hasPolicyScore);

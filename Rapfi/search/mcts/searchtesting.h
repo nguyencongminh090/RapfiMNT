@@ -65,4 +65,35 @@ void evaluateNode(Node &node, const SearchOptions &options, Board &board, int pl
 /// ordinary search). Returns the VCF value (VALUE_ZERO when nothing is found by the plain VCF).
 Value simpleVcf(Board &board, const SearchOptions &options, VCNLevel level, int ply);
 
+/// Answer of the VCN pass test (VCN-04): "after a null move by the defender, does the attacker win
+/// one level up?". Only NoThreat ends a node; Threat and Unknown leave it an ordinary node.
+enum class PassTestResult : uint8_t {
+    Unknown,   ///< Not decided (no budget, budget exhausted, or outside the static rule)
+    Threat,    ///< Proven: the attacker wins at the next level
+    NoThreat,  ///< Proven: the attacker does not win at the next level
+};
+
+/// The static necessary condition of the VC2 pass test (VCN-04 stage 1) for the attacker in
+/// `options`: NoThreat when the attacker has no cell that makes a three or a four, else Unknown.
+/// Reads the board only; the side to move does not matter.
+PassTestResult vcnPassTestStatic(const Board &board, const SearchOptions &options);
+
+/// The bounded VCT solver of the VC2 pass test (VCN-04 stage 2): does the attacker in `options`,
+/// to move on `board` at level VC3, have a forced win? `nodeBudget` is the work the solver may
+/// do: stones it places plus nodes of the VCF searches it runs (0: Unknown at once). `nodesUsed`,
+/// when given, receives the work done; it can pass the budget by one VCF search.
+/// The board must be bound to a search thread; it is restored on return.
+PassTestResult vctSolve(Board               &board,
+                        const SearchOptions &options,
+                        uint32_t             nodeBudget,
+                        uint32_t            *nodesUsed = nullptr);
+
+/// The attacker moves the solver searches at `board` (attacker to move, level VC3): every legal
+/// move that is a four or after which the exact VC4 VCF exists once the defender passes. Written
+/// to `moveList` (room for MAX_MOVES); returns the count. The board is restored on return.
+uint32_t vctAdmissibleMoves(Board &board, const SearchOptions &options, Pos *moveList);
+
+/// The TT key under which vctSolve caches the proven answer of `board` (attacker to move).
+HashKey vctCacheKey(const Board &board, const SearchOptions &options);
+
 }  // namespace Search::MCTS::Testing

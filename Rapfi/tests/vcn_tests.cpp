@@ -541,6 +541,45 @@ void quickWinCheck_fourThree_vcfOnly_stillWin()
     assert(v == mate_in(5));
 }
 
+// VCN-04. Black to move has a four-three at (6,5): block four on row 5 (closed by white (2,5)),
+// flex three on column 6. Its only block, (7,5), is also the flex-four square of white's open
+// three on column 7, so white's forced block makes a straight four and white wins.
+std::unique_ptr<Board> fourThreeBlockedByFlexFourBoard()
+{
+    auto board = makeBoard(FREESTYLE,
+                           alternate({Pos(3, 5), Pos(4, 5), Pos(5, 5), Pos(6, 3), Pos(6, 4)},
+                                     {Pos(2, 5), Pos(7, 6), Pos(7, 7), Pos(7, 8), Pos(14, 14)}));
+    assert(board->sideToMove() == BLACK);
+    assert(board->pattern4(Pos(6, 5), BLACK) == C_BLOCK4_FLEX3 && "fixture: (6,5) four-three");
+    assert(board->p4Count(BLACK, C_BLOCK4_FLEX3) == 1 && "fixture: the only four-three");
+    assert(board->p4Count(BLACK, A_FIVE) + board->p4Count(BLACK, B_FLEX4) == 0);
+    assert(board->pattern4(Pos(7, 5), WHITE) == B_FLEX4 && "fixture: the block is a flex four");
+    return board;
+}
+
+void quickWinCheck_fourThreeBlockIsOpponentFlexFour_noWin()
+{
+    // Arrange
+    auto board = fourThreeBlockedByFlexFourBoard();
+
+    // The line the win claim stands on: black four, white's forced block. White then has two
+    // five squares and black none, so black has lost.
+    board->move(FREESTYLE, Pos(6, 5));
+    assert(board->stateInfo().lastPattern4(BLACK, A_FIVE) == Pos(7, 5));
+    board->move(FREESTYLE, Pos(7, 5));
+    assert(board->p4Count(BLACK, A_FIVE) == 0 && board->p4Count(WHITE, A_FIVE) == 2);
+    board->undo(FREESTYLE);
+    board->undo(FREESTYLE);
+
+    // Act
+    Value dflt    = quickWinCheck<FREESTYLE>(*board, 0);
+    Value vcfOnly = quickWinCheck<FREESTYLE>(*board, 0, VALUE_INFINITE, true);
+
+    // Assert: no win for black may be reported
+    assert(dflt == VALUE_ZERO);
+    assert(vcfOnly == VALUE_ZERO);
+}
+
 void quickWinCheck_flexFour_vcfOnly_stillWin()
 {
     // Arrange: the open three on row 7 gives black a flex four
@@ -860,6 +899,7 @@ void runVcnTests()
     RUN_TEST(quickWinCheck_doubleThree_default_reportsWin);
     RUN_TEST(quickWinCheck_doubleThree_vcfOnly_noWin);
     RUN_TEST(quickWinCheck_fourThree_vcfOnly_stillWin);
+    RUN_TEST(quickWinCheck_fourThreeBlockIsOpponentFlexFour_noWin);
     RUN_TEST(quickWinCheck_flexFour_vcfOnly_stillWin);
     RUN_TEST(vcnSearch_vc4_doubleThreeAfterForcedBlock_attackerLoses);
     RUN_TEST(vcnSearch_vc3_doubleThreeAfterForcedBlock_attackerWins);
