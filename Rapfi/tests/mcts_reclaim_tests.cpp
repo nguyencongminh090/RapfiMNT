@@ -967,10 +967,10 @@ void search_reclaimOnLongSearch_graphRefillsAndSecondPassRuns()
     assert(s.graphMemoryUsed.load() == fx.liveFootprint());
 }
 
-void searchConfig_defaultReclaimTargetPercent_isZero()
+void searchConfig_defaultReclaimTargetPercent_isFifty()
 {
     Search::SearchConfig cfg;
-    assert(cfg.mctsReclaimTargetPercent == 0);
+    assert(cfg.mctsReclaimTargetPercent == 50);
 }
 
 }  // namespace
@@ -1025,5 +1025,5 @@ void runMctsReclaimTests()
     RUN_TEST(search_reclaimOnSmallBudgetFourThreads_passRunsAndCountersMatchLiveFootprint);
     RUN_TEST(search_reclaimOnUnboundedGraph_noPass);
     RUN_TEST(search_reclaimOnLongSearch_graphRefillsAndSecondPassRuns);
-    RUN_TEST(searchConfig_defaultReclaimTargetPercent_isZero);
+    RUN_TEST(searchConfig_defaultReclaimTargetPercent_isFifty);
 }

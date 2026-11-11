@@ -29,6 +29,7 @@
 #include "../search/mcts/nodetable.h"
 #include "../search/mcts/searcher.h"
 #include "../search/searchcommon.h"
+#include "../search/searchconfig.h"
 #include "../search/searchengine.h"
 #include "../search/searchthread.h"
 
@@ -856,9 +857,13 @@ void recycleOldNodes_afterMoveForward_noShardKeepsSlabWithoutLiveNode()
 void recycleOldNodes_budgetRunAfterSlabRelease_graphClosedFollowsLiveFootprint()
 {
     // Arrange: a budget small enough that search 1 closes the graph, then go forward two moves.
+    // Reclaim inside a search (SEARCH-16) is off, so that the graph is still closed when
+    // search 1 ends.
     NodeTableEngineFixture fx;
     MCTSSearcher          &s = fx.searcher();
     s.setMemoryLimit(512);
+    int savedReclaimPercent                    = Search::SearchCfg.mctsReclaimTargetPercent;
+    Search::SearchCfg.mctsReclaimTargetPercent = 0;
     auto board = makeBoard();
     runSearch(*board, 20000);
     bool closedAfterFirst = s.graphClosed();
@@ -875,6 +880,7 @@ void recycleOldNodes_budgetRunAfterSlabRelease_graphClosedFollowsLiveFootprint()
     bool   slabBound = noShardHasMoreSlabsThanNodes(*s.nodeTable);
     size_t gmu       = s.graphMemoryUsed.load();
     s.setMemoryLimit(0);  // the fixture copies the limit into the next searcher
+    Search::SearchCfg.mctsReclaimTargetPercent = savedReclaimPercent;
     assert(closedAfterFirst);
     assert(gmu == live);
     assert(closed == expected);

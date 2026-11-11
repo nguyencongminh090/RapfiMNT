@@ -51,8 +51,9 @@ struct SearchConfig
     int mctsExpandMinVisits = 1;
     /// Reclaim inside a search (SEARCH-16): when the graph closes, low-visit nodes are turned
     /// back into leaves and unreachable nodes are erased until the graph is at this percentage
-    /// of its soft limit. 0 = off (the graph stays closed until the next search).
-    int mctsReclaimTargetPercent = 0;
+    /// of its soft limit. 0 = off (the graph stays closed until the next search). 50 is the
+    /// default: it wins self-play at small budgets and ran a 30 minute 8 GB search (SEARCH-16).
+    int mctsReclaimTargetPercent = 50;
     /// Non-root nodes keep the leading edges until their cumulative policy reaches this
     /// mass; 1 keeps every edge (SEARCH-02). 0.99 is the default: it ties 1.0 where memory is
     /// not binding and wins where it is (SEARCH-05).

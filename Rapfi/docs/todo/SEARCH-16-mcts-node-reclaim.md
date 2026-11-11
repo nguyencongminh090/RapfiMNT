@@ -1,7 +1,7 @@
 # SEARCH-16 — MCTS: keep the search useful after the graph memory budget is full
 
-**Status:** option 5 implemented 2026-11-11 behind `mcts_reclaim_target_percent` (default `0` = off), not
-committed; measured, see "Results". Open: the user's decision on the default value.
+**Status:** done 2026-11-11. Option 5 implemented; `mcts_reclaim_target_percent` default `50` (user
+decision after the measurements in "Results"; `0` gives the old closed-graph behaviour).
 **Class:** B (search behaviour on budget-limited runs; unbounded runs must stay byte-identical).
 
 ## Problem
@@ -359,3 +359,14 @@ Nine passes, at 156, 271, 377, 470, 568, 730, 867, 990 and 1114 s:
 - Budgets where the graph does not fill: the key cannot act there (no pass runs), so no leg.
 - Other target percentages (30, 70; configs are in `build/search16/run/`), freestyle, VCN mode.
 - Pondering and `YXHASHCLEAR`-style commands during a pass.
+
+### Default changed to 50 (user decision, 2026-11-11)
+
+`mctsReclaimTargetPercent` default `0` -> `50`. The user decided against a further VCN run before
+the change. Consequences: a budget-limited MCTS search that fills its graph now differs from the
+previous binary; a search that never closes the graph and the alpha-beta bench do not. Tests
+319/319 (asserts live; `searchConfig_defaultReclaimTargetPercent_isFifty` replaces test 47, and
+`recycleOldNodes_budgetRunAfterSlabRelease_graphClosedFollowsLiveFootprint` sets the key to 0
+because it needs a graph that is still closed after the search); bench gcc Release
+`17621937 / 8c1f72e5`. Not re-run after this one-line change: PGO build, sanitizers, self-play
+(the self-play legs already compare 50 against 0).
