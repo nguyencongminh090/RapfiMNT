@@ -316,9 +316,46 @@ not the value of the open search.
 
 No game was lost on time or by a crash in either leg.
 
+### Long search: 8 GB, 30 min asked, 8 threads, item 6 position, key 50 (commit a83d406)
+
+`logs/rc50_8g_30m.log` against `build/vcn04/logs/ord_30m.log` (the VCN-04 binary, same position
+and limits, graph closed from about 150 s). Both searches ended at 1129 s and played F9.
+
+| Time | Key 50: win rate | Visits | n/ms | Closed graph: win rate | n/ms |
+|---|---|---|---|---|---|
+| 120 s | 51.68 % | 45M | 381 | 50.72 % | 337 |
+| 240 s | 49.69 % | 147M | 615 | 58.19 % | 3444 |
+| 480 s | 49.72 % | 250M | 522 | — | — |
+| 720 s | 51.47 % | 404M | 562 | — | — |
+| 960 s | 51.57 % | 591M | 615 | — | — |
+| end (1129 s) | 51.30 % | 740M | 655 | 58.55 % | 8389 |
+
+Nine passes, at 156, 271, 377, 470, 568, 730, 867, 990 and 1114 s:
+
+| Pass | Threshold (visits <=) | Trimmed | Erased | MB before -> after |
+|---|---|---|---|---|
+| 1 | 6 | 4.04M | 9.21M | 6478 -> 3096 |
+| 2 | 15 | 3.11M | 12.68M | 6478 -> 2974 |
+| 3 | 27 | 2.33M | 12.65M | 6478 -> 2983 |
+| 4 | 47 | 1.90M | 13.60M | 6478 -> 2883 |
+| 5 | 63 | 1.52M | 12.50M | 6478 -> 3029 |
+| 6 | 111 | 1.87M | 16.20M | 6478 -> 3041 |
+| 7 | 127 | 1.66M | 12.99M | 6478 -> 3346 |
+| 8 | 159 | 1.58M | 13.03M | 6478 -> 3456 |
+| 9 | 191 | 1.41M | 12.36M | 6478 -> 3552 |
+
+- Pause per pass: at most 3.5 to 4.1 s (time between the root lines printed before and after
+  each pass, so an upper bound), about 35 s of 1129 s in total (3 %).
+- The root value stays between 48.5 % and 51.7 %, the range of the open graph before any close
+  (the old run falls to 50.1 % before its close); the closed graph ends at 58.55 %.
+- The threshold rises with every pass (6 to 191), and from pass 7 the pass ends above the 50 %
+  target (3240 MB): the part of the graph above the threshold grows. Not followed further.
+- The visit rate after the first pass is 510 to 655 n/ms against about 385 before it. The cause
+  was not determined (the log has no count of network evaluations), so the visit rate is not a
+  count of new evaluations here.
+
 ### Not measured
 
-- A long search at 8 GB (pass time is extrapolated: about 4 s for 8 GB from 0.4 s at 800 MB).
 - Budgets where the graph does not fill: the key cannot act there (no pass runs), so no leg.
 - Other target percentages (30, 70; configs are in `build/search16/run/`), freestyle, VCN mode.
 - Pondering and `YXHASHCLEAR`-style commands during a pass.
