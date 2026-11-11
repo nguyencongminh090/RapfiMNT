@@ -31,6 +31,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <mutex>
 #include <limits>
 
 using namespace Search;
@@ -1724,6 +1726,38 @@ void recursiveApply(Node &node, std::function<void(Node &)> *f, PRNG *prng, uint
         (*f)(node);
 }
 
+/// Most rounds of one reclaim pass (SEARCH-16).
+constexpr int MaxReclaimRounds = 4;
+
+/// Marks (with the node age) every node a reclaim pass keeps reachable (SEARCH-16): the
+/// traversal of recursiveApply, except that it does not go below a node the pass will trim.
+/// @param root Whether the node is the root, which is never trimmed.
+/// @param trimMaxVisits The visit threshold of the pass, see nodeTrimmable().
+void markKeptNodes(Node &node, bool root, uint64_t trimMaxVisits, PRNG *prng, uint32_t globalNodeAge)
+{
+    std::atomic<uint32_t> &nodeAge = node.getAgeRef();
+    if (nodeAge.load(std::memory_order_acquire) == globalNodeAge)
+        return;
+
+    if (!node.isLeaf() && (root || !nodeTrimmable(node, trimMaxVisits))) {
+        EdgeArray &edges = *node.getEdges();
+
+        std::vector<uint32_t> edgeIndices;
+        for (uint32_t edgeIndex = 0; edgeIndex < edges.numEdges; edgeIndex++)
+            if (edges[edgeIndex].getChild())
+                edgeIndices.push_back(edgeIndex);
+
+        // Shuffle the indices for better multi-thread visit
+        if (prng)
+            std::shuffle(edgeIndices.begin(), edgeIndices.end(), *prng);
+
+        for (uint32_t edgeIndex : edgeIndices)
+            markKeptNodes(*edges[edgeIndex].getChild(), false, trimMaxVisits, prng, globalNodeAge);
+    }
+
+    nodeAge.store(globalNodeAge, std::memory_order_release);
+}
+
 }  // namespace
 
 float Search::MCTS::Testing::cpuctExplorationFactor(uint64_t parentVisits)
@@ -1864,6 +1898,9 @@ const RootMove *MCTSSearcher::searchMain(SearchThread &th)
             MESSAGEL("MCTS default graph budget: " << (graphMemoryLimit >> 20) << " MB");
     }
 
+    reclaimExhausted.store(false, std::memory_order_relaxed);
+    numReclaimPasses.store(0, std::memory_order_relaxed);
+
     // Initialize per-search scratch state
     scratch.numSelectableRootMoves = 0;
     scratch.lastOutputNodes        = 0;
@@ -1903,9 +1940,26 @@ void MCTSSearcher::search(SearchThread &th)
     Board         &board   = *th.board;
     assert(!graph.root->isLeaf());
 
+    // A reclaim pass (SEARCH-16) may stop this thread at the top of the loop, where it holds no
+    // node or edge pointer.
+    struct SafepointScope
+    {
+        SafepointGate &gate;
+        explicit SafepointScope(SafepointGate &g) : gate(g) { gate.enter(); }
+        ~SafepointScope() { gate.leave(); }
+    } safepointScope(safepoint);
+    const bool reclaimEnabled = SearchCfg.mctsReclaimTargetPercent > 0;
+
     // Main search loop
     std::vector<Node *> selectedPath;
     while (!th.engine.isTerminating()) {
+        if (reclaimEnabled) {
+            if (safepoint.requested())
+                safepoint.park();
+            else if (graphClosed() && !reclaimExhausted.load(std::memory_order_relaxed))
+                tryReclaim(th);
+        }
+
         // Stop when the graph memory budget is exhausted
         if (graphBounded && graphMemoryUsed.load(std::memory_order_relaxed) >= graphMemoryLimit)
             break;
@@ -2087,6 +2141,147 @@ void MCTSSearcher::recycleOldNodes(SearchThread &th)
     MESSAGEL("Reachable nodes: " << numReachableNodes.load()
                                  << ", Recycled nodes: " << numRecycledNodes.load()
                                  << ", Root visit: " << graph.root->getVisits());
+}
+
+MCTSSearcher::ReclaimStats MCTSSearcher::reclaimNodes(size_t targetBytes, const ParallelRun &run)
+{
+    // No search thread runs, so nothing holds a replaced edge array (SEARCH-10).
+    freeRetiredEdgeArrays();
+
+    ReclaimStats stats;
+    stats.bytesBefore = stats.bytesAfter = graphMemoryUsed.load(std::memory_order_relaxed);
+    if (!graph.root || stats.bytesBefore <= targetBytes)
+        return stats;
+    Node *const root = graph.root;
+
+    // 1. Estimated bytes freed by trimming a node, by its visit count: its edge array plus its
+    // explored children (exact for a tree; a child shared with a kept node is not freed).
+    ReclaimHistogram    histogram;
+    std::mutex          histogramMutex;
+    std::atomic<size_t> numShardsProcessed = 0;
+    run([&](size_t) {
+        ReclaimHistogram local;
+        processAllShards(*nodeTable, numShardsProcessed, [&](NodeTable::Shard &shard) {
+            nodeTable->forEachNode(shard, [&](Node &node) {
+                if (&node == root || !nodeTrimmable(node, Edge::VisitMask))
+                    return;
+                const EdgeArray &edges       = *node.getEdges();
+                size_t           numChildren = 0;
+                for (uint32_t i = 0; i < edges.numEdges; i++)
+                    numChildren += edges[i].getChild() != nullptr;
+                local.add(node.getVisits(),
+                          edgeArrayFootprint(edges.numEdges) + numChildren * nodeFootprint());
+            });
+        });
+        std::lock_guard lock(histogramMutex);
+        histogram.merge(local);
+    });
+
+    stats.maxVisits = histogram.thresholdFor(stats.bytesBefore - targetBytes);
+    if (stats.maxVisits == 0)
+        return stats;
+    const uint64_t maxVisits = stats.maxVisits;
+
+    // 2. Mark what stays reachable from the root when the low-visit nodes are leaves.
+    graph.globalNodeAge += 1;
+    const uint32_t age = graph.globalNodeAge;
+    run([&](size_t worker) {
+        PRNG prng(Hash::LCHash(worker));
+        markKeptNodes(*root, true, maxVisits, worker ? &prng : nullptr, age);
+    });
+
+    // 3. Erase the unmarked nodes and release the edge arrays of the marked low-visit nodes.
+    // Each node is handled by the one thread that holds its shard.
+    std::atomic<size_t> numTrimmed = 0, numErased = 0;
+    numShardsProcessed = 0;
+    run([&](size_t) {
+        processAllShards(*nodeTable, numShardsProcessed, [&](NodeTable::Shard &shard) {
+            size_t trimmed = 0;
+            size_t erased  = nodeTable->eraseNodesIf(shard, [&](Node &node) {
+                if (node.getAgeRef().load(std::memory_order_relaxed) != age) {
+                    size_t footprint = nodeFootprint();
+                    if (const EdgeArray *edges = node.getEdges())
+                        footprint += edgeArrayFootprint(edges->numEdges);
+                    graphMemoryUsed.fetch_sub(footprint, std::memory_order_relaxed);
+                    return true;
+                }
+                if (&node != root && nodeTrimmable(node, maxVisits)) {
+                    graphMemoryUsed.fetch_sub(node.releaseEdges(), std::memory_order_relaxed);
+                    trimmed++;
+                }
+                return false;
+            });
+            numTrimmed.fetch_add(trimmed, std::memory_order_relaxed);
+            numErased.fetch_add(erased, std::memory_order_relaxed);
+        });
+    });
+
+    stats.numTrimmed = numTrimmed.load();
+    stats.numErased  = numErased.load();
+    stats.bytesAfter = graphMemoryUsed.load(std::memory_order_relaxed);
+    return stats;
+}
+
+void MCTSSearcher::tryReclaim(SearchThread &th)
+{
+    // Another thread holds the stop: this thread is at its safe point, so it parks.
+    if (!safepoint.tryBegin()) {
+        safepoint.park();
+        return;
+    }
+
+    // Every other search thread is parked now. Sample again: a pass may just have finished.
+    if (graphClosed() && !reclaimExhausted.load(std::memory_order_relaxed)) {
+        const SearchContext &ctx        = th.engine.ctx;
+        size_t               used       = graphMemoryUsed.load(std::memory_order_relaxed);
+        size_t               numThreads = std::max<size_t>(th.engine.size(), 1);
+        Time estimate = Time(double(used) * reclaimThreadNsPerByte / double(numThreads) / 1e6);
+
+        // The main thread cannot check the time while it is parked: a pass must fit well
+        // inside the time left of a timed search.
+        bool timed = ctx.options.timeLimit && !ctx.inPonder.load(std::memory_order_relaxed);
+        if (timed && ctx.timectl.elapsed() + 2 * estimate + 1 >= ctx.timectl.optimum())
+            reclaimExhausted.store(true, std::memory_order_relaxed);
+        else {
+            // One round trims at most the lower 3/4 of the trimmable nodes (see
+            // ReclaimHistogram::thresholdFor), so a graph with much memory that the estimate
+            // does not see needs more rounds.
+            const size_t softLimit = softGraphLimit(graphMemoryLimit);
+            const size_t target =
+                reclaimTargetBytes(graphMemoryLimit, SearchCfg.mctsReclaimTargetPercent);
+            auto   start = std::chrono::steady_clock::now();
+            size_t freed = 0;
+            // Stop the rounds once at least half of the way to the target is done.
+            const size_t enough = target + (softLimit - std::min(softLimit, target)) / 2;
+            for (int round = 0; round < MaxReclaimRounds
+                                && graphMemoryUsed.load(std::memory_order_relaxed) > enough;
+                 round++) {
+                ReclaimStats stats = reclaimNodes(target, [this](const SafepointGate::Job &job) {
+                    safepoint.runJob(job);
+                });
+                size_t freedNow = stats.bytesBefore - stats.bytesAfter;
+                freed += freedNow;
+                MESSAGEL("MCTS reclaim: visits <= "
+                         << stats.maxVisits << ", trimmed " << stats.numTrimmed << ", erased "
+                         << stats.numErased << ", " << (stats.bytesBefore >> 20) << " -> "
+                         << (stats.bytesAfter >> 20) << " MB");
+                if (freedNow < softLimit / 16)
+                    break;
+            }
+            double elapsedNs = std::chrono::duration<double, std::nano>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count();
+            reclaimThreadNsPerByte =
+                elapsedNs * double(numThreads) / double(std::max<size_t>(used, 1));
+            numReclaimPasses.fetch_add(1, std::memory_order_relaxed);
+
+            // A pass that frees little would run again at once: leave the graph closed instead.
+            if (graphClosed() || freed < softLimit / 8)
+                reclaimExhausted.store(true, std::memory_order_relaxed);
+        }
+    }
+
+    safepoint.end();
 }
 
 void MCTSSearcher::updateRootMovesData(SearchThread &th)

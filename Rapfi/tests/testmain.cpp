@@ -42,6 +42,7 @@ void runMctsBoundTests();
 void runMctsWidenTests();
 void runMctsVcnTests();
 void runMctsNodeTableTests();
+void runMctsReclaimTests();
 void runGomocupTests();
 
 int testsRun    = 0;
@@ -77,6 +78,7 @@ int main(int argc, char *argv[])
     runMctsWidenTests();
     runMctsVcnTests();
     runMctsNodeTableTests();
+    runMctsReclaimTests();
     runGomocupTests();
 
     std::printf("\n%d/%d tests passed\n", testsPassed, testsRun);

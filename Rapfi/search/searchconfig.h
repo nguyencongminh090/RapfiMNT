@@ -49,6 +49,10 @@ struct SearchConfig
     /// A leaf is expanded only after this many visits (1 = on its second visit, as before).
     /// Delays the edge-array allocation of rarely revisited nodes (SEARCH-02).
     int mctsExpandMinVisits = 1;
+    /// Reclaim inside a search (SEARCH-16): when the graph closes, low-visit nodes are turned
+    /// back into leaves and unreachable nodes are erased until the graph is at this percentage
+    /// of its soft limit. 0 = off (the graph stays closed until the next search).
+    int mctsReclaimTargetPercent = 0;
     /// Non-root nodes keep the leading edges until their cumulative policy reaches this
     /// mass; 1 keeps every edge (SEARCH-02). 0.99 is the default: it ties 1.0 where memory is
     /// not binding and wins where it is (SEARCH-05).

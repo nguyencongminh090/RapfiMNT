@@ -6,7 +6,7 @@ a matching `instruction.md` line when execution guidance exists. See
 
 ## Active
 
-- [SEARCH-16 — MCTS: keep the search useful after the graph memory budget is full](docs/todo/SEARCH-16-mcts-node-reclaim.md) — a closed graph (SEARCH-03) adds no evaluation; values settle and the rest of the time is wasted (measured: 8 GB full at about 200 s, value stable from 300 s of 1129 s). Class B. Open 2026-11-11, discussion only: options are stop after the close, an expansion threshold that rises with memory use (recommended first), reclaim of low-visit nodes inside a search, collapse of large inferior subtrees; user's idea of verifying a branch before deletion recorded. No design chosen, no code.
+- [SEARCH-16 — MCTS: keep the search useful after the graph memory budget is full](docs/todo/SEARCH-16-mcts-node-reclaim.md) — a closed graph (SEARCH-03) adds no evaluation; values settle and the rest of the time is wasted. Class B. Option 5 (chosen by the user) implemented 2026-11-11, not committed: when the graph closes inside a search the threads park at a safe point, low-visit nodes are turned back into leaves and unreachable nodes erased (`mcts_reclaim_target_percent`, default 0 = off, key off is byte-identical). Tests 319/319 (48 new), asserts live, ASan clean, TSan clean in the new code; bench 17621937 / 8c1f72e5; self-play key 50 vs 0: Renju 1 thread 16 MB 79-31-1 (H1 accepted), Standard 2 threads 32 MB 38-21-1 (60 game cap). Option 2 measured and withdrawn. Open: the user's decision on the default value.
 
 ## Done
 

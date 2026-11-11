@@ -326,6 +326,11 @@ public:
                               std::atomic<size_t> *allocCounter,
                               RetiredEdgeArrays   &retired);
 
+    /// Frees the edge array and makes this node a leaf again; value, visits and bound are kept
+    /// (SEARCH-16). Only call while no search thread runs: nothing may hold the edge array.
+    /// @return edgeArrayFootprint() of the freed array, 0 for a leaf.
+    size_t releaseEdges();
+
     /// Returns the graph hash key of this node.
     HashKey getHash() const { return hash; }
 

@@ -63,6 +63,16 @@ Node::~Node()
         delete[] reinterpret_cast<EdgeArrayAlloc *>(edgeArray);
 }
 
+size_t Node::releaseEdges()
+{
+    EdgeArray *edgeArray = edges.exchange(nullptr, std::memory_order_acq_rel);
+    if (!edgeArray)
+        return 0;
+    size_t footprint = edgeArrayFootprint(edgeArray->numEdges);
+    delete[] reinterpret_cast<EdgeArrayAlloc *>(edgeArray);
+    return footprint;
+}
+
 void Node::writeTerminalStats(Value value)
 {
     if (value >= VALUE_MATE_IN_MAX_PLY) {

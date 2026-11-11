@@ -373,6 +373,8 @@ void Config::readSearch(const cpptoml::table &t, PendingConfig &pending)
         t.get_as<bool>("expand_when_first_evaluate").value_or(cfg.expandWhenFirstEvaluate);
     cfg.mctsExpandMinVisits =
         t.get_as<int>("mcts_expand_min_visits").value_or(cfg.mctsExpandMinVisits);
+    cfg.mctsReclaimTargetPercent =
+        t.get_as<int>("mcts_reclaim_target_percent").value_or(cfg.mctsReclaimTargetPercent);
     cfg.mctsEdgePolicyMass =
         t.get_as<double>("mcts_edge_policy_mass").value_or(cfg.mctsEdgePolicyMass);
     cfg.mctsMinEdges = t.get_as<int>("mcts_min_edges").value_or(cfg.mctsMinEdges);

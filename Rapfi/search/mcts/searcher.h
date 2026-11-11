@@ -29,10 +29,12 @@
 #include "membudget.h"
 #include "node.h"
 #include "nodetable.h"
+#include "reclaim.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <functional>
 
 namespace Search::MCTS {
 
@@ -129,6 +131,36 @@ public:
     /// graphMemoryUsed; freed by freeRetiredEdgeArrays() once no search thread runs.
     RetiredEdgeArrays retiredEdgeArrays;
 
+    /// What one reclaim pass did (SEARCH-16).
+    struct ReclaimStats
+    {
+        /// Nodes with at most this many visits were trimmed (0 = the pass did nothing).
+        uint64_t maxVisits = 0;
+        /// Nodes turned back into leaves.
+        size_t numTrimmed = 0;
+        /// Nodes erased because nothing kept reaches them any more.
+        size_t numErased = 0;
+        /// graphMemoryUsed before and after the pass.
+        size_t bytesBefore = 0, bytesAfter = 0;
+    };
+
+    /// Runs a job on every thread that takes part in a reclaim pass and waits for all of them.
+    using ParallelRun = std::function<void(const SafepointGate::Job &)>;
+
+    /// Stops the search threads at the top of their playout loop for a reclaim pass (SEARCH-16).
+    SafepointGate safepoint;
+
+    /// Set when a reclaim pass cannot help the running search any more (it freed too little, or
+    /// the turn time left is too short): the graph then stays closed. Reset by searchMain.
+    std::atomic<bool> reclaimExhausted {false};
+
+    /// Number of reclaim passes of the last search. Reset by searchMain.
+    std::atomic<uint32_t> numReclaimPasses {0};
+
+    /// Measured cost of the last reclaim pass in thread-nanoseconds per byte of graph, used to
+    /// tell whether the next pass fits in the turn time. Written only inside a pass.
+    double reclaimThreadNsPerByte = 16.0;
+
     MCTSSearcher();
     ~MCTSSearcher() = default;
 
@@ -169,12 +201,25 @@ public:
     /// Checks if current search reaches timeup condition.
     bool checkTimeupCondition(const TimeControl &timectl) override;
 
+    /// One reclaim pass (SEARCH-16): turns low-visit nodes back into leaves and erases the nodes
+    /// that nothing kept reaches any more, until about targetBytes of graph memory are left.
+    /// The root, terminal nodes and nodes with a proven bound keep their edges; no edge array of
+    /// a kept node is written. Also frees the retired edge arrays.
+    /// Only call while no thread searches the graph (the callers of `run` included).
+    /// @param targetBytes The graph size to shrink to; nothing happens at or below it.
+    /// @param run Runs each phase on the participating threads.
+    ReclaimStats reclaimNodes(size_t targetBytes, const ParallelRun &run);
+
 private:
     /// Setup root node for the search
     void setupRootNode(SearchThread &th);
 
     /// Garbage collect all old nodes in the node table
     void recycleOldNodes(SearchThread &th);
+
+    /// Called by a search thread at its safe point when the graph has closed: stops the other
+    /// search threads and runs a reclaim pass, or parks when another thread is doing that.
+    void tryReclaim(SearchThread &th);
 
     /// Rank the root moves and update PV, then print all root moves
     void updateRootMovesData(SearchThread &th);

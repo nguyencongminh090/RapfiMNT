@@ -327,6 +327,7 @@ set(HEADERS
     search/ab/searchstack.h
     search/mcts/node.h
     search/mcts/nodetable.h
+    search/mcts/reclaim.h
     search/mcts/searcher.h
     search/mcts/searchtesting.h
     search/mcts/parameter.h
@@ -708,6 +709,7 @@ if(BUILD_TESTS AND NOT EMSCRIPTEN)
         tests/mcts_widen_tests.cpp
         tests/mcts_vcn_tests.cpp
         tests/mcts_nodetable_tests.cpp
+        tests/mcts_reclaim_tests.cpp
         tests/gomocup_tests.cpp
     )
 
