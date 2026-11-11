@@ -8,6 +8,7 @@ to a detail file under `docs/instruction/`. Read the matching entry here before 
 
 ## Done
 
+- [VCN-04 — VCN reports a near-certain attacker win while the defender still has a defence](docs/instruction/VCN-04-false-positive-win.md) — done 2026-11-11 (option G; see todo results; stage 2 solver present, default budget 0; item 7 accepted by the user as measured)
 - [CMD-02 — Swap2 "put two" nested search runs outside `thinking` and `protocolMutex`](docs/instruction/CMD-02-swap2-puttwo-nested-search.md) — closed 2026-11-09 (user): branch unreachable, no code change
 - [CMD-01 — Engine stalls without sending a best move under a pipe harness](docs/instruction/CMD-01-engine-stall-no-bestmove.md) — done 2026-11-09 (see todo results; reduced scope approved by the user)
 - [PERF-04 — MCTS retained slab pool after recycle](docs/instruction/PERF-04-mcts-slab-pool-trim.md) — done 2026-11-09 (see todo results)
